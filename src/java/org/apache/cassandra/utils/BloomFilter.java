@@ -19,6 +19,10 @@ package org.apache.cassandra.utils;
 
 import com.google.common.annotations.VisibleForTesting;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import bd.ac.buet.cse.ms.thesis.CuckooFilter;
 import io.netty.util.concurrent.FastThreadLocal;
 import net.nicoulaj.compilecommand.annotations.Inline;
 import org.apache.cassandra.utils.concurrent.Ref;
@@ -27,6 +31,8 @@ import org.apache.cassandra.utils.obs.IBitSet;
 
 public class BloomFilter extends WrappedSharedCloseable implements IFilter
 {
+    private static final Logger logger = LoggerFactory.getLogger(BloomFilter.class);
+
     private final static FastThreadLocal<long[]> reusableIndexes = new FastThreadLocal<long[]>()
     {
         protected long[] initialValue()
@@ -49,6 +55,8 @@ public class BloomFilter extends WrappedSharedCloseable implements IFilter
         this.hashCount = hashCount;
         this.bitset = bitset;
         this.oldBfHashOrder = oldBfHashOrder;
+
+        logger.info("Initialized BloomFilter. {}", this);
     }
 
     private BloomFilter(BloomFilter copy)
@@ -117,6 +125,8 @@ public class BloomFilter extends WrappedSharedCloseable implements IFilter
 
     public void add(FilterKey key)
     {
+        logger.info("BloomFilter.add(); key={}", key);
+
         long[] indexes = indexes(key);
         for (int i = 0; i < hashCount; i++)
         {
@@ -126,15 +136,20 @@ public class BloomFilter extends WrappedSharedCloseable implements IFilter
 
     public final boolean isPresent(FilterKey key)
     {
+        boolean present = true;
         long[] indexes = indexes(key);
         for (int i = 0; i < hashCount; i++)
         {
             if (!bitset.get(indexes[i]))
             {
-                return false;
+                present = false;
+                break;
             }
         }
-        return true;
+
+        logger.info("BloomFilter.isPresent(); key={}; isPresent={}", key, present);
+
+        return present;
     }
 
     public void clear()

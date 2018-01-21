@@ -21,12 +21,18 @@ package bd.ac.buet.cse.ms.thesis;
 import com.google.common.hash.Funnels;
 import com.google.common.hash.HashCode;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import com.github.mgunlogson.cuckoofilter4j.Utils;
 import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.schema.SchemaKeyspace;
 import org.apache.cassandra.utils.IFilter;
 import org.apache.cassandra.utils.concurrent.Ref;
 
 public class CuckooFilter implements IFilter {
+
+    private static final Logger logger = LoggerFactory.getLogger(CuckooFilter.class);
 
     private final com.github.mgunlogson.cuckoofilter4j.CuckooFilter<byte[]> cuckooFilter;
 
@@ -35,6 +41,8 @@ public class CuckooFilter implements IFilter {
                        .withHashAlgorithm(Utils.Algorithm.xxHash64)
                        .withFalsePositiveRate(falsePositiveRate)
                        .build();
+
+        logger.info("Initialized CuckooFilter. {}", this);
     }
 
     CuckooFilter(com.github.mgunlogson.cuckoofilter4j.CuckooFilter<byte[]> underlyingCuckooFilter) {
@@ -47,7 +55,9 @@ public class CuckooFilter implements IFilter {
 
     @Override
     public void add(FilterKey key) {
-        cuckooFilter.put(getItem(key), getHashCode(key));
+        boolean successful = cuckooFilter.put(getItem(key), getHashCode(key));
+
+        logger.info("CuckooFilter.add(); key={}, isSuccessful={}", key, successful);
     }
 
     private byte[] getItem(FilterKey key) {
@@ -63,7 +73,11 @@ public class CuckooFilter implements IFilter {
 
     @Override
     public boolean isPresent(FilterKey key) {
-        return cuckooFilter.mightContain(getItem(key), getHashCode(key));
+        boolean present = cuckooFilter.mightContain(getItem(key), getHashCode(key));
+
+        logger.info("CuckooFilter.isPresent(); key={}; isPresent={}", key, present);
+
+        return present;
     }
 
     @Override
