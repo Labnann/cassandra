@@ -13,7 +13,7 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
- * 
+ *
  * Copied from Apache Harmony and Lucene (6.2.0) projects with modifications
  */
 package com.github.mgunlogson.cuckoofilter4j;
@@ -23,27 +23,31 @@ package com.github.mgunlogson.cuckoofilter4j;
  **/
 
 final class Constants {
-  private Constants() {}  // can't construct
+    private Constants() {
+    }  // can't construct
 
-  static final String OS_ARCH = System.getProperty("os.arch");
+    static final String OS_ARCH = System.getProperty("os.arch");
 
- 
-  /** True iff running on a 64bit JVM */
-  static final boolean JRE_IS_64BIT;
-  
-  static {
-    boolean is64Bit = false;
-    final String x = System.getProperty("sun.arch.data.model");
-    if (x != null) {
-      is64Bit = x.contains("64");
-    } else {
-      if (OS_ARCH != null && OS_ARCH.contains("64")) {
-        is64Bit = true;
-      } else {
-        is64Bit = false;
-      }
+
+    /**
+     * True iff running on a 64bit JVM
+     */
+    static final boolean JRE_IS_64BIT;
+
+    static {
+        boolean is64Bit = false;
+        final String x = System.getProperty("sun.arch.data.model");
+        if (x != null) {
+            is64Bit = x.contains("64");
+        }
+        else {
+            if (OS_ARCH != null && OS_ARCH.contains("64")) {
+                is64Bit = true;
+            }
+            else {
+                is64Bit = false;
+            }
+        }
+        JRE_IS_64BIT = is64Bit;
     }
-    JRE_IS_64BIT = is64Bit;
-  }
-
 }
