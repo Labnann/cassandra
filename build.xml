@@ -2033,4 +2033,9 @@
             classifier="javadoc"/>
   </target>
 
+  <target name="delete-data-dir"
+          description="Clears data directory">
+      <delete dir="data" />
+  </target>
+
 </project>
