@@ -23,6 +23,7 @@ package org.apache.cassandra.stress.generate.values;
 import java.io.Serializable;
 import java.nio.ByteBuffer;
 
+import bd.ac.buet.cse.ms.thesis.FilterSwitch;
 import org.apache.cassandra.stress.generate.Distribution;
 import org.apache.cassandra.stress.generate.DistributionFactory;
 import org.apache.cassandra.utils.ByteBufferUtil;
@@ -44,6 +45,9 @@ public class GeneratorConfig implements Serializable
         ByteBuffer buf = ByteBufferUtil.bytes(seedStr);
         long[] hash = new long[2];
         MurmurHash.hash3_x64_128(buf, buf.position(), buf.remaining(), 0, hash);
+        if (FilterSwitch.filter == FilterSwitch.CUCKOO_FILTER) {
+            throw new RuntimeException("ERROR: CuckooHashing is not used here! See the source code line above this one.");
+        }
         salt = hash[0];
     }
 

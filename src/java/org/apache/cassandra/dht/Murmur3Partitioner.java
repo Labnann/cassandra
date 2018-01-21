@@ -23,6 +23,7 @@ import java.nio.ByteBuffer;
 import java.util.*;
 import java.util.concurrent.ThreadLocalRandom;
 
+import bd.ac.buet.cse.ms.thesis.FilterSwitch;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.PreHashedDecoratedKey;
 import org.apache.cassandra.db.marshal.AbstractType;
@@ -33,6 +34,7 @@ import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.MurmurHash;
 import org.apache.cassandra.utils.ObjectSizes;
 
+import com.google.common.hash.xxHashFunction;
 import com.google.common.primitives.Longs;
 
 /**
@@ -227,7 +229,13 @@ public class Murmur3Partitioner implements IPartitioner
     private long[] getHash(ByteBuffer key)
     {
         long[] hash = new long[2];
-        MurmurHash.hash3_x64_128(key, key.position(), key.remaining(), 0, hash);
+
+        if (key.hasArray() && FilterSwitch.filter == FilterSwitch.CUCKOO_FILTER) {
+            hash[0] = xxHashFunction.xxHasher.hash(key.array(), key.position(), key.remaining(), 0);
+        } else {
+            MurmurHash.hash3_x64_128(key, key.position(), key.remaining(), 0, hash);
+        }
+
         return hash;
     }
 

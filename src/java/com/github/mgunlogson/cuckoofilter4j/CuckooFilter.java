@@ -33,6 +33,7 @@ import com.github.mgunlogson.cuckoofilter4j.Utils.Victim;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.hash.Funnel;
+import com.google.common.hash.HashCode;
 
 /**
  * A Cuckoo filter for instances of {@code T}. Cuckoo filters are probabilistic
@@ -122,6 +123,7 @@ public final class CuckooFilter<T> implements Serializable {
     private static final double DEFAULT_FP = 0.01;
     private static final int DEFAULT_CONCURRENCY = 16;
 
+    private final double fpp;
     @VisibleForTesting
     final FilterTable table;
     @VisibleForTesting
@@ -145,7 +147,7 @@ public final class CuckooFilter<T> implements Serializable {
      * Creates a Cuckoo filter.
      */
     private CuckooFilter(IndexTagCalc<T> hasher, FilterTable table, AtomicLong count, boolean hasVictim, Victim victim,
-                         int expectedConcurrency) {
+                         int expectedConcurrency, double fpp) {
         this.hasher = hasher;
         this.table = table;
         this.count = count;
@@ -161,6 +163,7 @@ public final class CuckooFilter<T> implements Serializable {
 
         this.victimLock = new StampedLock();
         this.bucketLocker = new SegmentedBucketLocker(expectedConcurrency);
+        this.fpp = fpp;
     }
 
     /***
@@ -326,7 +329,7 @@ public final class CuckooFilter<T> implements Serializable {
                 hasher = IndexTagCalc.create(hashAlgorithm, funnel, numBuckets, tagBits);
             }
             FilterTable filtertbl = FilterTable.create(tagBits, numBuckets);
-            return new CuckooFilter<>(hasher, filtertbl, new AtomicLong(0), false, null, expectedConcurrency);
+            return new CuckooFilter<>(hasher, filtertbl, new AtomicLong(0), false, null, expectedConcurrency, fpp);
         }
     }
 
@@ -403,7 +406,17 @@ public final class CuckooFilter<T> implements Serializable {
      * Returns {@code false} if insertion failed.
      */
     public boolean put(T item) {
-        BucketAndTag pos = hasher.generate(item);
+        return put(hasher.generate(item));
+    }
+
+    /**
+     * @see CuckooFilter#put(java.lang.Object)
+     */
+    public boolean put(T item, HashCode firstHashCode) {
+        return put(hasher.generate(item, firstHashCode));
+    }
+
+    private boolean put(BucketAndTag pos) {
         long curTag = pos.tag;
         long curIndex = pos.index;
         long altIndex = hasher.altIndex(curIndex, curTag);
@@ -634,7 +647,17 @@ public final class CuckooFilter<T> implements Serializable {
      * @return true if the item might be in the filter
      */
     public boolean mightContain(T item) {
-        BucketAndTag pos = hasher.generate(item);
+        return mightContain(hasher.generate(item));
+    }
+
+    /**
+     * @see CuckooFilter#mightContain(java.lang.Object)
+     */
+    public boolean mightContain(T item, HashCode firstHashCode) {
+        return mightContain(hasher.generate(item, firstHashCode));
+    }
+
+    private boolean mightContain(BucketAndTag pos) {
         long i1 = pos.index;
         long i2 = hasher.altIndex(pos.index, pos.tag);
         bucketLocker.lockBucketsRead(i1, i2);
@@ -814,10 +837,14 @@ public final class CuckooFilter<T> implements Serializable {
         bucketLocker.lockAllBucketsRead();
         try {
             return new CuckooFilter<>(hasher.copy(), table.copy(), count, hasVictim, victim.copy(),
-                                      expectedConcurrency);
+                                      expectedConcurrency, fpp);
         } finally {
             bucketLocker.unlockAllBucketsRead();
             victimLock.tryUnlockRead();
         }
+    }
+
+    public double getFalsePositiveProbability() {
+        return fpp;
     }
 }

@@ -131,6 +131,17 @@ final class IndexTagCalc<T> implements Serializable {
      * have enough bits for the filter size when the table is constructed.
      */
     BucketAndTag generate(T item) {
+        return generate(item, hasher.hashObj(item));
+    }
+
+    /**
+     * @see IndexTagCalc#generate(java.lang.Object)
+     */
+    BucketAndTag generate(T item, HashCode firstHashCode) {
+        return getBucketAndTag(item, firstHashCode);
+    }
+
+    BucketAndTag getBucketAndTag(T item, HashCode code) {
         /*
          * How do we get tag and bucketIndex from a single 32 bit hash? Max
          * filter size is constrained to 32 bits of bits (by BitSet) So, the bit
@@ -138,10 +149,9 @@ final class IndexTagCalc<T> implements Serializable {
          * offset is BUCKET_SIZE*bucketIndex*tagBits, we can never use more than
          * 32 bits of hash for tagBits+bucketIndex
          */
-        long tag = 0;
-        long bucketIndex = 0;
-        HashCode code = hasher.hashObj(item);
-        // 32 bit hash
+        long tag;
+        long bucketIndex;
+//      // 32 bit hash
 //      if (hashLength == 32) {
 //          int hashVal = code.asInt();
 //          bucketIndex = getBucketIndex32(hashVal);

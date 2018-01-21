@@ -21,7 +21,7 @@ public class xxHashFunction extends AbstractStreamingHashFunction implements Ser
         return 64;
     }
 
-    static final class xxHasher extends AbstractByteHasher {
+    public static final class xxHasher extends AbstractByteHasher {
 
         private static final long PRIME64_1 = -7046029288634856825L;
         private static final long PRIME64_2 = -4417276706812531889L;
@@ -108,7 +108,7 @@ public class xxHashFunction extends AbstractStreamingHashFunction implements Ser
          * @param seed hash seed
          * @return XXHash.
          */
-        private static long hash(byte[] buf, int off, int len, long seed) {
+        public static long hash(byte[] buf, int off, int len, long seed) {
             if (len < 0) {
                 throw new IllegalArgumentException("lengths must be >= 0");
             }

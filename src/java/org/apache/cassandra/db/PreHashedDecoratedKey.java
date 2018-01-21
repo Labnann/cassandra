@@ -20,6 +20,7 @@ package org.apache.cassandra.db;
 import java.nio.ByteBuffer;
 
 import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.utils.ByteBufferUtil;
 
 public class PreHashedDecoratedKey extends BufferDecoratedKey
 {
@@ -38,5 +39,15 @@ public class PreHashedDecoratedKey extends BufferDecoratedKey
     {
         dest[0] = hash0;
         dest[1] = hash1;
+    }
+
+    @Override
+    public String toString() {
+        return "PreHashedDecoratedKey{" +
+               "token=" + getToken() +
+               "; keystring=" + (getKey() == null ? "null" : ByteBufferUtil.bytesToHex(getKey())) +
+               "; hash0=" + hash0 +
+               "; hash1=" + hash1 +
+               '}';
     }
 }

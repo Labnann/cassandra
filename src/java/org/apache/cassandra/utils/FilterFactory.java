@@ -23,6 +23,10 @@ import java.io.IOException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import bd.ac.buet.cse.ms.thesis.CuckooFilter;
+import bd.ac.buet.cse.ms.thesis.CuckooFilterSerializer;
+import bd.ac.buet.cse.ms.thesis.FilterSwitch;
+import org.apache.cassandra.db.transform.Filter;
 import org.apache.cassandra.io.util.DataOutputPlus;
 import org.apache.cassandra.utils.obs.IBitSet;
 import org.apache.cassandra.utils.obs.OffHeapBitSet;
@@ -37,12 +41,18 @@ public class FilterFactory
 
     public static void serialize(IFilter bf, DataOutputPlus output) throws IOException
     {
-        BloomFilterSerializer.serialize((BloomFilter) bf, output);
+        if (FilterSwitch.filter == FilterSwitch.CUCKOO_FILTER) {
+            CuckooFilterSerializer.serialize((CuckooFilter) bf, output);
+        } else {
+            BloomFilterSerializer.serialize((BloomFilter) bf, output);
+        }
     }
 
     public static IFilter deserialize(DataInput input, boolean offheap, boolean oldBfHashOrder) throws IOException
     {
-        return BloomFilterSerializer.deserialize(input, offheap, oldBfHashOrder);
+        return FilterSwitch.filter == FilterSwitch.CUCKOO_FILTER
+               ? CuckooFilterSerializer.deserialize(input)
+               : BloomFilterSerializer.deserialize(input, offheap, oldBfHashOrder);
     }
 
     /**
@@ -73,6 +83,11 @@ public class FilterFactory
         assert maxFalsePosProbability <= 1.0 : "Invalid probability";
         if (maxFalsePosProbability == 1.0)
             return new AlwaysPresentFilter();
+
+        if (FilterSwitch.filter == FilterSwitch.CUCKOO_FILTER) {
+            return new CuckooFilter(Math.max(numElements, FilterSwitch.MIN_NO_OF_ELEMENTS_IN_CUCKOO_FILTER), maxFalsePosProbability);
+        }
+
         int bucketsPerElement = BloomCalculations.maxBucketsPerElement(numElements);
         BloomCalculations.BloomSpecification spec = BloomCalculations.computeBloomSpec(bucketsPerElement, maxFalsePosProbability);
         return createFilter(spec.K, numElements, spec.bucketsPerElement, offheap, oldBfHashOrder);

@@ -20,6 +20,9 @@ package org.apache.cassandra.db;
 import java.nio.ByteBuffer;
 import java.util.Comparator;
 
+import com.google.common.hash.xxHashFunction;
+
+import bd.ac.buet.cse.ms.thesis.FilterSwitch;
 import org.apache.cassandra.dht.IPartitioner;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.dht.Token.KeyBound;
@@ -135,6 +138,10 @@ public abstract class DecoratedKey implements PartitionPosition, FilterKey
     public void filterHash(long[] dest)
     {
         ByteBuffer key = getKey();
-        MurmurHash.hash3_x64_128(key, key.position(), key.remaining(), 0, dest);
+        if (key.hasArray() && FilterSwitch.filter == FilterSwitch.CUCKOO_FILTER) {
+            dest[0] = xxHashFunction.xxHasher.hash(key.array(), key.position(), key.remaining(), 0);
+        } else {
+            MurmurHash.hash3_x64_128(key, key.position(), key.remaining(), 0, dest);
+        }
     }
 }
