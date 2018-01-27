@@ -26,7 +26,6 @@ import org.slf4j.LoggerFactory;
 
 import com.github.mgunlogson.cuckoofilter4j.Utils;
 import org.apache.cassandra.db.DecoratedKey;
-import org.apache.cassandra.schema.SchemaKeyspace;
 import org.apache.cassandra.utils.IFilter;
 import org.apache.cassandra.utils.concurrent.Ref;
 
@@ -38,7 +37,7 @@ public class CuckooFilter implements IFilter {
 
     public CuckooFilter(long numOfElements, double falsePositiveRate) {
         cuckooFilter = new com.github.mgunlogson.cuckoofilter4j.CuckooFilter.Builder<>(Funnels.byteArrayFunnel(), numOfElements)
-                       .withHashAlgorithm(Utils.Algorithm.xxHash64)
+                       .withHashAlgorithm(Utils.Algorithm.Murmur3_x64_128)
                        .withFalsePositiveRate(falsePositiveRate)
                        .build();
 

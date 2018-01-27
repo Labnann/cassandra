@@ -230,11 +230,7 @@ public class Murmur3Partitioner implements IPartitioner
     {
         long[] hash = new long[2];
 
-        if (key.hasArray() && FilterSwitch.filter == FilterSwitch.CUCKOO_FILTER) {
-            hash[0] = xxHashFunction.xxHasher.hash(key.array(), key.position(), key.remaining(), 0);
-        } else {
-            MurmurHash.hash3_x64_128(key, key.position(), key.remaining(), 0, hash);
-        }
+        MurmurHash.hash3_x64_128(key, key.position(), key.remaining(), 0, hash);
 
         return hash;
     }

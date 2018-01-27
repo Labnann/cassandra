@@ -59,7 +59,12 @@ public final class Utils {
         /**
          * xxHash 64bit.
          */
-        xxHash64(4);
+        xxHash64(4),
+        /**
+         * Murmer3 - generates 128-bit hashes for x64 platform. Implemented by Cassandra.
+         */
+        Murmur3_x64_128(5);
+
         private final int id;
 
         Algorithm(int id) {

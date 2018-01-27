@@ -138,10 +138,6 @@ public abstract class DecoratedKey implements PartitionPosition, FilterKey
     public void filterHash(long[] dest)
     {
         ByteBuffer key = getKey();
-        if (key.hasArray() && FilterSwitch.filter == FilterSwitch.CUCKOO_FILTER) {
-            dest[0] = xxHashFunction.xxHasher.hash(key.array(), key.position(), key.remaining(), 0);
-        } else {
-            MurmurHash.hash3_x64_128(key, key.position(), key.remaining(), 0, dest);
-        }
+        MurmurHash.hash3_x64_128(key, key.position(), key.remaining(), 0, dest);
     }
 }

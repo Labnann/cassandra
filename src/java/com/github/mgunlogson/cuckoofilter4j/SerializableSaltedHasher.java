@@ -27,6 +27,7 @@ import java.util.Objects;
 
 import javax.annotation.Nullable;
 
+import bd.ac.buet.cse.ms.thesis.Murmur_x64_128;
 import com.github.mgunlogson.cuckoofilter4j.Utils.Algorithm;
 
 import com.google.common.hash.Funnel;
@@ -97,6 +98,8 @@ final class SerializableSaltedHasher<T> implements Serializable {
                 return Hashing.murmur3_128((int) seedNSalt);
             case Murmur3_32:
                 return Hashing.murmur3_32((int) seedNSalt);
+            case Murmur3_x64_128:
+                return new Murmur_x64_128(seedNSalt);
             case sha256:
                 return Hashing.sha1();
             case sipHash24:
