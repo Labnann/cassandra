@@ -47,6 +47,8 @@ public class CuckooFilter implements IFilter {
 
     CuckooFilter(com.github.mgunlogson.cuckoofilter4j.CuckooFilter<byte[]> underlyingCuckooFilter) {
         this.cuckooFilter = underlyingCuckooFilter;
+
+        logger.info("Shared copied CuckooFilter. {}", this);
     }
 
     public com.github.mgunlogson.cuckoofilter4j.CuckooFilter<byte[]> getUnderlyingCuckooFilter() {
@@ -57,7 +59,7 @@ public class CuckooFilter implements IFilter {
     public void add(FilterKey key) {
         boolean successful = cuckooFilter.put(getItem(key), getHashCode(key));
 
-        logger.info("CuckooFilter.add(); key={}, isSuccessful={}", key, successful);
+        logger.info("CuckooFilter.add(); key={}; hash0={}; isSuccessful={}", key, getHashCode(key).asLong(), successful);
     }
 
     private byte[] getItem(FilterKey key) {
@@ -67,6 +69,8 @@ public class CuckooFilter implements IFilter {
     private HashCode getHashCode(FilterKey key) {
         long[] dest = new long[2];
         key.filterHash(dest);
+
+//        logger.info("CuckooFilter.getHashCode(); key={}; hash={}", key, dest);
 
         return HashCode.fromLong(dest[0]);
     }
@@ -97,12 +101,12 @@ public class CuckooFilter implements IFilter {
 
     @Override
     public void clear() {
-        //ignored
+        throw new UnsupportedOperationException("CuckooFilter.clear() not implemented!");
     }
 
     @Override
     public void addTo(Ref.IdentityCollection identities) {
-        //ignored
+        throw new UnsupportedOperationException("CuckooFilter.addTo() not implemented!");
     }
 
     @Override
@@ -121,6 +125,8 @@ public class CuckooFilter implements IFilter {
                + ";storageSize=" + cuckooFilter.getStorageSize()
                + ";loadFactor=" + cuckooFilter.getLoadFactor()
                + ";count=" + cuckooFilter.getCount()
+               + ";underlyingCuckooFilterHashCode=" + System.identityHashCode(cuckooFilter)
+               + ";underlyingBitsHashCode=" + System.identityHashCode(cuckooFilter.table.memBlock.bits)
                + ']';
     }
 }

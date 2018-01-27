@@ -27,13 +27,18 @@ import javax.annotation.Nullable;
 
 import com.google.common.math.IntMath;
 import com.google.common.math.LongMath;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * This class represents the link to access methods on the underlying BitSet.
  *
  * @author Mark Gunlogson
  */
-final class FilterTable implements Serializable {
+public final class FilterTable implements Serializable {
+
+    private static final Logger logger = LoggerFactory.getLogger(FilterTable.class);
+
     private static final long serialVersionUID = 4172048932165857538L;
     /*
      * NOTE: Google's Guava library uses a custom BitSet implementation that
@@ -45,7 +50,7 @@ final class FilterTable implements Serializable {
      * NOTE: for speed, we don't check for inserts into invalid bucket indexes
      * or bucket positions!
      */
-    private final LongBitSet memBlock;
+    public final LongBitSet memBlock;
 
     private final int bitsPerTag;
 
@@ -194,14 +199,19 @@ final class FilterTable implements Serializable {
      * it. Faster than regular read because it stops checking if it finds a
      * non-matching bit.
      */
-    boolean checkTag(long bucketIndex, int posInBucket, long tag) {
+    private boolean checkTag(long bucketIndex, int posInBucket, long tag) {
         long tagStartIdx = getTagOffset(bucketIndex, posInBucket);
-        final int bityPerTag = bitsPerTag;
-        for (long i = 0; i < bityPerTag; i++) {
-            if (memBlock.get(i + tagStartIdx) != ((tag & (1L << i)) != 0)) {
+        for (long i = 0; i < bitsPerTag; i++) {
+            boolean tagBitSet = (tag & (1L << i)) != 0;
+            boolean memBlockGet = memBlock.get(i + tagStartIdx);
+//            logger.info("FilterTable.checkTag(); bucketIndex={}; posInBucket={}; tag={}; tagStartIdx={}; i={}; tagBitSet={}; memBlockGet={}; returnFalse={}",
+//                        bucketIndex, posInBucket, tag, tagStartIdx, i, tagBitSet, memBlockGet, memBlockGet != tagBitSet);
+            if (memBlockGet != tagBitSet) {
                 return false;
             }
         }
+//        logger.info("FilterTable.checkTag(); bucketIndex={}; posInBucket={}; tag={}; returnTrue",
+//                    bucketIndex, posInBucket, tag, tagStartIdx);
         return true;
     }
 

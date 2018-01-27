@@ -65,6 +65,8 @@ public class BloomFilter extends WrappedSharedCloseable implements IFilter
         this.hashCount = copy.hashCount;
         this.bitset = copy.bitset;
         this.oldBfHashOrder = copy.oldBfHashOrder;
+
+        logger.info("Shared copy BloomFilter. {}", this);
     }
 
     public long serializedSize()
@@ -170,7 +172,7 @@ public class BloomFilter extends WrappedSharedCloseable implements IFilter
 
     public String toString()
     {
-        return "BloomFilter[hashCount=" + hashCount + ";oldBfHashOrder=" + oldBfHashOrder + ";capacity=" + bitset.capacity() + ']';
+        return "BloomFilter[hashCount=" + hashCount + ";oldBfHashOrder=" + oldBfHashOrder + ";capacity=" + bitset.capacity() + ";hashCode=" + System.identityHashCode(bitset) + ']';
     }
 
     public void addTo(Ref.IdentityCollection identities)

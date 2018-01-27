@@ -34,6 +34,8 @@ import com.github.mgunlogson.cuckoofilter4j.Utils.Victim;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.hash.Funnel;
 import com.google.common.hash.HashCode;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * A Cuckoo filter for instances of {@code T}. Cuckoo filters are probabilistic
@@ -106,6 +108,8 @@ import com.google.common.hash.HashCode;
  */
 public final class CuckooFilter<T> implements Serializable {
 
+    private static final Logger logger = LoggerFactory.getLogger(CuckooFilter.class);
+
     /*
      * IMPORTANT THREAD SAFETY NOTES. To prevent deadlocks, all methods needing
      * multiple locks need to lock the victim first. This is followed by the
@@ -125,7 +129,7 @@ public final class CuckooFilter<T> implements Serializable {
 
     private final double fpp;
     @VisibleForTesting
-    final FilterTable table;
+    public final FilterTable table;
     @VisibleForTesting
     final IndexTagCalc<T> hasher;
     private final AtomicLong count;
@@ -422,7 +426,14 @@ public final class CuckooFilter<T> implements Serializable {
         long altIndex = hasher.altIndex(curIndex, curTag);
         bucketLocker.lockBucketsWrite(curIndex, altIndex);
         try {
-            if (table.insertToBucket(curIndex, curTag) || table.insertToBucket(altIndex, curTag)) {
+            boolean insertSuccessful;
+            boolean insertToCurIndexSuccessful = table.insertToBucket(curIndex, curTag);
+            insertSuccessful = insertToCurIndexSuccessful || table.insertToBucket(altIndex, curTag);
+
+//            logger.info("CuckooFilter.put(); tag={}; curIndex={}; curIndexPutSuccess={}; altIndex={}; altIndexPutSuccess={}",
+//                        curTag, curIndex, insertToCurIndexSuccessful, altIndex, insertSuccessful);
+
+            if (insertSuccessful) {
                 count.incrementAndGet();
                 return true;
             }
@@ -660,12 +671,15 @@ public final class CuckooFilter<T> implements Serializable {
     private boolean mightContain(BucketAndTag pos) {
         long i1 = pos.index;
         long i2 = hasher.altIndex(pos.index, pos.tag);
+        boolean found = false;
         bucketLocker.lockBucketsRead(i1, i2);
         try {
-            if (table.findTag(i1, i2, pos.tag)) {
+            found = table.findTag(i1, i2, pos.tag);
+            if (found) {
                 return true;
             }
         } finally {
+//            logger.info("CuckooFilter.mightContain(); tag={}; i1={}; i2={}; found={}", pos.tag, i1, i2, found);
             bucketLocker.unlockBucketsRead(i1, i2);
         }
         return checkIsVictim(pos);
