@@ -19,13 +19,7 @@
 package com.github.mgunlogson.cuckoofilter4j;
 
 import java.io.Serializable;
-import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.List;
-import java.util.concurrent.atomic.AtomicLongArray;
-
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 /**
  * BitSet of fixed length (numBits), backed by accessible ({@link #getBits})
@@ -34,13 +28,11 @@ import org.slf4j.LoggerFactory;
  */
 public final class LongBitSet implements Serializable {
 
-    private static final Logger logger = LoggerFactory.getLogger(LongBitSet.class);
-
     /**
      *
      */
     private static final long serialVersionUID = 4332907629892263426L;
-    public final AtomicLongArray bits; // Array of longs holding the bits
+    public final long[] bits; // Array of longs holding the bits
     private final long numBits; // The number of bits in use
     private final int numWords; // The exact number of longs needed to hold
     // numBits (<= bits.length)
@@ -88,8 +80,8 @@ public final class LongBitSet implements Serializable {
      */
     LongBitSet(long numBits) {
         this.numBits = numBits;
-        bits = new AtomicLongArray(new long[bits2words(numBits)]);
-        numWords = bits.length();
+        bits = new long[bits2words(numBits)];
+        numWords = bits.length;
     }
 
     /**
@@ -107,7 +99,7 @@ public final class LongBitSet implements Serializable {
             throw new IllegalArgumentException("The given long array is too small  to hold " + numBits + " bits");
         }
         this.numBits = numBits;
-        this.bits = new AtomicLongArray(storedBits);
+        this.bits = storedBits;
 
         assert verifyGhostBitsClear();
     }
@@ -119,8 +111,8 @@ public final class LongBitSet implements Serializable {
      * @return true if the bits past numBits are clear.
      */
     private boolean verifyGhostBitsClear() {
-        for (int i = numWords; i < bits.length(); i++) {
-            if (bits.get(i) != 0) {
+        for (int i = numWords; i < bits.length; i++) {
+            if (bits[i] != 0) {
                 return false;
             }
         }
@@ -131,7 +123,7 @@ public final class LongBitSet implements Serializable {
 
         long mask = -1L << numBits;
 
-        return (bits.get(numWords - 1) & mask) == 0;
+        return (bits[numWords - 1] & mask) == 0;
     }
 
     /**
@@ -145,12 +137,7 @@ public final class LongBitSet implements Serializable {
      * Expert.
      */
     long[] getBits() {
-        long[] arr = new long[bits.length()];
-        for (int i = 0; i < arr.length; i++) {
-            arr[i] = bits.get(i);
-        }
-
-        return arr;
+        return bits;
     }
 
     boolean get(long index) {
@@ -160,32 +147,22 @@ public final class LongBitSet implements Serializable {
         // array-index-out-of-bounds-exception, removing the need for an
         // explicit check.
         long bitmask = 1L << index;
-        long andOp = bits.get(i) & bitmask;
-        boolean bitSet = andOp != 0;
-
-//        logger.info("LongBitSet.get(); index={}; numBits={}; i={}; bits[i]={}; bitmask={}; andOp={}; returnVal={}; bits.hashCode={}; thread={}",
-//                    index, numBits, i, bits.get(i), bitmask, andOp, bitSet, System.identityHashCode(bits), Thread.currentThread());
-
-        return bitSet;
+        return (bits[i] & bitmask) != 0;
     }
 
     void set(long index) {
         assert index >= 0 && index < numBits : "index=" + index + " numBits=" + numBits;
-        int i = (int) (index >> 6); // div 64
+        int wordNum = (int) (index >> 6); // div 64
         long bitmask = 1L << index;
-        long oldBitVal = bits.get(i);
-        bits.set(i, bits.get(i) | bitmask);
-
-//        logger.info("LongBitSet.set(); index={}; numBits={}; i={}; bits[i]-curr={}; bits[i]-new={}; bits.hashCode={}; thread={}",
-//                    index, numBits, i, oldBitVal, bits.get(i), System.identityHashCode(bits), Thread.currentThread());
+        bits[wordNum] |= bitmask;
     }
 
     boolean getAndSet(long index) {
         assert index >= 0 && index < numBits : "index=" + index + ", numBits=" + numBits;
         int wordNum = (int) (index >> 6); // div 64
         long bitmask = 1L << index;
-        boolean val = (bits.get(wordNum) & bitmask) != 0;
-        bits.set(wordNum, bits.get(wordNum) | bitmask);
+        boolean val = (bits[wordNum] & bitmask) != 0;
+        bits[wordNum] |= bitmask;
         return val;
     }
 
@@ -193,15 +170,15 @@ public final class LongBitSet implements Serializable {
         assert index >= 0 && index < numBits : "index=" + index + ", numBits=" + numBits;
         int wordNum = (int) (index >> 6);
         long bitmask = 1L << index;
-        bits.set(wordNum, bits.get(wordNum) & ~bitmask);
+        bits[wordNum] &= ~bitmask;
     }
 
     boolean getAndClear(long index) {
         assert index >= 0 && index < numBits : "index=" + index + ", numBits=" + numBits;
         int wordNum = (int) (index >> 6); // div 64
         long bitmask = 1L << index;
-        boolean val = (bits.get(wordNum) & bitmask) != 0;
-        bits.set(wordNum, bits.get(wordNum) & ~bitmask);
+        boolean val = (bits[wordNum] & bitmask) != 0;
+        bits[wordNum] &= ~bitmask;
         return val;
     }
 
@@ -213,14 +190,14 @@ public final class LongBitSet implements Serializable {
         // Depends on the ghost bits being clear!
         assert index >= 0 && index < numBits : "index=" + index + ", numBits=" + numBits;
         int i = (int) (index >> 6);
-        long word = bits.get(i) >> index; // skip all the bits to the right of index
+        long word = bits[i] >> index; // skip all the bits to the right of index
 
         if (word != 0) {
             return index + Long.numberOfTrailingZeros(word);
         }
 
         while (++i < numWords) {
-            word = bits.get(i);
+            word = bits[i];
             if (word != 0) {
                 return (i << 6) + Long.numberOfTrailingZeros(word);
             }
@@ -237,7 +214,7 @@ public final class LongBitSet implements Serializable {
         assert index >= 0 && index < numBits : "index=" + index + " numBits=" + numBits;
         int i = (int) (index >> 6);
         final int subIndex = (int) (index & 0x3f); // index within the word
-        long word = (bits.get(i) << (63 - subIndex)); // skip all the bits to the
+        long word = (bits[i] << (63 - subIndex)); // skip all the bits to the
         // left of index
 
         if (word != 0) {
@@ -246,7 +223,7 @@ public final class LongBitSet implements Serializable {
         }
 
         while (--i >= 0) {
-            word = bits.get(i);
+            word = bits[i];
             if (word != 0) {
                 return (i << 6) + 63 - Long.numberOfLeadingZeros(word);
             }
@@ -262,7 +239,7 @@ public final class LongBitSet implements Serializable {
         assert other.numWords <= numWords : "numWords=" + numWords + ", other.numWords=" + other.numWords;
         int pos = Math.min(numWords, other.numWords);
         while (--pos >= 0) {
-            bits.set(pos, bits.get(pos) | other.bits.get(pos));
+            bits[pos] |= other.bits[pos];
         }
     }
 
@@ -273,7 +250,7 @@ public final class LongBitSet implements Serializable {
         assert other.numWords <= numWords : "numWords=" + numWords + ", other.numWords=" + other.numWords;
         int pos = Math.min(numWords, other.numWords);
         while (--pos >= 0) {
-            bits.set(pos, bits.get(pos) ^ other.bits.get(pos));
+            bits[pos] ^= other.bits[pos];
         }
     }
 
@@ -284,7 +261,7 @@ public final class LongBitSet implements Serializable {
         // Depends on the ghost bits being clear!
         int pos = Math.min(numWords, other.numWords);
         while (--pos >= 0) {
-            if ((bits.get(pos) & other.bits.get(pos)) != 0) {
+            if ((bits[pos] & other.bits[pos]) != 0) {
                 return true;
             }
         }
@@ -297,12 +274,10 @@ public final class LongBitSet implements Serializable {
     void and(LongBitSet other) {
         int pos = Math.min(numWords, other.numWords);
         while (--pos >= 0) {
-            bits.set(pos, bits.get(pos) & other.bits.get(pos));
+            bits[pos] &= other.bits[pos];
         }
         if (numWords > other.numWords) {
-            for (int i = other.numWords; i < numWords; i++) {
-                bits.set(i, 0L);
-            }
+            Arrays.fill(bits, other.numWords, numWords, 0L);
         }
     }
 
@@ -312,7 +287,7 @@ public final class LongBitSet implements Serializable {
     void andNot(LongBitSet other) {
         int pos = Math.min(numWords, other.numWords);
         while (--pos >= 0) {
-            bits.set(pos, bits.get(pos) & ~other.bits.get(pos));
+            bits[pos] &= ~other.bits[pos];
         }
     }
 
@@ -332,7 +307,7 @@ public final class LongBitSet implements Serializable {
         final int count = numWords;
 
         for (int i = 0; i < count; i++) {
-            if (bits.get(i) != 0) {
+            if (bits[i] != 0) {
                 return false;
             }
         }
@@ -371,17 +346,17 @@ public final class LongBitSet implements Serializable {
         // bits are used
 
         if (startWord == endWord) {
-            bits.set(startWord, bits.get(startWord) ^ (startmask & endmask));
+            bits[startWord] ^= (startmask & endmask);
             return;
         }
 
-        bits.set(startWord, bits.get(startWord) ^ startmask);
+        bits[startWord] ^= startmask;
 
         for (int i = startWord + 1; i < endWord; i++) {
-            bits.set(i, ~bits.get(i));
+            bits[i] = ~bits[i];
         }
 
-        bits.set(endWord, bits.get(endWord) ^ endmask);
+        bits[endWord] ^= endmask;
     }
 
     /**
@@ -391,7 +366,7 @@ public final class LongBitSet implements Serializable {
         assert index >= 0 && index < numBits : "index=" + index + " numBits=" + numBits;
         int wordNum = (int) (index >> 6); // div 64
         long bitmask = 1L << index; // mod 64 is implicit
-        bits.set(wordNum, bits.get(wordNum) ^ bitmask);
+        bits[wordNum] ^= bitmask;
     }
 
     /**
@@ -416,15 +391,13 @@ public final class LongBitSet implements Serializable {
         // bits are used
 
         if (startWord == endWord) {
-            bits.set(startWord, bits.get(startWord) | (startmask & endmask));
+            bits[startWord] |= (startmask & endmask);
             return;
         }
 
-        bits.set(startWord, bits.get(startWord) | startmask);
-        for (int i = startWord + 1; i < endWord; i++) {
-            bits.set(i, 0L);
-        }
-        bits.set(endWord, bits.get(endWord) | endmask);
+        bits[startWord] |= startmask;
+        Arrays.fill(bits, startWord + 1, endWord, -1L);
+        bits[endWord] |= endmask;
     }
 
     /**
@@ -453,20 +426,20 @@ public final class LongBitSet implements Serializable {
         endmask = ~endmask;
 
         if (startWord == endWord) {
-            bits.set(startWord, bits.get(startWord) & (startmask | endmask));
+            bits[startWord] &= (startmask | endmask);
             return;
         }
 
-        bits.set(startWord, bits.get(startWord) & startmask);
-        for (int i = startWord + 1; i < endWord; i++) {
-            bits.set(i, 0L);
-        }
-        bits.set(endWord, bits.get(endWord) & endmask);
+        bits[startWord] &= startmask;
+        Arrays.fill(bits, startWord + 1, endWord, 0L);
+        bits[endWord] &= endmask;
     }
 
     @Override
     public LongBitSet clone() {
-        return new LongBitSet(getBits(), numBits);
+        long[] bits = new long[this.bits.length];
+        System.arraycopy(this.bits, 0, bits, 0, numWords);
+        return new LongBitSet(bits, numBits);
     }
 
     /**
@@ -485,7 +458,7 @@ public final class LongBitSet implements Serializable {
             return false;
         }
         // Depends on the ghost bits being clear!
-        return bits.equals(other.bits);
+        return Arrays.equals(bits, other.bits);
     }
 
     @Override
@@ -493,7 +466,7 @@ public final class LongBitSet implements Serializable {
         // Depends on the ghost bits being clear!
         long h = 0;
         for (int i = numWords; --i >= 0; ) {
-            h ^= bits.get(i);
+            h ^= bits[i];
             h = (h << 1) | (h >>> 63); // rotate left
         }
         // fold leftmost bits into right and add a constant to prevent
