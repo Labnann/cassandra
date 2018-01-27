@@ -86,7 +86,7 @@ public class CuckooFilter implements IFilter {
 
     @Override
     public IFilter sharedCopy() {
-        return new CuckooFilter(cuckooFilter.copy());
+        return new CuckooFilter(cuckooFilter);
     }
 
     @Override
