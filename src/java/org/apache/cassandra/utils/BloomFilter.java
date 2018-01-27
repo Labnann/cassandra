@@ -56,7 +56,7 @@ public class BloomFilter extends WrappedSharedCloseable implements IFilter
         this.bitset = bitset;
         this.oldBfHashOrder = oldBfHashOrder;
 
-        logger.info("Initialized BloomFilter. {}", this);
+//        logger.info("Initialized BloomFilter. {}", this);
     }
 
     private BloomFilter(BloomFilter copy)
@@ -66,7 +66,7 @@ public class BloomFilter extends WrappedSharedCloseable implements IFilter
         this.bitset = copy.bitset;
         this.oldBfHashOrder = copy.oldBfHashOrder;
 
-        logger.info("Shared copy BloomFilter. {}", this);
+//        logger.info("Shared copy BloomFilter. {}", this);
     }
 
     public long serializedSize()
@@ -127,7 +127,7 @@ public class BloomFilter extends WrappedSharedCloseable implements IFilter
 
     public void add(FilterKey key)
     {
-        logger.info("BloomFilter.add(); key={}", key);
+//        logger.info("BloomFilter.add(); key={}", key);
 
         long[] indexes = indexes(key);
         for (int i = 0; i < hashCount; i++)
@@ -149,7 +149,7 @@ public class BloomFilter extends WrappedSharedCloseable implements IFilter
             }
         }
 
-        logger.info("BloomFilter.isPresent(); key={}; isPresent={}", key, present);
+//        logger.info("BloomFilter.isPresent(); key={}; isPresent={}", key, present);
 
         return present;
     }

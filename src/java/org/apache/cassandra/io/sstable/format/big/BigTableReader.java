@@ -191,11 +191,11 @@ public class BigTableReader extends SSTableReader
         long sampledPosition = getIndexScanPositionFromBinarySearchResult(binarySearchResult, indexSummary);
         int sampledIndex = getIndexSummaryIndexFromBinarySearchResult(binarySearchResult);
 
-        logger.info("binarySearchResult={}; sampledIndex={}", binarySearchResult, sampledIndex);
+//        logger.info("binarySearchResult={}; sampledIndex={}", binarySearchResult, sampledIndex);
 
         int effectiveInterval = indexSummary.getEffectiveIndexIntervalAfterIndex(sampledIndex);
 
-        logger.info("effectiveInterval={}", effectiveInterval);
+//        logger.info("effectiveInterval={}", effectiveInterval);
 
         if (ifile == null)
             return null;

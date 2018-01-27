@@ -163,11 +163,8 @@ public final class LongBitSet implements Serializable {
         long andOp = bits.get(i) & bitmask;
         boolean bitSet = andOp != 0;
 
-        if (index == 5273090) {
-            logger.error("Haha!");
-        }
-        logger.info("LongBitSet.get(); index={}; numBits={}; i={}; bits[i]={}; bitmask={}; andOp={}; returnVal={}; bits.hashCode={}; thread={}",
-                    index, numBits, i, bits.get(i), bitmask, andOp, bitSet, System.identityHashCode(bits), Thread.currentThread());
+//        logger.info("LongBitSet.get(); index={}; numBits={}; i={}; bits[i]={}; bitmask={}; andOp={}; returnVal={}; bits.hashCode={}; thread={}",
+//                    index, numBits, i, bits.get(i), bitmask, andOp, bitSet, System.identityHashCode(bits), Thread.currentThread());
 
         return bitSet;
     }
@@ -179,11 +176,8 @@ public final class LongBitSet implements Serializable {
         long oldBitVal = bits.get(i);
         bits.set(i, bits.get(i) | bitmask);
 
-        if (index == 5273090) {
-            logger.error("Haha!");
-        }
-        logger.info("LongBitSet.set(); index={}; numBits={}; i={}; bits[i]-curr={}; bits[i]-new={}; bits.hashCode={}; thread={}",
-                    index, numBits, i, oldBitVal, bits.get(i), System.identityHashCode(bits), Thread.currentThread());
+//        logger.info("LongBitSet.set(); index={}; numBits={}; i={}; bits[i]-curr={}; bits[i]-new={}; bits.hashCode={}; thread={}",
+//                    index, numBits, i, oldBitVal, bits.get(i), System.identityHashCode(bits), Thread.currentThread());
     }
 
     boolean getAndSet(long index) {

@@ -41,13 +41,13 @@ public class CuckooFilter implements IFilter {
                        .withFalsePositiveRate(falsePositiveRate)
                        .build();
 
-        logger.info("Initialized CuckooFilter. {}", this);
+//        logger.info("Initialized CuckooFilter. {}", this);
     }
 
     CuckooFilter(com.github.mgunlogson.cuckoofilter4j.CuckooFilter<byte[]> underlyingCuckooFilter) {
         this.cuckooFilter = underlyingCuckooFilter;
 
-        logger.info("Shared copied CuckooFilter. {}", this);
+//        logger.info("Shared copied CuckooFilter. {}", this);
     }
 
     public com.github.mgunlogson.cuckoofilter4j.CuckooFilter<byte[]> getUnderlyingCuckooFilter() {
@@ -58,7 +58,7 @@ public class CuckooFilter implements IFilter {
     public void add(FilterKey key) {
         boolean successful = cuckooFilter.put(getItem(key), getHashCode(key));
 
-        logger.info("CuckooFilter.add(); key={}; hash0={}; isSuccessful={}", key, getHashCode(key).asLong(), successful);
+//        logger.info("CuckooFilter.add(); key={}; hash0={}; isSuccessful={}", key, getHashCode(key).asLong(), successful);
     }
 
     private byte[] getItem(FilterKey key) {
@@ -78,7 +78,7 @@ public class CuckooFilter implements IFilter {
     public boolean isPresent(FilterKey key) {
         boolean present = cuckooFilter.mightContain(getItem(key), getHashCode(key));
 
-        logger.info("CuckooFilter.isPresent(); key={}; isPresent={}", key, present);
+//        logger.info("CuckooFilter.isPresent(); key={}; isPresent={}", key, present);
 
         return present;
     }
