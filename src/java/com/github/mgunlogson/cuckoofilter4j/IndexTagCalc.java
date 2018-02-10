@@ -131,17 +131,17 @@ final class IndexTagCalc<T> implements Serializable {
      * have enough bits for the filter size when the table is constructed.
      */
     BucketAndTag generate(T item) {
-        return generate(item, hasher.hashObj(item));
+        return generate(item, hasher.hashObj(item), null);
     }
 
     /**
      * @see IndexTagCalc#generate(java.lang.Object)
      */
-    BucketAndTag generate(T item, HashCode firstHashCode) {
-        return getBucketAndTag(item, firstHashCode);
+    BucketAndTag generate(T item, HashCode firstHashCode, HashCode secondHashCode) {
+        return getBucketAndTag(item, firstHashCode, secondHashCode);
     }
 
-    BucketAndTag getBucketAndTag(T item, HashCode code) {
+    BucketAndTag getBucketAndTag(T item, HashCode code, HashCode secondHashCode) {
         /*
          * How do we get tag and bucketIndex from a single 32 bit hash? Max
          * filter size is constrained to 32 bits of bits (by BitSet) So, the bit
@@ -169,6 +169,9 @@ final class IndexTagCalc<T> implements Serializable {
             bucketIndex = getBucketIndex64(hashVal);
             // loop until tag isn't equal to empty bucket (0)
             tag = getTagValue64(hashVal);
+            if (tag == 0) {
+                tag = getTagValue64(secondHashCode.asLong());
+            }
             assert tag != 0;
             for (int salt = 1; tag == 0; salt++) {
                 hashVal = hasher.hashObjWithSalt(item, salt).asLong();

@@ -114,36 +114,36 @@ public class TestCuckooFilter {
         assertTrue(falseNegatives + " false negatives detected", falseNegatives == 0);
     }
 
-    @Test
-    public void sanityFalseNegativeWithByteArrayFilter() {
-        CuckooFilter<byte[]> filter = new CuckooFilter.Builder<>(Funnels.byteArrayFunnel(), 2000000)
-                                       .withFalsePositiveRate(0.01)
-                                       .withHashAlgorithm(Algorithm.xxHash64)
-                                       .build();
-        // add them to filter
-        for (int i = 0; i < 10; i++) {
-            // will return false if filter is full...should NOT be
-            ByteBuffer byteBuffer = ByteBuffer.allocate(4).putInt(i);
-            assertTrue(filter.put(byteBuffer.array(),
-                                  HashCode.fromLong(xxHashFunction.xxHasher.hash(
-                                  byteBuffer.array(), 0, 4, 0))));
-        }
-        // check for false negatives
-        for (int z = 0; z < 10; z++) {
-            int falseNegatives = 0;
-            for (int i = 0; i < 10; i++) {
-                for (int x = 0; x < 10; x++) {
-                    ByteBuffer byteBuffer = ByteBuffer.allocate(4).putInt(i);
-                    if (!filter.mightContain(byteBuffer.array(),
-                                             HashCode.fromLong(xxHashFunction.xxHasher.hash(
-                                             byteBuffer.array(), 0, 4, 0)))) {
-                        falseNegatives++;
-                    }
-                }
-            }
-            assertTrue(falseNegatives + " false negatives detected", falseNegatives == 0);
-        }
-    }
+//    @Test
+//    public void sanityFalseNegativeWithByteArrayFilter() {
+//        CuckooFilter<byte[]> filter = new CuckooFilter.Builder<>(Funnels.byteArrayFunnel(), 2000000)
+//                                       .withFalsePositiveRate(0.01)
+//                                       .withHashAlgorithm(Algorithm.xxHash64)
+//                                       .build();
+//        // add them to filter
+//        for (int i = 0; i < 10; i++) {
+//            // will return false if filter is full...should NOT be
+//            ByteBuffer byteBuffer = ByteBuffer.allocate(4).putInt(i);
+//            assertTrue(filter.put(byteBuffer.array(),
+//                                  HashCode.fromLong(xxHashFunction.xxHasher.hash(
+//                                  byteBuffer.array(), 0, 4, 0))));
+//        }
+//        // check for false negatives
+//        for (int z = 0; z < 10; z++) {
+//            int falseNegatives = 0;
+//            for (int i = 0; i < 10; i++) {
+//                for (int x = 0; x < 10; x++) {
+//                    ByteBuffer byteBuffer = ByteBuffer.allocate(4).putInt(i);
+//                    if (!filter.mightContain(byteBuffer.array(),
+//                                             HashCode.fromLong(xxHashFunction.xxHasher.hash(
+//                                             byteBuffer.array(), 0, 4, 0)))) {
+//                        falseNegatives++;
+//                    }
+//                }
+//            }
+//            assertTrue(falseNegatives + " false negatives detected", falseNegatives == 0);
+//        }
+//    }
 
     @Test
     public void sanityApproimateCount() {

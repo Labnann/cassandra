@@ -416,8 +416,8 @@ public final class CuckooFilter<T> implements Serializable {
     /**
      * @see CuckooFilter#put(java.lang.Object)
      */
-    public boolean put(T item, HashCode firstHashCode) {
-        return put(hasher.generate(item, firstHashCode));
+    public boolean put(T item, HashCode firstHashCode, HashCode secondHashCode) {
+        return put(hasher.generate(item, firstHashCode, secondHashCode));
     }
 
     private boolean put(BucketAndTag pos) {
@@ -664,8 +664,8 @@ public final class CuckooFilter<T> implements Serializable {
     /**
      * @see CuckooFilter#mightContain(java.lang.Object)
      */
-    public boolean mightContain(T item, HashCode firstHashCode) {
-        return mightContain(hasher.generate(item, firstHashCode));
+    public boolean mightContain(T item, HashCode firstHashCode, HashCode secondHashCode) {
+        return mightContain(hasher.generate(item, firstHashCode, secondHashCode));
     }
 
     private boolean mightContain(BucketAndTag pos) {

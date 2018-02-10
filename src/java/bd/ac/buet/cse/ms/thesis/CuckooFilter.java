@@ -56,7 +56,8 @@ public class CuckooFilter implements IFilter {
 
     @Override
     public void add(FilterKey key) {
-        boolean successful = cuckooFilter.put(getItem(key), getHashCode(key));
+        HashCode[] hashCode = getHashCode(key);
+        boolean successful = cuckooFilter.put(getItem(key), hashCode[0], hashCode[1]);
 
 //        logger.info("CuckooFilter.add(); key={}; hash0={}; isSuccessful={}", key, getHashCode(key).asLong(), successful);
     }
@@ -65,20 +66,21 @@ public class CuckooFilter implements IFilter {
         return ((DecoratedKey) key).getKey().array();
     }
 
-    private HashCode getHashCode(FilterKey key) {
+    private HashCode[] getHashCode(FilterKey key) {
         long[] dest = new long[2];
         key.filterHash(dest);
 
 //        logger.info("CuckooFilter.getHashCode(); key={}; hash={}", key, dest);
 
-        return HashCode.fromLong(dest[0]);
+        return new HashCode[]{ HashCode.fromLong(dest[0]), HashCode.fromLong(dest[1]) };
     }
 
     @Override
     public boolean isPresent(FilterKey key) {
-        boolean present = cuckooFilter.mightContain(getItem(key), getHashCode(key));
+        HashCode[] hashCode = getHashCode(key);
+        boolean present = cuckooFilter.mightContain(getItem(key), hashCode[0], hashCode[1]);
 
-//        logger.info("CuckooFilter.isPresent(); key={}; isPresent={}", key, present);
+        logger.info("CuckooFilter.isPresent(); key={}; isPresent={}", key, present);
 
         return present;
     }

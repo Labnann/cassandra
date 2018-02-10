@@ -25,6 +25,7 @@ import org.slf4j.LoggerFactory;
 import bd.ac.buet.cse.ms.thesis.CuckooFilter;
 import io.netty.util.concurrent.FastThreadLocal;
 import net.nicoulaj.compilecommand.annotations.Inline;
+import org.apache.cassandra.tracing.Tracing;
 import org.apache.cassandra.utils.concurrent.Ref;
 import org.apache.cassandra.utils.concurrent.WrappedSharedCloseable;
 import org.apache.cassandra.utils.obs.IBitSet;
@@ -149,7 +150,7 @@ public class BloomFilter extends WrappedSharedCloseable implements IFilter
             }
         }
 
-//        logger.info("BloomFilter.isPresent(); key={}; isPresent={}", key, present);
+        logger.info("BloomFilter.isPresent(); key={}; isPresent={}", key, present);
 
         return present;
     }
