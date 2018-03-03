@@ -107,7 +107,7 @@ public class FilterFactory
     private static IFilter createFilter(int hash, long numElements, int bucketsPer, boolean offheap, boolean oldBfHashOrder)
     {
         long numBits = (numElements * bucketsPer) + BITSET_EXCESS;
-        IBitSet bitset = offheap ? new OffHeapBitSet(numBits) : new OpenBitSet(numBits);
+        IBitSet bitset = new OpenBitSet(numBits);
         return new BloomFilter(hash, bitset, oldBfHashOrder);
     }
 }
