@@ -2241,6 +2241,7 @@ public class StorageProxy implements StorageProxyMBean
             }
 
             Tracing.trace("Submitted {} concurrent range requests", concurrentQueries.size());
+//            logger.info("Submitted {} concurrent range requests", concurrentQueries.size());
             // We want to count the results for the sake of updating the concurrency factor (see updateConcurrencyFactor) but we don't want to
             // enforce any particular limit at this point (this could break code than rely on postReconciliationProcessing), hence the DataLimits.NONE.
             counter = DataLimits.NONE.newCounter(command.nowInSec(), true, command.selectsFullPartition(), enforceStrictLiveness);
@@ -2267,6 +2268,7 @@ public class StorageProxy implements StorageProxyMBean
     public static PartitionIterator getRangeSlice(PartitionRangeReadCommand command, ConsistencyLevel consistencyLevel, long queryStartNanoTime)
     {
         Tracing.trace("Computing ranges to query");
+//        logger.info("Computing ranges to query");
 
         Keyspace keyspace = Keyspace.open(command.metadata().ksName);
         RangeIterator ranges = new RangeIterator(command, keyspace, consistencyLevel);
@@ -2282,6 +2284,7 @@ public class StorageProxy implements StorageProxyMBean
         logger.trace("Estimated result rows per range: {}; requested rows: {}, ranges.size(): {}; concurrent range requests: {}",
                      resultsPerRange, command.limits().count(), ranges.rangeCount(), concurrencyFactor);
         Tracing.trace("Submitting range requests on {} ranges with a concurrency of {} ({} rows per range expected)", ranges.rangeCount(), concurrencyFactor, resultsPerRange);
+//        logger.info("Submitting range requests on {} ranges with a concurrency of {} ({} rows per range expected)", ranges.rangeCount(), concurrencyFactor, resultsPerRange);
 
         // Note that in general, a RangeCommandIterator will honor the command limit for each range, but will not enforce it globally.
 

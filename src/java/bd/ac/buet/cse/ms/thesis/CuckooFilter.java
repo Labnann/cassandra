@@ -59,7 +59,7 @@ public class CuckooFilter implements IFilter {
         HashCode[] hashCode = getHashCode(key);
         boolean successful = cuckooFilter.put(getItem(key), hashCode[0], hashCode[1]);
 
-//        logger.info("CuckooFilter.add(); key={}; hash0={}; isSuccessful={}", key, getHashCode(key).asLong(), successful);
+//        logger.info("CuckooFilter.add(); key={}; isSuccessful={}", key, successful);
     }
 
     private byte[] getItem(FilterKey key) {

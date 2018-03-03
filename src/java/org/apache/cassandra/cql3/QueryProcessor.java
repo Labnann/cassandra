@@ -554,6 +554,7 @@ public class QueryProcessor implements QueryHandler
     throws RequestValidationException
     {
         Tracing.trace("Parsing {}", queryStr);
+//        logger.info("Parsing {}", queryStr);
         ParsedStatement statement = parseStatement(queryStr);
 
         // Set keyspace for statement that require login
@@ -561,6 +562,7 @@ public class QueryProcessor implements QueryHandler
             ((CFStatement)statement).prepareKeyspace(clientState);
 
         Tracing.trace("Preparing statement");
+//        logger.info("Preparing statement");
         return statement.prepare();
     }
 

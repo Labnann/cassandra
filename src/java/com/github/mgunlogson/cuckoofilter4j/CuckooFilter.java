@@ -333,7 +333,12 @@ public final class CuckooFilter<T> implements Serializable {
                 hasher = IndexTagCalc.create(hashAlgorithm, funnel, numBuckets, tagBits);
             }
             FilterTable filtertbl = FilterTable.create(tagBits, numBuckets);
-            return new CuckooFilter<>(hasher, filtertbl, new AtomicLong(0), false, null, expectedConcurrency, fpp);
+            CuckooFilter<T> tCuckooFilter = new CuckooFilter<>(hasher, filtertbl, new AtomicLong(0), false, null, expectedConcurrency, fpp);
+
+//            logger.info("Creating cuckoo filter. K={}, n={}, bitsPerTag={}, fpp={}, numBuckets={}, storageSize={}",
+//                        2, maxKeys, tagBits, fpp, numBuckets, tCuckooFilter.getStorageSize());
+
+            return tCuckooFilter;
         }
     }
 

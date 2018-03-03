@@ -84,13 +84,23 @@ public class FilterFactory
         if (maxFalsePosProbability == 1.0)
             return new AlwaysPresentFilter();
 
+//        logger.info("Creating filter. n={}", numElements);
+
         if (FilterSwitch.filter == FilterSwitch.CUCKOO_FILTER) {
-            return new CuckooFilter(Math.max(numElements, FilterSwitch.MIN_NO_OF_ELEMENTS_IN_CUCKOO_FILTER), maxFalsePosProbability);
+            CuckooFilter cuckooFilter = new CuckooFilter(Math.max(numElements, FilterSwitch.MIN_NO_OF_ELEMENTS_IN_CUCKOO_FILTER), maxFalsePosProbability);
+//            logger.info("Cuckoo filter serialized size: {}", cuckooFilter.serializedSize());
+            return cuckooFilter;
         }
 
         int bucketsPerElement = BloomCalculations.maxBucketsPerElement(numElements);
         BloomCalculations.BloomSpecification spec = BloomCalculations.computeBloomSpec(bucketsPerElement, maxFalsePosProbability);
-        return createFilter(spec.K, numElements, spec.bucketsPerElement, offheap, oldBfHashOrder);
+
+//        logger.info("Creating bloom filter. K={}, n={}, bucketPerElem={}, storageSize={}, fpp={}", spec.K, numElements,
+//                    spec.bucketsPerElement, (numElements * spec.bucketsPerElement) + BITSET_EXCESS, maxFalsePosProbability);
+
+        IFilter bloomFilter = createFilter(spec.K, numElements, spec.bucketsPerElement, offheap, oldBfHashOrder);
+//        logger.info("Bloom filter serialized size: {}", bloomFilter.serializedSize());
+        return bloomFilter;
     }
 
     @SuppressWarnings("resource")

@@ -534,6 +534,7 @@ public abstract class ReadCommand extends MonitorableImpl implements ReadQuery
                 }
 
                 Tracing.trace("Read {} live and {} tombstone cells{}", liveRows, tombstones, (warnTombstones ? " (see tombstone_warn_threshold)" : ""));
+//                logger.info("Read {} live and {} tombstone cells{}", liveRows, tombstones, (warnTombstones ? " (see tombstone_warn_threshold)" : ""));
             }
         };
 

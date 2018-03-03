@@ -111,6 +111,7 @@ public class QueryMessage extends Message.Request
                     builder.put("serial_consistency_level", options.getSerialConsistency().name());
 
                 Tracing.instance.begin("Execute CQL3 query", state.getClientAddress(), builder.build());
+//                logger.info("Execute CQL3 query");
             }
 
             Message.Response response = ClientState.getCQLQueryHandler().process(query, state, options, getCustomPayload(), queryStartNanoTime);

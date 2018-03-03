@@ -79,6 +79,7 @@ public final class FilterTable implements Serializable {
         // table size
         long bitsPerBucket = IntMath.checkedMultiply(CuckooFilter.BUCKET_SIZE, bitsPerTag);
         long bitSetSize = LongMath.checkedMultiply(bitsPerBucket, numBuckets);
+//        logger.info("Cuckoo Filter. bitsPerBucket={}, m={}", bitsPerBucket, bitSetSize);
         LongBitSet memBlock = new LongBitSet(bitSetSize);
         return new FilterTable(memBlock, bitsPerTag, numBuckets);
     }

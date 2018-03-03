@@ -141,6 +141,7 @@ public class BigTableReader extends SSTableReader
             {
                 listener.onSSTableSkipped(this, SkippingReason.BLOOM_FILTER);
                 Tracing.trace("Bloom filter allows skipping sstable {}", descriptor.generation);
+//                logger.info("Filter allows skipping sstable {}", descriptor.generation);
                 return null;
             }
         }
@@ -180,10 +181,13 @@ public class BigTableReader extends SSTableReader
         }
         if (skip)
         {
-            if (op == Operator.EQ && updateCacheAndStats)
+            if (op == Operator.EQ && updateCacheAndStats) {
                 bloomFilterTracker.addFalsePositive();
+                logger.info("Found false positive.");
+            }
             listener.onSSTableSkipped(this, SkippingReason.MIN_MAX_KEYS);
             Tracing.trace("Check against min and max keys allows skipping sstable {}", descriptor.generation);
+//            logger.info("Check against min and max keys allows skipping sstable {}", descriptor.generation);
             return null;
         }
 
@@ -267,6 +271,7 @@ public class BigTableReader extends SSTableReader
                         bloomFilterTracker.addTruePositive();
                     listener.onSSTableSelected(this, indexEntry, SelectionReason.INDEX_ENTRY_FOUND);
                     Tracing.trace("Partition index with {} entries found for sstable {}", indexEntry.columnsIndexCount(), descriptor.generation);
+//                    logger.info("Partition index with {} entries found for sstable {}", indexEntry.columnsIndexCount(), descriptor.generation);
                     return indexEntry;
                 }
 
