@@ -530,7 +530,7 @@ public abstract class ReadCommand extends MonitorableImpl implements ReadQuery
                 {
                     String msg = String.format("Read %d live rows and %d tombstone cells for query %1.512s (see tombstone_warn_threshold)", liveRows, tombstones, ReadCommand.this.toCQLString());
                     ClientWarn.instance.warn(msg);
-                    logger.warn(msg);
+//                    logger.warn(msg);
                 }
 
                 Tracing.trace("Read {} live and {} tombstone cells{}", liveRows, tombstones, (warnTombstones ? " (see tombstone_warn_threshold)" : ""));

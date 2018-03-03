@@ -150,7 +150,7 @@ public class BloomFilter extends WrappedSharedCloseable implements IFilter
             }
         }
 
-        logger.info("BloomFilter.isPresent(); key={}; isPresent={}", key, present);
+//        logger.info("BloomFilter.isPresent(); key={}; isPresent={}", key, present);
 
         return present;
     }

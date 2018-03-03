@@ -80,7 +80,7 @@ public class CuckooFilter implements IFilter {
         HashCode[] hashCode = getHashCode(key);
         boolean present = cuckooFilter.mightContain(getItem(key), hashCode[0], hashCode[1]);
 
-        logger.info("CuckooFilter.isPresent(); key={}; isPresent={}", key, present);
+//        logger.info("CuckooFilter.isPresent(); key={}; isPresent={}", key, present);
 
         return present;
     }
