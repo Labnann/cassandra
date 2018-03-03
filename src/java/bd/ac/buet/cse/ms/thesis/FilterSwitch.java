@@ -23,7 +23,7 @@ public class FilterSwitch {
     public static final int BLOOM_FILTER = 0;
     public static final int CUCKOO_FILTER = 1;
 
-    public static final int MIN_NO_OF_ELEMENTS_IN_CUCKOO_FILTER = 2000000;
+    public static final int MIN_NO_OF_ELEMENTS_IN_CUCKOO_FILTER = 4;
 
     public static int filter = CUCKOO_FILTER;
 
