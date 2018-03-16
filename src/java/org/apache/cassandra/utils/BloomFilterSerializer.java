@@ -47,7 +47,7 @@ final class BloomFilterSerializer
     public static BloomFilter deserialize(DataInput in, boolean offheap, boolean oldBfHashOrder) throws IOException
     {
         int hashes = in.readInt();
-        IBitSet bs = offheap ? OffHeapBitSet.deserialize(in) : OpenBitSet.deserialize(in);
+        IBitSet bs = OpenBitSet.deserialize(in);
 
         return new BloomFilter(hashes, bs, oldBfHashOrder);
     }
