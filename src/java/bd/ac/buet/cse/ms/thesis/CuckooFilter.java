@@ -82,7 +82,21 @@ public class CuckooFilter implements IFilter {
 
 //        logger.info("CuckooFilter.isPresent(); key={}; isPresent={}", key, present);
 
+//        logFilterStats();
+
         return present;
+    }
+
+    private void logFilterStats() {
+        int filterHashCode = System.identityHashCode(cuckooFilter);
+        double loadFactor = cuckooFilter.getLoadFactor();
+        long noOfItemsInFilter = cuckooFilter.getCount();
+        long actualCapacity = cuckooFilter.getActualCapacity();
+        long storageSize = cuckooFilter.getStorageSize();
+        long serializedSize = serializedSize();
+
+        logger.info("CuckooFilter.stats(); filterHashCode={}; loadFactor={}; noOfItemsInFilter={}; actualCapacity={}; storageSize={}; serializedSize={}",
+                    filterHashCode, loadFactor, noOfItemsInFilter, actualCapacity, storageSize, serializedSize);
     }
 
     @Override

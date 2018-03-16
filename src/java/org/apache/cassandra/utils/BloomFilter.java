@@ -29,6 +29,8 @@ import org.apache.cassandra.tracing.Tracing;
 import org.apache.cassandra.utils.concurrent.Ref;
 import org.apache.cassandra.utils.concurrent.WrappedSharedCloseable;
 import org.apache.cassandra.utils.obs.IBitSet;
+import org.apache.cassandra.utils.obs.OffHeapBitSet;
+import org.apache.cassandra.utils.obs.OpenBitSet;
 
 public class BloomFilter extends WrappedSharedCloseable implements IFilter
 {
@@ -152,7 +154,49 @@ public class BloomFilter extends WrappedSharedCloseable implements IFilter
 
 //        logger.info("BloomFilter.isPresent(); key={}; isPresent={}", key, present);
 
+//        logFilterStats();
+
         return present;
+    }
+
+    private void logFilterStats() {
+        OpenBitSet openBitSet;
+        OffHeapBitSet offHeapBitSet;
+        try {
+            openBitSet = (OpenBitSet) bitset;
+
+            int filterHashCode = System.identityHashCode(openBitSet);
+            long noOfItemsInFilter = 0;
+            for (int i = 0; i < openBitSet.size(); i++) {
+                if (openBitSet.get(i)) {
+                    noOfItemsInFilter++;
+                }
+            }
+            long actualCapacity = openBitSet.capacity();
+            long storageSize = openBitSet.size();
+            long serializedSize = openBitSet.serializedSize();
+            double loadFactor = (double) noOfItemsInFilter / (double) storageSize;
+
+            logger.info("BloomFilter.stats() [openbitset]; filterHashCode={}; loadFactor={}; noOfItemsInFilter={}; actualCapacity={}; storageSize={}; serializedSize={}",
+                        filterHashCode, loadFactor, noOfItemsInFilter, actualCapacity, storageSize, serializedSize);
+        } catch (ClassCastException e) {
+            offHeapBitSet = (OffHeapBitSet) bitset;
+
+            int filterHashCode = System.identityHashCode(offHeapBitSet);
+            long noOfItemsInFilter = 0;
+            for (int i = 0; i < offHeapBitSet.offHeapSize(); i++) {
+                if (offHeapBitSet.get(i)) {
+                    noOfItemsInFilter++;
+                }
+            }
+            long actualCapacity = offHeapBitSet.capacity();
+            long storageSize = offHeapBitSet.offHeapSize();
+            long serializedSize = offHeapBitSet.serializedSize();
+            double loadFactor = (double) noOfItemsInFilter / actualCapacity;
+
+            logger.info("BloomFilter.stats() [offheapbitset]; filterHashCode={}; loadFactor={}; noOfItemsInFilter={}; actualCapacity={}; storageSize={}; serializedSize={}",
+                        filterHashCode, loadFactor, noOfItemsInFilter, actualCapacity, storageSize, serializedSize);
+        }
     }
 
     public void clear()
