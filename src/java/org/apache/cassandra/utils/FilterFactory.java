@@ -106,7 +106,19 @@ public class FilterFactory
     @SuppressWarnings("resource")
     private static IFilter createFilter(int hash, long numElements, int bucketsPer, boolean offheap, boolean oldBfHashOrder)
     {
-        long numBits = (numElements * bucketsPer) + BITSET_EXCESS;
+        long numBits = 0;
+        switch (FilterSwitch.loadPercentage) {
+            case 0:
+                numBits = (long) (numElements * Math.pow(bucketsPer, 3)) + BITSET_EXCESS;
+                break;
+            case 50:
+                numBits = (long) (numElements * bucketsPer / 1.5) + BITSET_EXCESS;
+                break;
+            case 100:
+                numBits = (long) (numElements * bucketsPer / 6) + BITSET_EXCESS;
+                break;
+        }
+
         IBitSet bitset = new OpenBitSet(numBits);
         return new BloomFilter(hash, bitset, oldBfHashOrder);
     }

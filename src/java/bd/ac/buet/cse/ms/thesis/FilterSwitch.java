@@ -25,6 +25,10 @@ public class FilterSwitch {
 
     public static final int MIN_NO_OF_ELEMENTS_IN_CUCKOO_FILTER = 4;
 
-    public static int filter = CUCKOO_FILTER;
+    public static final boolean LOG_STATS = false;
+    public static final boolean LOG_LOOKUP_RESULTS = false;
+
+    public static final int loadPercentage = 50;
+    public static final int filter = CUCKOO_FILTER;
 
 }
