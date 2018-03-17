@@ -181,9 +181,11 @@ public class BigTableReader extends SSTableReader
         }
         if (skip)
         {
-            if (op == Operator.EQ && updateCacheAndStats) {
-                bloomFilterTracker.addFalsePositive();
-                logger.info("Found false positive.");
+            if (op == Operator.EQ) {
+                if (updateCacheAndStats) {
+                    bloomFilterTracker.addFalsePositive();
+                }
+                logger.warn("Found false positive!");
             }
             listener.onSSTableSkipped(this, SkippingReason.MIN_MAX_KEYS);
             Tracing.trace("Check against min and max keys allows skipping sstable {}", descriptor.generation);
