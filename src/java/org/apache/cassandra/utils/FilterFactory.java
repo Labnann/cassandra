@@ -111,8 +111,14 @@ public class FilterFactory
             case 0:
                 numBits = (long) (numElements * Math.pow(bucketsPer, 3)) + BITSET_EXCESS;
                 break;
+            case 25:
+                numBits = (long) (numElements * Math.pow(bucketsPer, 1.23)) + BITSET_EXCESS;
+                break;
             case 50:
                 numBits = (long) (numElements * bucketsPer / 1.5) + BITSET_EXCESS;
+                break;
+            case 75:
+                numBits = (long) (numElements * bucketsPer / 3) + BITSET_EXCESS;
                 break;
             case 100:
                 numBits = (long) (numElements * bucketsPer / 6) + BITSET_EXCESS;
