@@ -18,9 +18,10 @@
 
 package bd.ac.buet.cse.ms.thesis;
 
+import java.io.Serializable;
+
 import com.google.common.hash.Funnels;
 import com.google.common.hash.HashCode;
-
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -29,7 +30,7 @@ import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.utils.IFilter;
 import org.apache.cassandra.utils.concurrent.Ref;
 
-public class CuckooFilter implements IFilter {
+public class CuckooFilter implements IFilter,Serializable {
 
     private static final Logger logger = LoggerFactory.getLogger(CuckooFilter.class);
 
@@ -44,14 +45,10 @@ public class CuckooFilter implements IFilter {
 //        logger.info("Initialized CuckooFilter. {}", this);
     }
 
-    CuckooFilter(com.github.mgunlogson.cuckoofilter4j.CuckooFilter<byte[]> underlyingCuckooFilter) {
-        this.cuckooFilter = underlyingCuckooFilter;
+    private CuckooFilter(CuckooFilter copy) {
+        this.cuckooFilter = copy.cuckooFilter;
 
 //        logger.info("Shared copied CuckooFilter. {}", this);
-    }
-
-    public com.github.mgunlogson.cuckoofilter4j.CuckooFilter<byte[]> getUnderlyingCuckooFilter() {
-        return cuckooFilter;
     }
 
     @Override
@@ -60,6 +57,14 @@ public class CuckooFilter implements IFilter {
         boolean successful = cuckooFilter.put(getItem(key), hashCode[0], hashCode[1]);
 
 //        logger.info("CuckooFilter.add(); key={}; isSuccessful={}", key, successful);
+    }
+
+    @Override
+    public void delete(FilterKey key) {
+        HashCode[] hashCode = getHashCode(key);
+        boolean successful = cuckooFilter.delete(getItem(key), hashCode[0], hashCode[1]);
+
+//        logger.info("CuckooFilter.delete(); key={}; isSuccessful={}", key, successful);
     }
 
     private byte[] getItem(FilterKey key) {
@@ -105,7 +110,7 @@ public class CuckooFilter implements IFilter {
 
     @Override
     public IFilter sharedCopy() {
-        return new CuckooFilter(cuckooFilter);
+        return new CuckooFilter(this);
     }
 
     @Override

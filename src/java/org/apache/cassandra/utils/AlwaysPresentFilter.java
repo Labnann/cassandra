@@ -28,6 +28,8 @@ public class AlwaysPresentFilter implements IFilter
 
     public void add(FilterKey key) { }
 
+    public void delete(FilterKey key) { }
+
     public void clear() { }
 
     public void close() { }

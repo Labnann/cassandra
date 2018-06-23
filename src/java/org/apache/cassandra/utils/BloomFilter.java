@@ -164,6 +164,11 @@ public class BloomFilter extends WrappedSharedCloseable implements IFilter
         return present;
     }
 
+    @Override
+    public void delete(FilterKey key) {
+        //no-op
+    }
+
     private void logFilterStats() {
         OpenBitSet openBitSet;
         OffHeapBitSet offHeapBitSet;

@@ -37,7 +37,7 @@ public final class CuckooFilterSerializer {
     }
 
     private static byte[] getSerializedFilterBytes(CuckooFilter cuckooFilter) {
-        return SerializationUtils.serialize(cuckooFilter.getUnderlyingCuckooFilter());
+        return SerializationUtils.serialize(cuckooFilter);
     }
 
     @SuppressWarnings({ "UncheckedCast", "unchecked" })
@@ -46,7 +46,7 @@ public final class CuckooFilterSerializer {
         byte[] bytes = new byte[(int) size];
         in.readFully(bytes);
 
-        return new CuckooFilter((com.github.mgunlogson.cuckoofilter4j.CuckooFilter<byte[]>) SerializationUtils.deserialize(bytes));
+        return (CuckooFilter) SerializationUtils.deserialize(bytes);
     }
 
     /**

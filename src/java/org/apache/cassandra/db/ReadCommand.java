@@ -17,33 +17,60 @@
  */
 package org.apache.cassandra.db;
 
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.NavigableSet;
+import java.util.SortedSet;
+import java.util.TreeSet;
 import java.util.function.Predicate;
-
 import javax.annotation.Nullable;
 
 import com.google.common.collect.Lists;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.config.*;
+import bd.ac.buet.cse.ms.thesis.FilterSwitch;
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.config.Schema;
+import org.apache.cassandra.config.SchemaConstants;
 import org.apache.cassandra.cql3.Operator;
-import org.apache.cassandra.db.filter.*;
+import org.apache.cassandra.db.filter.ClusteringIndexFilter;
+import org.apache.cassandra.db.filter.ClusteringIndexNamesFilter;
+import org.apache.cassandra.db.filter.ClusteringIndexSliceFilter;
+import org.apache.cassandra.db.filter.ColumnFilter;
+import org.apache.cassandra.db.filter.DataLimits;
+import org.apache.cassandra.db.filter.RowFilter;
+import org.apache.cassandra.db.filter.TombstoneOverwhelmingException;
+import org.apache.cassandra.db.lifecycle.SSTableSet;
+import org.apache.cassandra.db.lifecycle.View;
 import org.apache.cassandra.db.monitoring.ApproximateTime;
 import org.apache.cassandra.db.monitoring.MonitorableImpl;
-import org.apache.cassandra.db.partitions.*;
-import org.apache.cassandra.db.rows.*;
+import org.apache.cassandra.db.partitions.PartitionIterator;
+import org.apache.cassandra.db.partitions.PurgeFunction;
+import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
+import org.apache.cassandra.db.partitions.UnfilteredPartitionIterators;
+import org.apache.cassandra.db.rows.Cell;
+import org.apache.cassandra.db.rows.RangeTombstoneMarker;
+import org.apache.cassandra.db.rows.Row;
+import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.db.transform.StoppingTransformation;
 import org.apache.cassandra.db.transform.Transformation;
 import org.apache.cassandra.dht.AbstractBounds;
 import org.apache.cassandra.index.Index;
 import org.apache.cassandra.index.IndexNotAvailableException;
+import org.apache.cassandra.io.FSWriteError;
 import org.apache.cassandra.io.ForwardingVersionedSerializer;
 import org.apache.cassandra.io.IVersionedSerializer;
+import org.apache.cassandra.io.sstable.Component;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.util.BufferedDataOutputStreamPlus;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.io.util.DataOutputStreamPlus;
 import org.apache.cassandra.metrics.TableMetrics;
 import org.apache.cassandra.net.MessageOut;
 import org.apache.cassandra.net.MessagingService;
@@ -53,7 +80,10 @@ import org.apache.cassandra.service.ClientWarn;
 import org.apache.cassandra.tracing.Tracing;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.FilterFactory;
+import org.apache.cassandra.utils.IFilter;
 import org.apache.cassandra.utils.Pair;
+import org.apache.cassandra.utils.SyncUtil;
 
 /**
  * General interface for storage-engine read commands (common to both range and
@@ -420,7 +450,7 @@ public abstract class ReadCommand extends MonitorableImpl implements ReadQuery
         try
         {
             resultIterator = withStateTracking(resultIterator);
-            resultIterator = withMetricsRecording(withoutPurgeableTombstones(resultIterator, cfs), cfs.metric, startTimeNanos);
+            resultIterator = withMetricsRecording(withoutPurgeableTombstones(resultIterator, cfs), cfs.metric, startTimeNanos, resultIterator, cfs);
 
             // If we've used a 2ndary index, we know the result already satisfy the primary expression used, so
             // no point in checking it again.
@@ -457,7 +487,7 @@ public abstract class ReadCommand extends MonitorableImpl implements ReadQuery
      * Wraps the provided iterator so that metrics on what is scanned by the command are recorded.
      * This also log warning/trow TombstoneOverwhelmingException if appropriate.
      */
-    private UnfilteredPartitionIterator withMetricsRecording(UnfilteredPartitionIterator iter, final TableMetrics metric, final long startTimeNanos)
+    private UnfilteredPartitionIterator withMetricsRecording(UnfilteredPartitionIterator iter, final TableMetrics metric, final long startTimeNanos, UnfilteredPartitionIterator originalIter, ColumnFamilyStore cfs)
     {
         class MetricRecording extends Transformation<UnfilteredRowIterator>
         {
@@ -471,6 +501,13 @@ public abstract class ReadCommand extends MonitorableImpl implements ReadQuery
             private int tombstones = 0;
 
             private DecoratedKey currentKey;
+            private UnfilteredPartitionIterator originalIterator;
+            private ColumnFamilyStore cfs;
+
+            private MetricRecording(UnfilteredPartitionIterator originalIterator, ColumnFamilyStore cfs) {
+                this.originalIterator = originalIterator;
+                this.cfs = cfs;
+            }
 
             @Override
             public UnfilteredRowIterator applyToPartition(UnfilteredRowIterator iter)
@@ -535,10 +572,50 @@ public abstract class ReadCommand extends MonitorableImpl implements ReadQuery
 
                 Tracing.trace("Read {} live and {} tombstone cells{}", liveRows, tombstones, (warnTombstones ? " (see tombstone_warn_threshold)" : ""));
 //                logger.info("Read {} live and {} tombstone cells{}", liveRows, tombstones, (warnTombstones ? " (see tombstone_warn_threshold)" : ""));
+
+                if (FilterSwitch.filter == FilterSwitch.CUCKOO_FILTER
+                    && FilterSwitch.ENABLE_CUCKOO_DELETION
+                    && ReadCommand.this.getClass() == SinglePartitionReadCommand.class) {
+
+                    SinglePartitionReadCommand readCommand = (SinglePartitionReadCommand) ReadCommand.this;
+                    CFMetaData readCommandMetaData = readCommand.metadata();
+                    DecoratedKey key = readCommand.partitionKey();
+
+                    if (!readCommandMetaData.ksName.equals("system")
+                        && !readCommandMetaData.ksName.equals("system_distributed")
+                        && !readCommandMetaData.ksName.equals("system_schema")
+                        && !readCommandMetaData.ksName.equals("system_auth")
+                        && !readCommandMetaData.ksName.equals("system_traces")
+                        && !readCommandMetaData.getKeyValidator().getString(key.getKey()).isEmpty()
+                        && readCommand.rowFilter().isEmpty()
+                        && liveRows == 0) {
+
+                        for (SSTableReader sstable : cfs.select(View.select(SSTableSet.LIVE, key)).sstables) {
+                            IFilter filter = sstable.getBloomFilter();
+                            if (filter.isPresent(key)) {
+
+                                logger.info("Delete key from Cuckoo Filter. sstable: " + sstable.descriptor.generation);
+
+                                filter.delete(key);
+
+                                // flush filter
+                                String path = sstable.descriptor.filenameFor(Component.FILTER);
+                                try (FileOutputStream fos = new FileOutputStream(path);
+                                     DataOutputStreamPlus stream = new BufferedDataOutputStreamPlus(fos)) {
+                                    FilterFactory.serialize(filter, stream);
+                                    stream.flush();
+                                    SyncUtil.sync(fos);
+                                } catch (IOException e) {
+                                    throw new FSWriteError(e, path);
+                                }
+                            }
+                        }
+                    }
+                }
             }
         };
 
-        return Transformation.apply(iter, new MetricRecording());
+        return Transformation.apply(iter, new MetricRecording(originalIter, cfs));
     }
 
     protected class CheckForAbort extends StoppingTransformation<UnfilteredRowIterator>

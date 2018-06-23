@@ -27,6 +27,7 @@ public class FilterSwitch {
 
     public static final boolean LOG_STATS = false;
     public static final boolean LOG_LOOKUP_RESULTS = false;
+    public static final boolean ENABLE_CUCKOO_DELETION = true;
 
     public static final int loadPercentage = 50;
     public static final int filter = CUCKOO_FILTER;

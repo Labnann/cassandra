@@ -31,6 +31,8 @@ public interface IFilter extends SharedCloseable
 
     boolean isPresent(FilterKey key);
 
+    void delete(FilterKey key);
+
     void clear();
 
     long serializedSize();

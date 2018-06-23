@@ -35,6 +35,7 @@ import com.github.mgunlogson.cuckoofilter4j.Utils.Victim;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.hash.Funnel;
 import com.google.common.hash.HashCode;
+import com.google.common.hash.Hasher;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -753,7 +754,17 @@ public final class CuckooFilter<T> implements Serializable {
      */
 
     public boolean delete(T item) {
-        BucketAndTag pos = hasher.generate(item);
+        return delete(hasher.generate(item));
+    }
+
+    /**
+     * @see CuckooFilter#delete(java.lang.Object)
+     */
+    public boolean delete(T item, HashCode firstHashCode, HashCode secondHashCode) {
+        return delete(hasher.generate(item, firstHashCode, secondHashCode));
+    }
+
+    private boolean delete(BucketAndTag pos) {
         long i1 = pos.index;
         long i2 = hasher.altIndex(pos.index, pos.tag);
         bucketLocker.lockBucketsWrite(i1, i2);
