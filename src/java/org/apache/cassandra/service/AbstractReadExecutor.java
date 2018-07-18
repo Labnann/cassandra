@@ -26,11 +26,14 @@ import com.google.common.collect.Iterables;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import bd.ac.buet.cse.ms.thesis.FilterSwitch;
+import bd.ac.buet.cse.ms.thesis.GlobalFilterService;
 import org.apache.cassandra.concurrent.Stage;
 import org.apache.cassandra.concurrent.StageManager;
 import org.apache.cassandra.config.ReadRepairDecision;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.ConsistencyLevel;
+import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.ReadCommand;
 import org.apache.cassandra.db.SinglePartitionReadCommand;
 import org.apache.cassandra.db.Keyspace;
@@ -101,6 +104,20 @@ public abstract class AbstractReadExecutor
             {
                 hasLocalEndpoint = true;
                 continue;
+            }
+
+            if (readCommand instanceof SinglePartitionReadCommand && FilterSwitch.ENABLE_GLOBAL_FILTER)
+            {
+                DecoratedKey key = ((SinglePartitionReadCommand) readCommand).partitionKey();
+                String cfName = readCommand.metadata().cfName;
+                String ksName = readCommand.metadata().ksName;
+
+                if (!GlobalFilterService.isSystemKeyspace(ksName)
+                    && !GlobalFilterService.instance().isPresent(key, cfName, ksName)) {
+                    logger.info("Global Filter permits skipping read from remote node");
+                    hasLocalEndpoint = true;
+                    continue;
+                }
             }
 
             if (traceState != null)

@@ -31,6 +31,7 @@ import javax.management.ObjectName;
 import javax.management.StandardMBean;
 import javax.management.remote.JMXConnectorServer;
 
+import bd.ac.buet.cse.ms.thesis.GlobalFilterService;
 import com.addthis.metrics3.reporter.config.ReporterConfig;
 import com.codahale.metrics.Meter;
 import com.codahale.metrics.MetricRegistryListener;
@@ -194,6 +195,8 @@ public class CassandraDaemon
         logSystemInfo();
 
         NativeLibrary.tryMlockall();
+
+        GlobalFilterService.initialize();
 
         try
         {

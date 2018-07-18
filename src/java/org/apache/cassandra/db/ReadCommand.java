@@ -32,6 +32,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import bd.ac.buet.cse.ms.thesis.FilterSwitch;
+import bd.ac.buet.cse.ms.thesis.GlobalFilterService;
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.ColumnDefinition;
 import org.apache.cassandra.config.DatabaseDescriptor;
@@ -581,11 +582,7 @@ public abstract class ReadCommand extends MonitorableImpl implements ReadQuery
                     CFMetaData readCommandMetaData = readCommand.metadata();
                     DecoratedKey key = readCommand.partitionKey();
 
-                    if (!readCommandMetaData.ksName.equals("system")
-                        && !readCommandMetaData.ksName.equals("system_distributed")
-                        && !readCommandMetaData.ksName.equals("system_schema")
-                        && !readCommandMetaData.ksName.equals("system_auth")
-                        && !readCommandMetaData.ksName.equals("system_traces")
+                    if (!GlobalFilterService.isSystemKeyspace(readCommandMetaData.ksName)
                         && !readCommandMetaData.getKeyValidator().getString(key.getKey()).isEmpty()
                         && readCommand.rowFilter().isEmpty()
                         && liveRows == 0) {
@@ -597,6 +594,7 @@ public abstract class ReadCommand extends MonitorableImpl implements ReadQuery
                                 logger.info("Delete key from Cuckoo Filter. sstable: " + sstable.descriptor.generation);
 
                                 filter.delete(key);
+                                GlobalFilterService.instance().delete(key, readCommandMetaData.cfName, readCommandMetaData.ksName);
 
                                 // flush filter
                                 String path = sstable.descriptor.filenameFor(Component.FILTER);

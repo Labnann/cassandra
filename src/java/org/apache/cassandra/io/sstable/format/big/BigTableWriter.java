@@ -28,6 +28,7 @@ import java.util.Optional;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import bd.ac.buet.cse.ms.thesis.GlobalFilterService;
 import org.apache.cassandra.cache.ChunkCache;
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.Config;
@@ -457,6 +458,7 @@ public class BigTableWriter extends SSTableWriter
         public void append(DecoratedKey key, RowIndexEntry indexEntry, long dataEnd, ByteBuffer indexInfo) throws IOException
         {
             bf.add(key);
+            GlobalFilterService.instance().add(key, metadata.cfName, metadata.ksName);
             long indexStart = indexFile.position();
             try
             {
