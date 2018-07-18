@@ -174,8 +174,6 @@ public class Server implements CassandraDaemon.Server
         // Close opened connections
         connectionTracker.closeAll();
 
-        GlobalFilterService.destroy();
-
         logger.info("Stop listening for CQL clients");
     }
 

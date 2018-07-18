@@ -5,8 +5,6 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.Arrays;
 import java.util.HashMap;
-import java.util.concurrent.locks.Lock;
-import java.util.concurrent.locks.ReentrantLock;
 
 import org.apache.commons.lang.SerializationUtils;
 import org.slf4j.Logger;
@@ -15,6 +13,7 @@ import org.slf4j.LoggerFactory;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.utils.IFilter;
+import org.apache.hadoop.util.hash.MurmurHash;
 
 public class GlobalFilterService {
 
@@ -24,18 +23,14 @@ public class GlobalFilterService {
                                                                   "system_auth", "system_traces" };
 
     private static final String GLOBAL_FILTER_FILE_NAME = "Filters.db";
-    private static final long FILTER_DIRTY_MONITORING_INTERVAL_MILLIS = 5 * 1000;
+    private static final int FILTER_NUM_OF_ELEMENTS = 1000;
+    private static final double FILTER_FALSE_POSITIVE_RATE = 0.01;
 
     private static GlobalFilterService service;
 
     private HashMap<String /* KeySpace */, HashMap<String /* ColumnFamily */, IFilter>> tableFilters = new HashMap<>();
 
-    private boolean dirty = false;
-    private boolean stopService = false;
-
-    private final FilterMonitor filterMonitor = new FilterMonitor();
-
-    private final Lock lock = new ReentrantLock();
+    private long lastSavedFilterHash = 0;
 
     public static boolean isSystemKeyspace(String ksName) {
         return Arrays.asList(SYSTEM_KEYSPACES).contains(ksName);
@@ -48,12 +43,6 @@ public class GlobalFilterService {
 
         service = new GlobalFilterService();
         service.loadFiltersFromDisk();
-        service.startFilterDirtyMonitor();
-    }
-
-    public static synchronized void destroy() {
-        service.stopService = true;
-        service.filterMonitor.interrupt();
     }
 
     public static synchronized GlobalFilterService instance() {
@@ -65,6 +54,10 @@ public class GlobalFilterService {
     }
 
     public void add(DecoratedKey key, String columnFamily, String keySpace) {
+        if (!FilterSwitch.ENABLE_GLOBAL_FILTER) {
+            return;
+        }
+
         if (isSystemKeyspace(keySpace)) {
             logger.trace("Ignoring adding key to global filter for system keyspace {}", keySpace);
 
@@ -77,15 +70,17 @@ public class GlobalFilterService {
 
         HashMap<String, IFilter> cfFilterMap = tableFilters.get(keySpace);
         if (!cfFilterMap.containsKey(columnFamily)) {
-            cfFilterMap.put(columnFamily, createFilter());
+            cfFilterMap.put(columnFamily, new CuckooFilter(FILTER_NUM_OF_ELEMENTS, FILTER_FALSE_POSITIVE_RATE));
         }
 
         cfFilterMap.get(columnFamily).add(key);
-
-        markDirty();
     }
 
     public void delete(DecoratedKey key, String columnFamily, String keySpace) {
+        if (!FilterSwitch.ENABLE_GLOBAL_FILTER) {
+            return;
+        }
+
         if (isSystemKeyspace(keySpace)) {
             logger.trace("Ignoring deleting key from global filter for system keyspace {}", keySpace);
 
@@ -106,8 +101,6 @@ public class GlobalFilterService {
         }
 
         cfFilterMap.get(columnFamily).delete(key);
-
-        markDirty();
     }
 
     public boolean isPresent(DecoratedKey key, String columnFamily, String keySpace) {
@@ -131,31 +124,15 @@ public class GlobalFilterService {
         return cfFilterMap.get(columnFamily).isPresent(key);
     }
 
-    private IFilter createFilter() {
-        int numOfElements = 1000;
-        double falsePositiveRate = 0.01;
-
-        return new CuckooFilter(numOfElements, falsePositiveRate);
-    }
-
-    private void markDirty() {
-        lock.lock();
-        try {
-            dirty = true;
-        } finally {
-            lock.unlock();
-        }
-    }
-
     private GlobalFilterService() {
         // ignored
     }
 
-    private void startFilterDirtyMonitor() {
-        service.filterMonitor.start();
-    }
-
     private void loadFiltersFromDisk() {
+        if (!FilterSwitch.ENABLE_GLOBAL_FILTER) {
+            return;
+        }
+
         Path globalFiltersPath = getGlobalFiltersPath();
 
         logger.debug("Global Filters Path: {}", globalFiltersPath.toAbsolutePath());
@@ -166,18 +143,32 @@ public class GlobalFilterService {
                 //noinspection unchecked
                 tableFilters = (HashMap<String, HashMap<String, IFilter>>) SerializationUtils.deserialize(filterBytes);
             } catch (Exception e) {
-                throw new RuntimeException("Cannot load Global Filter", e);
+                throw new RuntimeException("Cannot load Global Filters", e);
             }
 
-            logger.debug("Loaded filters from disk");
+            logger.debug("Loaded Global Filters from disk");
         }
         else {
-            logger.debug("Global Filter does not exist on disk.");
+            logger.debug("Global Filters does not exist on disk.");
         }
     }
 
-    private void saveFiltersToDisk() {
+    public void saveFiltersToDisk() {
+        if (!FilterSwitch.ENABLE_GLOBAL_FILTER) {
+            return;
+        }
+
         byte[] bytes = SerializationUtils.serialize(tableFilters);
+
+        int hash = MurmurHash.getInstance().hash(bytes);
+
+        if (hash == lastSavedFilterHash) {
+            logger.debug("Skipping saving Global Filters as apparently it hasn't changed.");
+
+            return;
+        }
+
+        lastSavedFilterHash = hash;
 
         try {
             Files.write(getGlobalFiltersPath(), bytes);
@@ -185,7 +176,7 @@ public class GlobalFilterService {
             throw new RuntimeException("Cannot save Global Filter", e);
         }
 
-        logger.info("Saved filters to disk.");
+        logger.debug("Saved Global Filters to disk.");
     }
 
     private Path getGlobalFiltersPath() {
@@ -193,34 +184,5 @@ public class GlobalFilterService {
         String storageDir = dataDir.substring(0, dataDir.length() - 5);
 
         return Paths.get(storageDir + '/' + GLOBAL_FILTER_FILE_NAME);
-    }
-
-
-    private class FilterMonitor extends Thread {
-        @Override
-        public void run() {
-            logger.info("Starting Filter Monitor Service.");
-            while (true) {
-                try {
-                    if (dirty) {
-                        lock.lock();
-                        try {
-                            saveFiltersToDisk();
-                            dirty = false;
-                        } finally {
-                            lock.unlock();
-                        }
-                    }
-
-                    if (stopService) {
-                        logger.info("Stopped Filter Monitor Service.");
-                        break;
-                    }
-
-                    Thread.sleep(FILTER_DIRTY_MONITORING_INTERVAL_MILLIS);
-                } catch (InterruptedException ignore) {
-                }
-            }
-        }
     }
 }

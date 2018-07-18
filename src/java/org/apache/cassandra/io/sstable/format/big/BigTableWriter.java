@@ -492,6 +492,7 @@ public class BigTableWriter extends SSTableWriter
                     FilterFactory.serialize(bf, stream);
                     stream.flush();
                     SyncUtil.sync(fos);
+                    GlobalFilterService.instance().saveFiltersToDisk();
                 }
                 catch (IOException e)
                 {

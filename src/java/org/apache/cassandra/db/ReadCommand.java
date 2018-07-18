@@ -603,6 +603,7 @@ public abstract class ReadCommand extends MonitorableImpl implements ReadQuery
                                     FilterFactory.serialize(filter, stream);
                                     stream.flush();
                                     SyncUtil.sync(fos);
+                                    GlobalFilterService.instance().saveFiltersToDisk();
                                 } catch (IOException e) {
                                     throw new FSWriteError(e, path);
                                 }
