@@ -12,6 +12,7 @@ import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.IFilter;
 import org.apache.hadoop.util.hash.MurmurHash;
 
@@ -28,9 +29,10 @@ public class GlobalFilterService {
 
     private static GlobalFilterService service;
 
-    private HashMap<String /* KeySpace */, HashMap<String /* ColumnFamily */, IFilter>> tableFilters = new HashMap<>();
+    private HashMap<String /* IP */, HashMap<String /* KeySpace */, HashMap<String /* ColumnFamily */, IFilter>>> tableFilters = new HashMap<>();
 
     private long lastSavedFilterHash = 0;
+    private String nodeIp = null;
 
     public static boolean isSystemKeyspace(String ksName) {
         return Arrays.asList(SYSTEM_KEYSPACES).contains(ksName);
@@ -42,6 +44,7 @@ public class GlobalFilterService {
         }
 
         service = new GlobalFilterService();
+        service.nodeIp = FBUtilities.getBroadcastAddress().toString();
         service.loadFiltersFromDisk();
     }
 
@@ -64,11 +67,16 @@ public class GlobalFilterService {
             return;
         }
 
-        if (!tableFilters.containsKey(keySpace)) {
-            tableFilters.put(keySpace, new HashMap<>());
+        if (!tableFilters.containsKey(nodeIp)) {
+            tableFilters.put(nodeIp, new HashMap<>());
         }
 
-        HashMap<String, IFilter> cfFilterMap = tableFilters.get(keySpace);
+        HashMap<String, HashMap<String, IFilter>> ksMap = tableFilters.get(nodeIp);
+        if (!ksMap.containsKey(keySpace)) {
+            ksMap.put(keySpace, new HashMap<>());
+        }
+
+        HashMap<String, IFilter> cfFilterMap = ksMap.get(keySpace);
         if (!cfFilterMap.containsKey(columnFamily)) {
             cfFilterMap.put(columnFamily, new CuckooFilter(FILTER_NUM_OF_ELEMENTS, FILTER_FALSE_POSITIVE_RATE));
         }
@@ -87,13 +95,20 @@ public class GlobalFilterService {
             return;
         }
 
-        if (!tableFilters.containsKey(keySpace)) {
+        if (!tableFilters.containsKey(nodeIp)) {
+            logger.warn("Tried to delete key from nonexistent filter. IP: {}", nodeIp);
+
+            return;
+        }
+
+        HashMap<String, HashMap<String, IFilter>> ksMap = tableFilters.get(nodeIp);
+        if (!ksMap.containsKey(keySpace)) {
             logger.warn("Tried to delete key from nonexistent filter. KeySpace: {}", keySpace);
 
             return;
         }
 
-        HashMap<String, IFilter> cfFilterMap = tableFilters.get(keySpace);
+        HashMap<String, IFilter> cfFilterMap = ksMap.get(keySpace);
         if (!cfFilterMap.containsKey(columnFamily)) {
             logger.warn("Tried to delete key from nonexistent filter. ColumnFamily: {}", columnFamily);
 
@@ -103,18 +118,25 @@ public class GlobalFilterService {
         cfFilterMap.get(columnFamily).delete(key);
     }
 
-    public boolean isPresent(DecoratedKey key, String columnFamily, String keySpace) {
+    public boolean isPresent(DecoratedKey key, String columnFamily, String keySpace, String ip) {
         if (isSystemKeyspace(keySpace)) {
             throw new RuntimeException("Key lookup from system keyspace (" + keySpace + ") is not allowed.");
         }
 
-        if (!tableFilters.containsKey(keySpace)) {
+        if (!tableFilters.containsKey(ip)) {
+            logger.warn("Tried to lookup key from nonexistent filter. IP: {}", ip);
+
+            return false;
+        }
+
+        HashMap<String, HashMap<String, IFilter>> ksMap = tableFilters.get(ip);
+        if (!ksMap.containsKey(keySpace)) {
             logger.warn("Tried to lookup key from nonexistent filter. KeySpace: {}", keySpace);
 
             return false;
         }
 
-        HashMap<String, IFilter> cfFilterMap = tableFilters.get(keySpace);
+        HashMap<String, IFilter> cfFilterMap = ksMap.get(keySpace);
         if (!cfFilterMap.containsKey(columnFamily)) {
             logger.warn("Tried to lookup key from nonexistent filter. ColumnFamily: {}", columnFamily);
 
@@ -141,7 +163,7 @@ public class GlobalFilterService {
             try {
                 byte[] filterBytes = Files.readAllBytes(globalFiltersPath);
                 //noinspection unchecked
-                tableFilters = (HashMap<String, HashMap<String, IFilter>>) SerializationUtils.deserialize(filterBytes);
+                tableFilters = (HashMap<String, HashMap<String,HashMap<String,IFilter>>>) SerializationUtils.deserialize(filterBytes);
             } catch (Exception e) {
                 throw new RuntimeException("Cannot load Global Filters", e);
             }

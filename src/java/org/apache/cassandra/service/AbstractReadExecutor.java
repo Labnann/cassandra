@@ -113,7 +113,7 @@ public abstract class AbstractReadExecutor
                 String ksName = readCommand.metadata().ksName;
 
                 if (!GlobalFilterService.isSystemKeyspace(ksName)
-                    && !GlobalFilterService.instance().isPresent(key, cfName, ksName)) {
+                    && !GlobalFilterService.instance().isPresent(key, cfName, ksName, endpoint.toString())) {
                     logger.info("Global Filter permits skipping read from remote node");
                     hasLocalEndpoint = true;
                     continue;
