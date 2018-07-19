@@ -130,20 +130,28 @@ public class GlobalFilterService {
         }
 
         HashMap<String, HashMap<String, IFilter>> ksMap = tableFilters.get(ip);
-        if (!ksMap.containsKey(keySpace)) {
+        if (ksMap == null || !ksMap.containsKey(keySpace)) {
             logger.warn("Tried to lookup key from nonexistent filter. KeySpace: {}", keySpace);
 
             return false;
         }
 
         HashMap<String, IFilter> cfFilterMap = ksMap.get(keySpace);
-        if (!cfFilterMap.containsKey(columnFamily)) {
+        if (cfFilterMap == null || !cfFilterMap.containsKey(columnFamily)) {
             logger.warn("Tried to lookup key from nonexistent filter. ColumnFamily: {}", columnFamily);
 
             return false;
         }
 
         return cfFilterMap.get(columnFamily).isPresent(key);
+    }
+
+    public HashMap<String, HashMap<String, IFilter>> getFilters(String ip) {
+        return tableFilters.get(ip);
+    }
+
+    public void sync(String ip, HashMap<String, HashMap<String, IFilter>> filters) {
+        tableFilters.put(ip, filters);
     }
 
     private GlobalFilterService() {

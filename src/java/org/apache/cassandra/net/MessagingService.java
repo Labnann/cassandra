@@ -45,6 +45,7 @@ import org.cliffc.high_scale_lib.NonBlockingHashMap;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import bd.ac.buet.cse.ms.thesis.GlobalFilterSyn;
 import org.apache.cassandra.concurrent.ExecutorLocals;
 import org.apache.cassandra.concurrent.ScheduledExecutors;
 import org.apache.cassandra.concurrent.Stage;
@@ -178,6 +179,7 @@ public final class MessagingService implements MessagingServiceMBean
         GOSSIP_DIGEST_SYN,
         GOSSIP_DIGEST_ACK,
         GOSSIP_DIGEST_ACK2,
+        GLOBAL_FILTER_SYN,
         @Deprecated DEFINITIONS_ANNOUNCE,
         DEFINITIONS_UPDATE,
         TRUNCATE
@@ -285,6 +287,7 @@ public final class MessagingService implements MessagingServiceMBean
         put(Verb.STREAM_REQUEST, Stage.MISC);
         put(Verb.REPLICATION_FINISHED, Stage.MISC);
         put(Verb.SNAPSHOT, Stage.MISC);
+        put(Verb.GLOBAL_FILTER_SYN, Stage.MISC);
 
         put(Verb.TREE_REQUEST, Stage.ANTI_ENTROPY);
         put(Verb.TREE_RESPONSE, Stage.ANTI_ENTROPY);
@@ -333,6 +336,7 @@ public final class MessagingService implements MessagingServiceMBean
         put(Verb.GOSSIP_DIGEST_ACK, GossipDigestAck.serializer);
         put(Verb.GOSSIP_DIGEST_ACK2, GossipDigestAck2.serializer);
         put(Verb.GOSSIP_DIGEST_SYN, GossipDigestSyn.serializer);
+        put(Verb.GLOBAL_FILTER_SYN, GlobalFilterSyn.serializer);
         put(Verb.DEFINITIONS_UPDATE, MigrationManager.MigrationsSerializer.instance);
         put(Verb.TRUNCATE, Truncation.serializer);
         put(Verb.REPLICATION_FINISHED, null);

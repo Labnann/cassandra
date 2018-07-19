@@ -31,6 +31,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import bd.ac.buet.cse.ms.thesis.GlobalFilterService;
+import bd.ac.buet.cse.ms.thesis.GlobalFilterSyncService;
 import io.netty.bootstrap.ServerBootstrap;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.*;
@@ -173,6 +174,8 @@ public class Server implements CassandraDaemon.Server
     {
         // Close opened connections
         connectionTracker.closeAll();
+
+        GlobalFilterSyncService.destroy();
 
         logger.info("Stop listening for CQL clients");
     }

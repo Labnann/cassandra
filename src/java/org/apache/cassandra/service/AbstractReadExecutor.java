@@ -114,6 +114,9 @@ public abstract class AbstractReadExecutor
 
                 if (!GlobalFilterService.isSystemKeyspace(ksName)
                     && !GlobalFilterService.instance().isPresent(key, cfName, ksName, endpoint.toString())) {
+                    if (traceState != null) {
+                        traceState.trace("Global Filter permits skipping read from remote node: {}", endpoint);
+                    }
                     logger.info("Global Filter permits skipping read from remote node");
                     hasLocalEndpoint = true;
                     continue;
