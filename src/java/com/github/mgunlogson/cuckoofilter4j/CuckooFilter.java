@@ -125,7 +125,7 @@ public final class CuckooFilter<T> implements Serializable {
     static final int BUCKET_SIZE = 4;
     // make sure to update getNeededBitsForFpRate() if changing this... then
     // again don't change this
-    private static final double LOAD_FACTOR = FilterSwitch.loadPercentage == 0 ? 0.15 : FilterSwitch.loadPercentage == 25 ? 0.35 : FilterSwitch.loadPercentage == 50 ? 0.55 : FilterSwitch.loadPercentage == 75 ? 0.75: FilterSwitch.loadPercentage == 100 ? 0.955 : -1;
+    private static final double LOAD_FACTOR = FilterSwitch.loadPercentage == 0 ? 0.15 : (FilterSwitch.loadPercentage == 25 ? 0.35 : (FilterSwitch.loadPercentage == 50 ? 0.55 : (FilterSwitch.loadPercentage == 75 ? 0.75: (FilterSwitch.loadPercentage == 100 ? 0.955 : 0.15))));
     private static final double DEFAULT_FP = 0.01;
     private static final int DEFAULT_CONCURRENCY = 16;
 

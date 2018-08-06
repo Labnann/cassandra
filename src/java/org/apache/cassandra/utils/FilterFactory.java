@@ -106,23 +106,25 @@ public class FilterFactory
     @SuppressWarnings("resource")
     private static IFilter createFilter(int hash, long numElements, int bucketsPer, boolean offheap, boolean oldBfHashOrder)
     {
-        long numBits = 0;
+        long numBits;
         switch (FilterSwitch.loadPercentage) {
             case 0:
-                numBits = (long) (numElements * Math.pow(bucketsPer, 3)) + BITSET_EXCESS;
+                numBits = (long) (numElements * Math.pow(bucketsPer, 3f)) + BITSET_EXCESS;
                 break;
             case 25:
-                numBits = (long) (numElements * Math.pow(bucketsPer, 1.23)) + BITSET_EXCESS;
+                numBits = (long) (numElements * Math.pow(bucketsPer, 1.23f)) + BITSET_EXCESS;
                 break;
             case 50:
-                numBits = (long) (numElements * bucketsPer / 1.5) + BITSET_EXCESS;
+                numBits = (long) (numElements * bucketsPer / 1.5f) + BITSET_EXCESS;
                 break;
             case 75:
-                numBits = (long) (numElements * bucketsPer / 3) + BITSET_EXCESS;
+                numBits = (long) (numElements * bucketsPer / 3f) + BITSET_EXCESS;
                 break;
             case 100:
-                numBits = (long) (numElements * bucketsPer / 6) + BITSET_EXCESS;
+                numBits = (long) (numElements * bucketsPer / 6f) + BITSET_EXCESS;
                 break;
+            default:
+                numBits = (numElements * bucketsPer) + BITSET_EXCESS;
         }
 
         IBitSet bitset = new OpenBitSet(numBits);
