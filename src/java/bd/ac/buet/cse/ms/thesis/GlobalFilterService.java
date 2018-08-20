@@ -12,7 +12,9 @@ import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.utils.BloomFilter;
 import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.FilterFactory;
 import org.apache.cassandra.utils.IFilter;
 import org.apache.hadoop.util.hash.MurmurHash;
 
@@ -78,7 +80,8 @@ public class GlobalFilterService {
 
         HashMap<String, IFilter> cfFilterMap = ksMap.get(keySpace);
         if (!cfFilterMap.containsKey(columnFamily)) {
-            cfFilterMap.put(columnFamily, new CuckooFilter(FILTER_NUM_OF_ELEMENTS, FILTER_FALSE_POSITIVE_RATE));
+            cfFilterMap.put(columnFamily,
+                            FilterFactory.getFilter(FILTER_NUM_OF_ELEMENTS, FILTER_FALSE_POSITIVE_RATE, false, false));
         }
 
         cfFilterMap.get(columnFamily).add(key);
@@ -172,6 +175,16 @@ public class GlobalFilterService {
                 byte[] filterBytes = Files.readAllBytes(globalFiltersPath);
                 //noinspection unchecked
                 tableFilters = (HashMap<String, HashMap<String,HashMap<String,IFilter>>>) SerializationUtils.deserialize(filterBytes);
+
+                if (FilterSwitch.filter == FilterSwitch.BLOOM_FILTER) {
+                    for (HashMap<String, HashMap<String, IFilter>> values : tableFilters.values()) {
+                        for (HashMap<String, IFilter> vals : values.values()) {
+                            for (IFilter filter : vals.values()) {
+                                ((BloomFilter) filter).restoreInstantiation();
+                            }
+                        }
+                    }
+                }
             } catch (Exception e) {
                 throw new RuntimeException("Cannot load Global Filters", e);
             }

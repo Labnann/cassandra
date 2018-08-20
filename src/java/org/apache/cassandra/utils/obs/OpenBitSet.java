@@ -17,6 +17,7 @@
  */
 package org.apache.cassandra.utils.obs;
 
+import java.io.Serializable;
 import java.util.Arrays;
 import java.io.DataInput;
 import java.io.DataOutput;
@@ -52,7 +53,7 @@ import org.apache.cassandra.utils.concurrent.Ref;
  * </p>
  */
 
-public class OpenBitSet implements IBitSet
+public class OpenBitSet implements IBitSet, Serializable
 {
   /**
    * We break the bitset up into multiple arrays to avoid promotion failure caused by attempting to allocate

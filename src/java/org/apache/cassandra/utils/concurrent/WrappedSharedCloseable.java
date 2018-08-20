@@ -29,7 +29,10 @@ import static org.apache.cassandra.utils.Throwables.merge;
  */
 public abstract class WrappedSharedCloseable extends SharedCloseableImpl
 {
-    final AutoCloseable[] wrapped;
+    protected AutoCloseable[] wrapped;
+
+    public WrappedSharedCloseable() {
+    }
 
     public WrappedSharedCloseable(final AutoCloseable closeable)
     {
@@ -40,6 +43,11 @@ public abstract class WrappedSharedCloseable extends SharedCloseableImpl
     {
         super(new Tidy(closeable));
         wrapped = closeable;
+    }
+
+    public void setWrapped(AutoCloseable closeable) {
+        wrapped = new AutoCloseable[] {closeable};
+        super.setRef(new Tidy(wrapped));
     }
 
     static final class Tidy implements RefCounted.Tidy

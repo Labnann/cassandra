@@ -23,7 +23,13 @@ package org.apache.cassandra.utils.concurrent;
  */
 public abstract class SharedCloseableImpl implements SharedCloseable
 {
-    final Ref<?> ref;
+    Ref<?> ref;
+
+    public SharedCloseableImpl() {}
+
+    public void setRef(RefCounted.Tidy tidy) {
+        ref = new Ref<Object>(null, tidy);
+    }
 
     public SharedCloseableImpl(RefCounted.Tidy tidy)
     {

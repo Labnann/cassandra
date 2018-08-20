@@ -31,6 +31,7 @@ import javax.management.ObjectName;
 import javax.management.StandardMBean;
 import javax.management.remote.JMXConnectorServer;
 
+import bd.ac.buet.cse.ms.thesis.FilterSwitch;
 import bd.ac.buet.cse.ms.thesis.GlobalFilterService;
 import bd.ac.buet.cse.ms.thesis.GlobalFilterSyncService;
 import com.addthis.metrics3.reporter.config.ReporterConfig;
@@ -516,6 +517,11 @@ public class CassandraDaemon
      */
     public void start()
     {
+        // Console Log FilterSwitch settings.
+        logger.info("Filter={}, Global filter enabled={}, Cuckoo deletion enabled={}, load={}%",
+                    FilterSwitch.filter == FilterSwitch.BLOOM_FILTER ? "Bloom" : "Cuckoo",
+                    FilterSwitch.ENABLE_GLOBAL_FILTER, FilterSwitch.ENABLE_CUCKOO_DELETION, FilterSwitch.loadPercentage);
+
         String nativeFlag = System.getProperty("cassandra.start_native_transport");
         if ((nativeFlag != null && Boolean.parseBoolean(nativeFlag)) || (nativeFlag == null && DatabaseDescriptor.startNativeTransport()))
         {

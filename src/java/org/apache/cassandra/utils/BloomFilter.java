@@ -17,6 +17,8 @@
  */
 package org.apache.cassandra.utils;
 
+import java.io.Serializable;
+
 import com.google.common.annotations.VisibleForTesting;
 
 import org.slf4j.Logger;
@@ -33,7 +35,7 @@ import org.apache.cassandra.utils.obs.IBitSet;
 import org.apache.cassandra.utils.obs.OffHeapBitSet;
 import org.apache.cassandra.utils.obs.OpenBitSet;
 
-public class BloomFilter extends WrappedSharedCloseable implements IFilter
+public class BloomFilter extends WrappedSharedCloseable implements IFilter, Serializable
 {
     private static final Logger logger = LoggerFactory.getLogger(BloomFilter.class);
 
@@ -45,13 +47,20 @@ public class BloomFilter extends WrappedSharedCloseable implements IFilter
         }
     };
 
-    public final IBitSet bitset;
-    public final int hashCount;
+    public IBitSet bitset;
+    public int hashCount;
     /**
      * CASSANDRA-8413: 3.0 (inverted) bloom filters have no 'static' bits caused by using the same upper bits
      * for both bloom filter and token distribution.
      */
-    public final boolean oldBfHashOrder;
+    public boolean oldBfHashOrder;
+
+    BloomFilter() {
+    }
+
+    public void restoreInstantiation() {
+        super.setWrapped(bitset);
+    }
 
     BloomFilter(int hashCount, IBitSet bitset, boolean oldBfHashOrder)
     {
