@@ -34,6 +34,7 @@ import com.google.common.util.concurrent.RateLimiter;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import bd.ac.buet.cse.ms.thesis.GlobalFilterService;
 import com.clearspring.analytics.stream.cardinality.CardinalityMergeException;
 import com.clearspring.analytics.stream.cardinality.HyperLogLogPlus;
 import com.clearspring.analytics.stream.cardinality.ICardinality;
@@ -848,8 +849,10 @@ public abstract class SSTableReader extends SSTable implements SelfRefCounted<SS
                         first = decoratedKey;
                     last = decoratedKey;
 
-                    if (recreateBloomFilter)
+                    if (recreateBloomFilter) {
                         bf.add(decoratedKey);
+                        GlobalFilterService.instance().add(decoratedKey, metadata.cfName, metadata.ksName);
+                    }
 
                     // if summary was already read from disk we don't want to re-populate it using primary index
                     if (!summaryLoaded)

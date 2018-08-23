@@ -29,6 +29,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import bd.ac.buet.cse.ms.thesis.GlobalFilterService;
+import bd.ac.buet.cse.ms.thesis.GlobalFilterSyncService;
 import org.apache.cassandra.cache.ChunkCache;
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.Config;

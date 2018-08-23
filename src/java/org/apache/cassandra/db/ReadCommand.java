@@ -574,9 +574,7 @@ public abstract class ReadCommand extends MonitorableImpl implements ReadQuery
                 Tracing.trace("Read {} live and {} tombstone cells{}", liveRows, tombstones, (warnTombstones ? " (see tombstone_warn_threshold)" : ""));
 //                logger.info("Read {} live and {} tombstone cells{}", liveRows, tombstones, (warnTombstones ? " (see tombstone_warn_threshold)" : ""));
 
-                if (FilterSwitch.filter == FilterSwitch.CUCKOO_FILTER
-                    && FilterSwitch.ENABLE_CUCKOO_DELETION
-                    && ReadCommand.this.getClass() == SinglePartitionReadCommand.class) {
+                if (FilterSwitch.ENABLE_CUCKOO_DELETION && ReadCommand.this.getClass() == SinglePartitionReadCommand.class) {
 
                     SinglePartitionReadCommand readCommand = (SinglePartitionReadCommand) ReadCommand.this;
                     CFMetaData readCommandMetaData = readCommand.metadata();
@@ -591,24 +589,29 @@ public abstract class ReadCommand extends MonitorableImpl implements ReadQuery
                             IFilter filter = sstable.getBloomFilter();
                             if (filter.isPresent(key)) {
 
-                                logger.info("Delete key from Cuckoo Filter. sstable: " + sstable.descriptor.generation);
+                                logger.trace("Delete key from Cuckoo Filter. sstable: {}", sstable.descriptor.generation);
 
                                 filter.delete(key);
-                                GlobalFilterService.instance().delete(key, readCommandMetaData.cfName, readCommandMetaData.ksName);
 
                                 // flush filter
-                                String path = sstable.descriptor.filenameFor(Component.FILTER);
-                                try (FileOutputStream fos = new FileOutputStream(path);
-                                     DataOutputStreamPlus stream = new BufferedDataOutputStreamPlus(fos)) {
-                                    FilterFactory.serialize(filter, stream);
-                                    stream.flush();
-                                    SyncUtil.sync(fos);
-                                    GlobalFilterService.instance().saveFiltersToDisk();
-                                } catch (IOException e) {
-                                    throw new FSWriteError(e, path);
-                                }
+                                new Thread() {
+                                    public void run() {
+                                        String path = sstable.descriptor.filenameFor(Component.FILTER);
+                                        try (FileOutputStream fos = new FileOutputStream(path);
+                                             DataOutputStreamPlus stream = new BufferedDataOutputStreamPlus(fos)) {
+                                            FilterFactory.serialize(filter, stream);
+                                            stream.flush();
+                                            SyncUtil.sync(fos);
+                                        } catch (IOException e) {
+                                            throw new FSWriteError(e, path);
+                                        }
+                                    }
+                                }.start();
                             }
                         }
+
+                        GlobalFilterService.instance().delete(key, readCommandMetaData.cfName, readCommandMetaData.ksName);
+                        GlobalFilterService.instance().saveFiltersToDisk();
                     }
                 }
             }

@@ -81,7 +81,7 @@ public class GlobalFilterService {
         HashMap<String, IFilter> cfFilterMap = ksMap.get(keySpace);
         if (!cfFilterMap.containsKey(columnFamily)) {
             cfFilterMap.put(columnFamily,
-                            FilterFactory.getFilter(FILTER_NUM_OF_ELEMENTS, FILTER_FALSE_POSITIVE_RATE, false, false));
+                            FilterFactory.getFilter(FILTER_NUM_OF_ELEMENTS, FILTER_FALSE_POSITIVE_RATE, false, false, true));
         }
 
         cfFilterMap.get(columnFamily).add(key);
@@ -154,7 +154,9 @@ public class GlobalFilterService {
     }
 
     public void sync(String ip, HashMap<String, HashMap<String, IFilter>> filters) {
+        logger.info("SyncedFilterHashesDifferent={}", tableFilters.get(ip) == null || tableFilters.get(ip).hashCode() != filters.hashCode());
         tableFilters.put(ip, filters);
+        saveFiltersToDisk(false);
     }
 
     private GlobalFilterService() {
@@ -176,7 +178,7 @@ public class GlobalFilterService {
                 //noinspection unchecked
                 tableFilters = (HashMap<String, HashMap<String,HashMap<String,IFilter>>>) SerializationUtils.deserialize(filterBytes);
 
-                if (FilterSwitch.filter == FilterSwitch.BLOOM_FILTER) {
+                if (FilterSwitch.globalFilter == FilterSwitch.BLOOM_FILTER) {
                     for (HashMap<String, HashMap<String, IFilter>> values : tableFilters.values()) {
                         for (HashMap<String, IFilter> vals : values.values()) {
                             for (IFilter filter : vals.values()) {
@@ -197,29 +199,41 @@ public class GlobalFilterService {
     }
 
     public void saveFiltersToDisk() {
+        saveFiltersToDisk(false);
+    }
+
+    private void saveFiltersToDisk(boolean forceSync) {
         if (!FilterSwitch.ENABLE_GLOBAL_FILTER) {
             return;
         }
 
-        byte[] bytes = SerializationUtils.serialize(tableFilters);
+        new Thread() {
+            public void run() {
+                byte[] bytes = SerializationUtils.serialize(tableFilters);
 
-        int hash = MurmurHash.getInstance().hash(bytes);
+                int hash = MurmurHash.getInstance().hash(bytes);
 
-        if (hash == lastSavedFilterHash) {
-            logger.debug("Skipping saving Global Filters as apparently it hasn't changed.");
+                if (hash == lastSavedFilterHash) {
+                    logger.debug("Skipping saving Global Filters as apparently it hasn't changed.");
 
-            return;
-        }
+                    return;
+                }
 
-        lastSavedFilterHash = hash;
+                lastSavedFilterHash = hash;
 
-        try {
-            Files.write(getGlobalFiltersPath(), bytes);
-        } catch (Exception e) {
-            throw new RuntimeException("Cannot save Global Filter", e);
-        }
+                try {
+                    Files.write(getGlobalFiltersPath(), bytes);
+                } catch (Exception e) {
+                    throw new RuntimeException("Cannot save Global Filter", e);
+                }
 
-        logger.debug("Saved Global Filters to disk.");
+                logger.debug("Saved Global Filters to disk. Filter serialized size: {}", bytes.length);
+
+                if (forceSync) {
+                    GlobalFilterSyncService.forceSyncNow();
+                }
+            }
+        }.start();
     }
 
     private Path getGlobalFiltersPath() {

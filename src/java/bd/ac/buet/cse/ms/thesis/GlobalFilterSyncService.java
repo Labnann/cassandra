@@ -36,7 +36,7 @@ public class GlobalFilterSyncService {
 
     private static final Logger logger = LoggerFactory.getLogger(GlobalFilterSyncService.class);
 
-    private static final long GLOBAL_FILTER_SYNC_INTERVAL_MILLIS = 10 * 1000;
+    private static final long GLOBAL_FILTER_SYNC_INTERVAL_MILLIS = 3 * 60 * 1000;
 
     private static GlobalFilterSyncService instance;
 
@@ -53,6 +53,12 @@ public class GlobalFilterSyncService {
     public static void destroy() {
         if (instance != null) {
             instance.stopService();
+        }
+    }
+
+    public static void forceSyncNow() {
+        if (instance != null) {
+            instance.syncGlobalFilters();
         }
     }
 
@@ -88,7 +94,7 @@ public class GlobalFilterSyncService {
                 continue;
             }
 
-            logger.debug("Sending GlobalFilterSyn msg to {}", node.toString());
+            logger.info("Sending GlobalFilterSyn msg to {}", node.toString());
             MessagingService.instance().sendOneWay(message, node);
         }
     }

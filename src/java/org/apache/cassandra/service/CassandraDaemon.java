@@ -518,8 +518,9 @@ public class CassandraDaemon
     public void start()
     {
         // Console Log FilterSwitch settings.
-        logger.info("Filter={}, Global filter enabled={}, Cuckoo deletion enabled={}, load={}%",
+        logger.info("Filter={}, Global filter={}, Global filter enabled={}, Cuckoo deletion enabled={}, load={}%",
                     FilterSwitch.filter == FilterSwitch.BLOOM_FILTER ? "Bloom" : "Cuckoo",
+                    FilterSwitch.globalFilter == FilterSwitch.BLOOM_FILTER ? "Bloom" : "Cuckoo",
                     FilterSwitch.ENABLE_GLOBAL_FILTER, FilterSwitch.ENABLE_CUCKOO_DELETION, FilterSwitch.loadPercentage);
 
         String nativeFlag = System.getProperty("cassandra.start_native_transport");

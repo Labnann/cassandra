@@ -34,6 +34,7 @@ import org.apache.cassandra.config.ReadRepairDecision;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.ConsistencyLevel;
 import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.EmptyIterators;
 import org.apache.cassandra.db.ReadCommand;
 import org.apache.cassandra.db.SinglePartitionReadCommand;
 import org.apache.cassandra.db.Keyspace;
@@ -97,6 +98,7 @@ public abstract class AbstractReadExecutor
     private void makeRequests(ReadCommand readCommand, Iterable<InetAddress> endpoints)
     {
         boolean hasLocalEndpoint = false;
+        boolean skipRemoteReading = false;
 
         for (InetAddress endpoint : endpoints)
         {
@@ -118,7 +120,9 @@ public abstract class AbstractReadExecutor
                         traceState.trace("Global Filter permits skipping read from remote node: {}", endpoint);
                     }
                     logger.info("Global Filter permits skipping read from remote node");
-                    hasLocalEndpoint = true;
+
+                    skipRemoteReading = true;
+
                     continue;
                 }
             }
@@ -128,6 +132,10 @@ public abstract class AbstractReadExecutor
             logger.trace("reading {} from {}", readCommand.isDigestQuery() ? "digest" : "data", endpoint);
             MessageOut<ReadCommand> message = readCommand.createMessage(MessagingService.instance().getVersion(endpoint));
             MessagingService.instance().sendRRWithFailure(message, endpoint, handler);
+        }
+
+        if (skipRemoteReading) {
+            handler.response(command.createResponse(EmptyIterators.unfilteredPartition(readCommand.metadata(), false)));
         }
 
         // We delay the local (potentially blocking) read till the end to avoid stalling remote requests.

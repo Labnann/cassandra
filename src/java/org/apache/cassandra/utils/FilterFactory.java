@@ -80,13 +80,18 @@ public class FilterFactory
      */
     public static IFilter getFilter(long numElements, double maxFalsePosProbability, boolean offheap, boolean oldBfHashOrder)
     {
+        return getFilter(numElements, maxFalsePosProbability, offheap, oldBfHashOrder, false);
+    }
+
+    public static IFilter getFilter(long numElements, double maxFalsePosProbability, boolean offheap, boolean oldBfHashOrder, boolean globalFilter) {
         assert maxFalsePosProbability <= 1.0 : "Invalid probability";
         if (maxFalsePosProbability == 1.0)
             return new AlwaysPresentFilter();
 
 //        logger.info("Creating filter. n={}", numElements);
 
-        if (FilterSwitch.filter == FilterSwitch.CUCKOO_FILTER) {
+        if ((globalFilter && FilterSwitch.globalFilter == FilterSwitch.CUCKOO_FILTER)
+            || (!globalFilter && FilterSwitch.filter == FilterSwitch.CUCKOO_FILTER)) {
             CuckooFilter cuckooFilter = new CuckooFilter(Math.max(numElements, FilterSwitch.MIN_NO_OF_ELEMENTS_IN_CUCKOO_FILTER), maxFalsePosProbability);
 //            logger.info("Cuckoo filter serialized size: {}", cuckooFilter.serializedSize());
             return cuckooFilter;
@@ -102,6 +107,7 @@ public class FilterFactory
 //        logger.info("Bloom filter serialized size: {}", bloomFilter.serializedSize());
         return bloomFilter;
     }
+
 
     @SuppressWarnings("resource")
     private static IFilter createFilter(int hash, long numElements, int bucketsPer, boolean offheap, boolean oldBfHashOrder)
