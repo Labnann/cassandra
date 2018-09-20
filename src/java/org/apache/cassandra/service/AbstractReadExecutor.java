@@ -119,7 +119,7 @@ public abstract class AbstractReadExecutor
                     if (traceState != null) {
                         traceState.trace("Global Filter permits skipping read from remote node: {}", endpoint);
                     }
-                    logger.info("Global Filter permits skipping read from remote node");
+                    logger.debug("Global Filter permits skipping read from remote node");
 
                     skipRemoteReading = true;
 
