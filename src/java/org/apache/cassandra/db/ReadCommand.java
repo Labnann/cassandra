@@ -58,6 +58,11 @@ import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.db.rows.RangeTombstoneMarker;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+import org.apache.cassandra.db.partitions.*;
+import org.apache.cassandra.db.rows.*;
+import org.apache.cassandra.db.transform.RTBoundCloser;
+import org.apache.cassandra.db.transform.RTBoundValidator;
+import org.apache.cassandra.db.transform.RTBoundValidator.Stage;
 import org.apache.cassandra.db.transform.StoppingTransformation;
 import org.apache.cassandra.db.transform.Transformation;
 import org.apache.cassandra.dht.AbstractBounds;
@@ -372,6 +377,10 @@ public abstract class ReadCommand extends MonitorableImpl implements ReadQuery
 
     public ReadResponse createResponse(UnfilteredPartitionIterator iterator)
     {
+        // validate that the sequence of RT markers is correct: open is followed by close, deletion times for both
+        // ends equal, and there are no dangling RT bound in any partition.
+        iterator = RTBoundValidator.validate(iterator, Stage.PROCESSED, true);
+
         return isDigestQuery()
              ? ReadResponse.createDigestResponse(iterator, this)
              : ReadResponse.createDataResponse(iterator, this);
@@ -444,30 +453,37 @@ public abstract class ReadCommand extends MonitorableImpl implements ReadQuery
             Tracing.trace("Executing read on {}.{} using index {}", cfs.metadata.ksName, cfs.metadata.cfName, index.getIndexMetadata().name);
         }
 
-        UnfilteredPartitionIterator resultIterator = searcher == null
-                                         ? queryStorage(cfs, executionController)
-                                         : searcher.search(executionController);
+        UnfilteredPartitionIterator iterator = (null == searcher) ? queryStorage(cfs, executionController) : searcher.search(executionController);
+        iterator = RTBoundValidator.validate(iterator, Stage.MERGED, false);
 
         try
         {
-            resultIterator = withStateTracking(resultIterator);
-            resultIterator = withMetricsRecording(withoutPurgeableTombstones(resultIterator, cfs), cfs.metric, startTimeNanos, resultIterator, cfs);
+            iterator = withStateTracking(iterator);
+            iterator = RTBoundValidator.validate(withoutPurgeableTombstones(iterator, cfs), Stage.PURGED, false);
+            iterator = withMetricsRecording(withoutPurgeableTombstones(resultIterator, cfs), cfs.metric, startTimeNanos, iterator, cfs);
 
             // If we've used a 2ndary index, we know the result already satisfy the primary expression used, so
             // no point in checking it again.
-            RowFilter updatedFilter = searcher == null
-                                    ? rowFilter()
-                                    : index.getPostIndexQueryFilter(rowFilter());
+            RowFilter filter = (null == searcher) ? rowFilter() : index.getPostIndexQueryFilter(rowFilter());
 
-            // TODO: We'll currently do filtering by the rowFilter here because it's convenient. However,
-            // we'll probably want to optimize by pushing it down the layer (like for dropped columns) as it
-            // would be more efficient (the sooner we discard stuff we know we don't care, the less useless
-            // processing we do on it).
-            return limits().filter(updatedFilter.filter(resultIterator, nowInSec()), nowInSec(), selectsFullPartition());
+            /*
+             * TODO: We'll currently do filtering by the rowFilter here because it's convenient. However,
+             * we'll probably want to optimize by pushing it down the layer (like for dropped columns) as it
+             * would be more efficient (the sooner we discard stuff we know we don't care, the less useless
+             * processing we do on it).
+             */
+            iterator = filter.filter(iterator, nowInSec());
+
+            // apply the limits/row counter; this transformation is stopping and would close the iterator as soon
+            // as the count is observed; if that happens in the middle of an open RT, its end bound will not be included.
+            iterator = limits().filter(iterator, nowInSec(), selectsFullPartition());
+
+            // because of the above, we need to append an aritifical end bound if the source iterator was stopped short by a counter.
+            return RTBoundCloser.close(iterator);
         }
         catch (RuntimeException | Error e)
         {
-            resultIterator.close();
+            iterator.close();
             throw e;
         }
     }
@@ -495,7 +511,7 @@ public abstract class ReadCommand extends MonitorableImpl implements ReadQuery
             private final int failureThreshold = DatabaseDescriptor.getTombstoneFailureThreshold();
             private final int warningThreshold = DatabaseDescriptor.getTombstoneWarnThreshold();
 
-            private final boolean respectTombstoneThresholds = !SchemaConstants.isSystemKeyspace(ReadCommand.this.metadata().ksName);
+            private final boolean respectTombstoneThresholds = !SchemaConstants.isLocalSystemKeyspace(ReadCommand.this.metadata().ksName);
             private final boolean enforceStrictLiveness = metadata.enforceStrictLiveness();
 
             private int liveRows = 0;
@@ -523,17 +539,37 @@ public abstract class ReadCommand extends MonitorableImpl implements ReadQuery
                 return applyToRow(row);
             }
 
+            /**
+             * Count the number of live rows returned by the read command and the number of tombstones.
+             *
+             * Tombstones come in two forms on rows :
+             * - cells that aren't live anymore (either expired through TTL or deleted) : 1 tombstone per cell
+             * - Rows that aren't live and have no cell (DELETEs performed on the primary key) : 1 tombstone per row 
+             * We avoid counting rows as tombstones if they contain nothing but expired cells.
+             */
             @Override
             public Row applyToRow(Row row)
             {
-                if (row.hasLiveData(ReadCommand.this.nowInSec(), enforceStrictLiveness))
-                    ++liveRows;
-
+                boolean hasTombstones = false;
                 for (Cell cell : row.cells())
                 {
                     if (!cell.isLive(ReadCommand.this.nowInSec()))
+                    {
                         countTombstone(row.clustering());
+                        hasTombstones = true; // allows to avoid counting an extra tombstone if the whole row expired
+                    }
                 }
+
+                if (row.hasLiveData(ReadCommand.this.nowInSec(), enforceStrictLiveness))
+                    ++liveRows;
+                else if (!row.primaryKeyLivenessInfo().isLive(ReadCommand.this.nowInSec())
+                        && row.hasDeletion(ReadCommand.this.nowInSec())
+                        && !hasTombstones)
+                {
+                    // We're counting primary key deletions only here.
+                    countTombstone(row.clustering());
+                }
+
                 return row;
             }
 
@@ -566,7 +602,9 @@ public abstract class ReadCommand extends MonitorableImpl implements ReadQuery
                 boolean warnTombstones = tombstones > warningThreshold && respectTombstoneThresholds;
                 if (warnTombstones)
                 {
-                    String msg = String.format("Read %d live rows and %d tombstone cells for query %1.512s (see tombstone_warn_threshold)", liveRows, tombstones, ReadCommand.this.toCQLString());
+                    String msg = String.format(
+                            "Read %d live rows and %d tombstone cells for query %1.512s (see tombstone_warn_threshold)",
+                            liveRows, tombstones, ReadCommand.this.toCQLString());
                     ClientWarn.instance.warn(msg);
 //                    logger.warn(msg);
                 }
@@ -1229,7 +1267,7 @@ public abstract class ReadCommand extends MonitorableImpl implements ReadQuery
             int compositesToGroup = in.readInt();
 
             // command-level Composite "start" and "stop"
-            LegacyLayout.LegacyBound startBound = LegacyLayout.decodeBound(metadata, ByteBufferUtil.readWithShortLength(in), true);
+            LegacyLayout.LegacyBound startBound = LegacyLayout.decodeSliceBound(metadata, ByteBufferUtil.readWithShortLength(in), true);
 
             ByteBufferUtil.readWithShortLength(in);  // the composite "stop", which isn't actually needed
 
@@ -1722,8 +1760,8 @@ public abstract class ReadCommand extends MonitorableImpl implements ReadQuery
             Slices.Builder slicesBuilder = new Slices.Builder(metadata.comparator);
             for (int i = 0; i < numSlices; i++)
             {
-                LegacyLayout.LegacyBound start = LegacyLayout.decodeBound(metadata, startBuffers[i], true);
-                LegacyLayout.LegacyBound finish = LegacyLayout.decodeBound(metadata, finishBuffers[i], false);
+                LegacyLayout.LegacyBound start = LegacyLayout.decodeSliceBound(metadata, startBuffers[i], true);
+                LegacyLayout.LegacyBound finish = LegacyLayout.decodeSliceBound(metadata, finishBuffers[i], false);
 
                 if (start.isStatic)
                 {

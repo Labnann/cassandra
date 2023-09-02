@@ -46,6 +46,7 @@ import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.repair.messages.RepairOption;
 import org.apache.cassandra.service.ActiveRepairService;
+import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.service.QueryState;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.tracing.TraceKeyspace;
@@ -105,7 +106,7 @@ public class RepairRunnable extends WrappedRunnable implements ProgressEventNoti
 
     protected void fireErrorAndComplete(String tag, int progressCount, int totalProgress, String message)
     {
-        fireProgressEvent(tag, new ProgressEvent(ProgressEventType.ERROR, progressCount, totalProgress, message));
+        fireProgressEvent(tag, new ProgressEvent(ProgressEventType.ERROR, progressCount, totalProgress, String.format("Repair command #%d failed with error %s", cmd, message)));
         fireProgressEvent(tag, new ProgressEvent(ProgressEventType.COMPLETE, progressCount, totalProgress, String.format("Repair command #%d finished with error", cmd)));
     }
 
@@ -390,7 +391,7 @@ public class RepairRunnable extends WrappedRunnable implements ProgressEventNoti
 
                 String format = "select event_id, source, activity from %s.%s where session_id = ? and event_id > ? and event_id < ?;";
                 String query = String.format(format, SchemaConstants.TRACE_KEYSPACE_NAME, TraceKeyspace.EVENTS);
-                SelectStatement statement = (SelectStatement) QueryProcessor.parseStatement(query).prepare().statement;
+                SelectStatement statement = (SelectStatement) QueryProcessor.parseStatement(query).prepare(ClientState.forInternalCalls()).statement;
 
                 ByteBuffer sessionIdBytes = ByteBufferUtil.bytes(sessionId);
                 InetAddress source = FBUtilities.getBroadcastAddress();

@@ -44,6 +44,9 @@ import org.apache.cassandra.utils.FBUtilities;
 
 public class DataResolver extends ResponseResolver
 {
+    private static final boolean DROP_OVERSIZED_READ_REPAIR_MUTATIONS =
+        Boolean.getBoolean("cassandra.drop_oversized_readrepair_mutations");
+
     @VisibleForTesting
     final List<AsyncOneResponse> repairResults = Collections.synchronizedList(new ArrayList<>());
     private final long queryStartNanoTime;
@@ -341,8 +344,10 @@ public class DataResolver extends ResponseResolver
                     // The following can be pretty verbose, but it's really only triggered if a bug happen, so we'd
                     // rather get more info to debug than not.
                     CFMetaData table = command.metadata();
-                    String details = String.format("Error merging RTs on %s.%s: merged=%s, versions=%s, sources={%s}, responses:%n %s",
+                    String details = String.format("Error merging RTs on %s.%s: command=%s, reversed=%b, merged=%s, versions=%s, sources={%s}, responses:%n %s",
                                                    table.ksName, table.cfName,
+                                                   command.toCQLString(),
+                                                   isReversed,
                                                    merged == null ? "null" : merged.toString(table),
                                                    '[' + Joiner.on(", ").join(Iterables.transform(Arrays.asList(versions), rt -> rt == null ? "null" : rt.toString(table))) + ']',
                                                    Arrays.toString(sources),
@@ -405,9 +410,11 @@ public class DataResolver extends ResponseResolver
                         DeletionTime partitionRepairDeletion = partitionLevelRepairDeletion(i);
                         if (markerToRepair[i] == null && currentDeletion.supersedes(partitionRepairDeletion))
                         {
-                            // Since there is an ongoing merged deletion, the only way we don't have an open repair for
-                            // this source is that it had a range open with the same deletion as current and it's
-                            // closing it.
+                            /*
+                             * Since there is an ongoing merged deletion, the only way we don't have an open repair for
+                             * this source is that it had a range open with the same deletion as current marker,
+                             * and the marker is closing it.
+                             */
                             assert marker.isClose(isReversed) && currentDeletion.equals(marker.closeDeletionTime(isReversed))
                                  : String.format("currentDeletion=%s, marker=%s", currentDeletion, marker.toString(command.metadata()));
 
@@ -465,15 +472,49 @@ public class DataResolver extends ResponseResolver
             public void close()
             {
                 for (int i = 0; i < repairs.length; i++)
-                {
-                    if (repairs[i] == null)
-                        continue;
+                    if (null != repairs[i])
+                        sendRepairMutation(repairs[i], sources[i]);
+            }
 
-                    // use a separate verb here because we don't want these to be get the white glove hint-
-                    // on-timeout behavior that a "real" mutation gets
-                    Tracing.trace("Sending read-repair-mutation to {}", sources[i]);
-                    MessageOut<Mutation> msg = new Mutation(repairs[i]).createMessage(MessagingService.Verb.READ_REPAIR);
-                    repairResults.add(MessagingService.instance().sendRR(msg, sources[i]));
+            private void sendRepairMutation(PartitionUpdate partition, InetAddress destination)
+            {
+                Mutation mutation = new Mutation(partition);
+                int messagingVersion = MessagingService.instance().getVersion(destination);
+
+                int    mutationSize = (int) Mutation.serializer.serializedSize(mutation, messagingVersion);
+                int maxMutationSize = DatabaseDescriptor.getMaxMutationSize();
+
+                if (mutationSize <= maxMutationSize)
+                {
+                    Tracing.trace("Sending read-repair-mutation to {}", destination);
+                    // use a separate verb here to avoid writing hints on timeouts
+                    MessageOut<Mutation> message = mutation.createMessage(MessagingService.Verb.READ_REPAIR);
+                    repairResults.add(MessagingService.instance().sendRR(message, destination));
+                    ColumnFamilyStore.metricsFor(command.metadata().cfId).readRepairRequests.mark();
+                }
+                else if (DROP_OVERSIZED_READ_REPAIR_MUTATIONS)
+                {
+                    logger.debug("Encountered an oversized ({}/{}) read repair mutation for table {}.{}, key {}, node {}",
+                                 mutationSize,
+                                 maxMutationSize,
+                                 command.metadata().ksName,
+                                 command.metadata().cfName,
+                                 command.metadata().getKeyValidator().getString(partitionKey.getKey()),
+                                 destination);
+                }
+                else
+                {
+                    logger.warn("Encountered an oversized ({}/{}) read repair mutation for table {}.{}, key {}, node {}",
+                                mutationSize,
+                                maxMutationSize,
+                                command.metadata().ksName,
+                                command.metadata().cfName,
+                                command.metadata().getKeyValidator().getString(partitionKey.getKey()),
+                                destination);
+
+                    int blockFor = consistency.blockFor(keyspace);
+                    Tracing.trace("Timed out while read-repairing after receiving all {} data and digest responses", blockFor);
+                    throw new ReadTimeoutException(consistency, blockFor - 1, blockFor, true);
                 }
             }
         }

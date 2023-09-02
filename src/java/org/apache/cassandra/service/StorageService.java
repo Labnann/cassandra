@@ -52,6 +52,7 @@ import ch.qos.logback.classic.jmx.JMXConfiguratorMBean;
 import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.Appender;
 import ch.qos.logback.core.hook.DelayingShutdownHook;
+
 import org.apache.cassandra.auth.AuthKeyspace;
 import org.apache.cassandra.auth.AuthMigrationListener;
 import org.apache.cassandra.batchlog.BatchRemoveVerbHandler;
@@ -86,6 +87,7 @@ import org.apache.cassandra.repair.*;
 import org.apache.cassandra.repair.messages.RepairOption;
 import org.apache.cassandra.schema.CompactionParams.TombstoneOption;
 import org.apache.cassandra.schema.KeyspaceMetadata;
+import org.apache.cassandra.schema.SchemaKeyspace;
 import org.apache.cassandra.service.paxos.CommitVerbHandler;
 import org.apache.cassandra.service.paxos.PrepareVerbHandler;
 import org.apache.cassandra.service.paxos.ProposeVerbHandler;
@@ -96,6 +98,7 @@ import org.apache.cassandra.thrift.cassandraConstants;
 import org.apache.cassandra.tracing.TraceKeyspace;
 import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.*;
+import org.apache.cassandra.utils.logging.LoggingSupportFactory;
 import org.apache.cassandra.utils.progress.ProgressEvent;
 import org.apache.cassandra.utils.progress.ProgressEventType;
 import org.apache.cassandra.utils.progress.jmx.JMXProgressSupport;
@@ -212,7 +215,7 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
 
     private final List<IEndpointLifecycleSubscriber> lifecycleSubscribers = new CopyOnWriteArrayList<>();
 
-    private final ObjectName jmxObjectName;
+    private final String jmxObjectName;
 
     private Collection<Token> bootstrapTokens = null;
 
@@ -223,6 +226,16 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
     private boolean replacing;
 
     private final StreamStateStore streamStateStore = new StreamStateStore();
+
+    public boolean isSurveyMode()
+    {
+        return isSurveyMode;
+    }
+
+    public boolean hasJoined()
+    {
+        return joined;
+    }
 
     /** This method updates the local token on disk  */
     public void setTokens(Collection<Token> tokens)
@@ -250,17 +263,9 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
         // use dedicated executor for sending JMX notifications
         super(Executors.newSingleThreadExecutor());
 
-        MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
-        try
-        {
-            jmxObjectName = new ObjectName("org.apache.cassandra.db:type=StorageService");
-            mbs.registerMBean(this, jmxObjectName);
-            mbs.registerMBean(StreamManager.instance, new ObjectName(StreamManager.OBJECT_NAME));
-        }
-        catch (Exception e)
-        {
-            throw new RuntimeException(e);
-        }
+        jmxObjectName = "org.apache.cassandra.db:type=StorageService";
+        MBeanWrapper.instance.registerMBean(this, jmxObjectName);
+        MBeanWrapper.instance.registerMBean(StreamManager.instance, StreamManager.OBJECT_NAME);
 
         legacyProgressSupport = new LegacyJMXProgressSupport(this, jmxObjectName);
 
@@ -367,6 +372,23 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
         {
             throw new IllegalStateException("No configured daemon");
         }
+
+        // We only start transports if bootstrap has completed and we're not in survey mode, OR if we are in
+        // survey mode and streaming has completed but we're not using auth.
+        // OR if we have not joined the ring yet.
+        if (StorageService.instance.hasJoined() &&
+                ((!StorageService.instance.isSurveyMode() && !SystemKeyspace.bootstrapComplete()) ||
+                (StorageService.instance.isSurveyMode() && StorageService.instance.isBootstrapMode())))
+        {
+            throw new IllegalStateException("Node is not yet bootstrapped completely. Use nodetool to check bootstrap state and resume. For more, see `nodetool help bootstrap`");
+        }
+        else if (StorageService.instance.hasJoined() && StorageService.instance.isSurveyMode() &&
+                DatabaseDescriptor.getAuthenticator().requireAuthentication())
+        {
+            // Auth isn't initialised until we join the ring, so if we're in survey mode auth will always fail.
+            throw new IllegalStateException("Not starting RPC server as write_survey mode and authentication is enabled");
+        }
+
         daemon.thriftServer.start();
     }
 
@@ -541,7 +563,7 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
         return localHostId;
     }
 
-    private synchronized void checkForEndpointCollision(UUID localHostId) throws ConfigurationException
+    private synchronized void checkForEndpointCollision(UUID localHostId, Set<InetAddress> peers) throws ConfigurationException
     {
         if (Boolean.getBoolean("cassandra.allow_unsafe_join"))
         {
@@ -550,7 +572,11 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
         }
 
         logger.debug("Starting shadow gossip round to check for endpoint collision");
-        Map<InetAddress, EndpointState> epStates = Gossiper.instance.doShadowRound();
+        Map<InetAddress, EndpointState> epStates = Gossiper.instance.doShadowRound(peers);
+
+        if (epStates.isEmpty() && DatabaseDescriptor.getSeeds().contains(FBUtilities.getBroadcastAddress()))
+            logger.info("Unable to gossip with any peers but continuing anyway since node is in its own seed list");
+
         // If bootstrapping, check whether any previously known status for the endpoint makes it unsafe to do so.
         // If not bootstrapping, compare the host id for this endpoint learned from gossip (if any) with the local
         // one, which was either read from system.local or generated at startup. If a learned id is present &
@@ -647,10 +673,7 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
                 if (FBUtilities.isWindows)
                     WindowsTimer.endTimerPeriod(DatabaseDescriptor.getWindowsTimerInterval());
 
-                // Cleanup logback
-                DelayingShutdownHook logbackHook = new DelayingShutdownHook();
-                logbackHook.setContext((LoggerContext)LoggerFactory.getILoggerFactory());
-                logbackHook.run();
+                LoggingSupportFactory.getLoggingSupport().onShutdown();
             }
         }, "StorageServiceShutdownHook");
         Runtime.getRuntime().addShutdownHook(drainOnShutdown);
@@ -750,7 +773,12 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
 
     private boolean shouldBootstrap()
     {
-        return DatabaseDescriptor.isAutoBootstrap() && !SystemKeyspace.bootstrapComplete() && !DatabaseDescriptor.getSeeds().contains(FBUtilities.getBroadcastAddress());
+        return DatabaseDescriptor.isAutoBootstrap() && !SystemKeyspace.bootstrapComplete() && !isSeed();
+    }
+
+    public static boolean isSeed()
+    {
+        return DatabaseDescriptor.getSeeds().contains(FBUtilities.getBroadcastAddress());
     }
 
     private void prepareToJoin() throws ConfigurationException
@@ -801,7 +829,7 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
             }
             else
             {
-                checkForEndpointCollision(localHostId);
+                checkForEndpointCollision(localHostId, SystemKeyspace.loadHostIds().keySet());
             }
 
             // have to start the gossip service before we can see any info on other nodes.  this is necessary
@@ -830,6 +858,29 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
             LoadBroadcaster.instance.startBroadcasting();
             HintsService.instance.startDispatch();
             BatchlogManager.instance.start();
+        }
+    }
+
+    public void waitForSchema(int delay)
+    {
+        // first sleep the delay to make sure we see all our peers
+        for (int i = 0; i < delay; i += 1000)
+        {
+            // if we see schema, we can proceed to the next check directly
+            if (!Schema.instance.getVersion().equals(SchemaConstants.emptyVersion))
+            {
+                logger.debug("got schema: {}", Schema.instance.getVersion());
+                break;
+            }
+            Uninterruptibles.sleepUninterruptibly(1, TimeUnit.SECONDS);
+        }
+        // if our schema hasn't matched yet, wait until it has
+        // we do this by waiting for all in-flight migration requests and responses to complete
+        // (post CASSANDRA-1391 we don't expect this to be necessary very often, but it doesn't hurt to be careful)
+        if (!MigrationManager.isReadyForBootstrap())
+        {
+            setMode(Mode.JOINING, "waiting for schema information to complete", true);
+            MigrationManager.waitUntilReadyForBootstrap();
         }
     }
 
@@ -869,25 +920,7 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
             else
                 SystemKeyspace.setBootstrapState(SystemKeyspace.BootstrapState.IN_PROGRESS);
             setMode(Mode.JOINING, "waiting for ring information", true);
-            // first sleep the delay to make sure we see all our peers
-            for (int i = 0; i < delay; i += 1000)
-            {
-                // if we see schema, we can proceed to the next check directly
-                if (!Schema.instance.getVersion().equals(SchemaConstants.emptyVersion))
-                {
-                    logger.debug("got schema: {}", Schema.instance.getVersion());
-                    break;
-                }
-                Uninterruptibles.sleepUninterruptibly(1, TimeUnit.SECONDS);
-            }
-            // if our schema hasn't matched yet, wait until it has
-            // we do this by waiting for all in-flight migration requests and responses to complete
-            // (post CASSANDRA-1391 we don't expect this to be necessary very often, but it doesn't hurt to be careful)
-            if (!MigrationManager.isReadyForBootstrap())
-            {
-                setMode(Mode.JOINING, "waiting for schema information to complete", true);
-                MigrationManager.waitUntilReadyForBootstrap();
-            }
+            waitForSchema(delay);
             setMode(Mode.JOINING, "schema complete, ready to bootstrap", true);
             setMode(Mode.JOINING, "waiting for pending range calculation", true);
             PendingRangeCalculatorService.instance.blockUntilFinished();
@@ -917,7 +950,7 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
                     throw new UnsupportedOperationException(s);
                 }
                 setMode(Mode.JOINING, "getting bootstrap token", true);
-                bootstrapTokens = BootStrapper.getBootstrapTokens(tokenMetadata, FBUtilities.getBroadcastAddress());
+                bootstrapTokens = BootStrapper.getBootstrapTokens(tokenMetadata, FBUtilities.getBroadcastAddress(), delay);
             }
             else
             {
@@ -973,22 +1006,7 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
             bootstrapTokens = SystemKeyspace.getSavedTokens();
             if (bootstrapTokens.isEmpty())
             {
-                Collection<String> initialTokens = DatabaseDescriptor.getInitialTokens();
-                if (initialTokens.size() < 1)
-                {
-                    bootstrapTokens = BootStrapper.getRandomTokens(tokenMetadata, DatabaseDescriptor.getNumTokens());
-                    if (DatabaseDescriptor.getNumTokens() == 1)
-                        logger.warn("Generated random token {}. Random tokens will result in an unbalanced ring; see http://wiki.apache.org/cassandra/Operations", bootstrapTokens);
-                    else
-                        logger.info("Generated random tokens. tokens are {}", bootstrapTokens);
-                }
-                else
-                {
-                    bootstrapTokens = new ArrayList<>(initialTokens.size());
-                    for (String token : initialTokens)
-                        bootstrapTokens.add(getTokenFactory().fromString(token));
-                    logger.info("Saved tokens not found. Using configuration value: {}", bootstrapTokens);
-                }
+                bootstrapTokens = BootStrapper.getBootstrapTokens(tokenMetadata, FBUtilities.getBroadcastAddress(), delay);
             }
             else
             {
@@ -1022,13 +1040,17 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
         }
         else
         {
-            logger.info("Startup complete, but write survey mode is active, not becoming an active ring member. Use JMX (StorageService->joinRing()) to finalize ring joining.");
+            if (dataAvailable)
+                logger.info("Startup complete, but write survey mode is active, not becoming an active ring member. Use JMX (StorageService->joinRing()) to finalize ring joining.");
+            else
+                logger.warn("Some data streaming failed. Use nodetool to check bootstrap state and resume. For more, see `nodetool help bootstrap`. {}", SystemKeyspace.getBootstrapState());
         }
     }
 
     public static boolean isReplacingSameAddress()
     {
-        return DatabaseDescriptor.getReplaceAddress().equals(FBUtilities.getBroadcastAddress());
+        InetAddress replaceAddress = DatabaseDescriptor.getReplaceAddress();
+        return replaceAddress != null && replaceAddress.equals(FBUtilities.getBroadcastAddress());
     }
 
     public void gossipSnitchInfo()
@@ -1062,9 +1084,24 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
         }
         else if (isSurveyMode)
         {
-            logger.info("Leaving write survey mode and joining ring at operator request");
-            finishJoiningRing(resumedBootstrap, SystemKeyspace.getSavedTokens());
-            isSurveyMode = false;
+            // if isSurveyMode is on then verify isBootstrapMode
+            // node can join the ring even if isBootstrapMode is true which should not happen
+            if (!isBootstrapMode())
+            {
+                isSurveyMode = false;
+                logger.info("Leaving write survey mode and joining ring at operator request");
+                finishJoiningRing(resumedBootstrap, SystemKeyspace.getSavedTokens());
+                daemon.start();
+            }
+            else
+            {
+                logger.warn("Can't join the ring because in write_survey mode and bootstrap hasn't completed");
+            }
+        }
+        else if (isBootstrapMode())
+        {
+            // bootstrap is not complete hence node cannot join the ring
+            logger.warn("Can't join the ring because bootstrap hasn't completed.");
         }
     }
 
@@ -1110,6 +1147,16 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
     {
         try
         {
+            /*
+             * We use timestamp of 0, intentionally, so that varying timestamps wouldn't cause schema mismatches on
+             * newly added nodes.
+             *
+             * Having the initial/default timestamp as 0 also allows users to make and persist changes to replication
+             * of our replicated system keyspaces.
+             *
+             * In case that we need to make incompatible changes to those kesypaces/tables, we'd need to bump the timestamp
+             * on per-keyspace/per-table basis. So far we've never needed to.
+             */
             MigrationManager.announceNewKeyspace(ksm, 0, false);
         }
         catch (AlreadyExistsException e)
@@ -1488,6 +1535,9 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
             SystemKeyspace.resetAvailableRanges();
         }
 
+        // Force disk boundary invalidation now that local tokens are set
+        invalidateDiskBoundaries();
+
         setMode(Mode.JOINING, "Starting to bootstrap...", true);
         BootStrapper bootstrapper = new BootStrapper(FBUtilities.getBroadcastAddress(), tokens, tokenMetadata);
         bootstrapper.addProgressListener(progressSupport);
@@ -1516,6 +1566,20 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
         {
             logger.error("Error while waiting on bootstrap to complete. Bootstrap will have to be restarted.", e);
             return false;
+        }
+    }
+
+    private void invalidateDiskBoundaries()
+    {
+        for (Keyspace keyspace : Keyspace.all())
+        {
+            for (ColumnFamilyStore cfs : keyspace.getColumnFamilyStores())
+            {
+                for (final ColumnFamilyStore store : cfs.concatWithIndexes())
+                {
+                    store.invalidateDiskBoundaries();
+                }
+            }
         }
     }
 
@@ -1558,17 +1622,18 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
                     bootstrapFinished();
                     // start participating in the ring.
                     // pretend we are in survey mode so we can use joinRing() here
-                    isSurveyMode = true;
-                    try
+                    if (isSurveyMode)
                     {
-                        progressSupport.progress("bootstrap", ProgressEvent.createNotification("Joining ring..."));
-                        joinRing(true);
+                        logger.info("Startup complete, but write survey mode is active, not becoming an active ring member. Use JMX (StorageService->joinRing()) to finalize ring joining.");
                     }
-                    catch (IOException ignore)
+                    else
                     {
-                        // joinRing with survey mode does not throw IOException
+                        isSurveyMode = false;
+                        progressSupport.progress("bootstrap", ProgressEvent.createNotification("Joining ring..."));
+                        finishJoiningRing(true, bootstrapTokens);
                     }
                     progressSupport.progress("bootstrap", new ProgressEvent(ProgressEventType.COMPLETE, 1, 1, "Resume bootstrap complete"));
+                    daemon.start();
                     logger.info("Resume complete");
                 }
 
@@ -2529,7 +2594,12 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
 
         UUID hostId = tokenMetadata.getHostId(endpoint);
         if (hostId != null && tokenMetadata.isMember(endpoint))
-            HintsService.instance.excise(hostId);
+        {
+            // enough time for writes to expire and MessagingService timeout reporter callback to fire, which is where
+            // hints are mostly written from - using getMinRpcTimeout() / 2 for the interval.
+            long delay = DatabaseDescriptor.getMinRpcTimeout() + DatabaseDescriptor.getWriteRpcTimeout();
+            ScheduledExecutors.optionalTasks.schedule(() -> HintsService.instance.excise(hostId), delay, TimeUnit.MILLISECONDS);
+        }
 
         removeEndpoint(endpoint);
         tokenMetadata.removeEndpoint(endpoint);
@@ -2945,7 +3015,7 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
 
     public int forceKeyspaceCleanup(int jobs, String keyspaceName, String... tables) throws IOException, ExecutionException, InterruptedException
     {
-        if (SchemaConstants.isSystemKeyspace(keyspaceName))
+        if (SchemaConstants.isLocalSystemKeyspace(keyspaceName))
             throw new RuntimeException("Cleanup of the system keyspace is neither necessary nor wise");
 
         CompactionManager.AllSSTableOpStatus status = CompactionManager.AllSSTableOpStatus.SUCCESSFUL;
@@ -2970,10 +3040,15 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
 
     public int scrub(boolean disableSnapshot, boolean skipCorrupted, boolean checkData, int jobs, String keyspaceName, String... tables) throws IOException, ExecutionException, InterruptedException
     {
+        return scrub(disableSnapshot, skipCorrupted, checkData, false, jobs, keyspaceName, tables);
+    }
+
+    public int scrub(boolean disableSnapshot, boolean skipCorrupted, boolean checkData, boolean reinsertOverflowedTTL, int jobs, String keyspaceName, String... tables) throws IOException, ExecutionException, InterruptedException
+    {
         CompactionManager.AllSSTableOpStatus status = CompactionManager.AllSSTableOpStatus.SUCCESSFUL;
         for (ColumnFamilyStore cfStore : getValidColumnFamilies(true, false, keyspaceName, tables))
         {
-            CompactionManager.AllSSTableOpStatus oneStatus = cfStore.scrub(disableSnapshot, skipCorrupted, checkData, jobs);
+            CompactionManager.AllSSTableOpStatus oneStatus = cfStore.scrub(disableSnapshot, skipCorrupted, reinsertOverflowedTTL, checkData, jobs);
             if (oneStatus != CompactionManager.AllSSTableOpStatus.SUCCESSFUL)
                 status = oneStatus;
         }
@@ -3268,7 +3343,7 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
         Map<String, TabularData> snapshotMap = new HashMap<>();
         for (Keyspace keyspace : Keyspace.all())
         {
-            if (SchemaConstants.isSystemKeyspace(keyspace.getName()))
+            if (SchemaConstants.isLocalSystemKeyspace(keyspace.getName()))
                 continue;
 
             for (ColumnFamilyStore cfStore : keyspace.getColumnFamilyStores())
@@ -3294,7 +3369,7 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
         long total = 0;
         for (Keyspace keyspace : Keyspace.all())
         {
-            if (SchemaConstants.isSystemKeyspace(keyspace.getName()))
+            if (SchemaConstants.isLocalSystemKeyspace(keyspace.getName()))
                 continue;
 
             for (ColumnFamilyStore cfStore : keyspace.getColumnFamilyStores())
@@ -3308,7 +3383,30 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
 
     public void refreshSizeEstimates() throws ExecutionException
     {
+        cleanupSizeEstimates();
         FBUtilities.waitOnFuture(ScheduledExecutors.optionalTasks.submit(SizeEstimatesRecorder.instance));
+    }
+
+    public void cleanupSizeEstimates()
+    {
+        SetMultimap<String, String> sizeEstimates = SystemKeyspace.getTablesWithSizeEstimates();
+
+        for (Entry<String, Collection<String>> tablesByKeyspace : sizeEstimates.asMap().entrySet())
+        {
+            String keyspace = tablesByKeyspace.getKey();
+            if (!Schema.instance.getKeyspaces().contains(keyspace))
+            {
+                SystemKeyspace.clearSizeEstimates(keyspace);
+            }
+            else
+            {
+                for (String table : tablesByKeyspace.getValue())
+                {
+                    if (!Schema.instance.hasCF(Pair.create(keyspace, table)))
+                        SystemKeyspace.clearSizeEstimates(keyspace, table);
+                }
+            }
+        }
     }
 
     /**
@@ -3785,50 +3883,16 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
 
     public void setLoggingLevel(String classQualifier, String rawLevel) throws Exception
     {
-        ch.qos.logback.classic.Logger logBackLogger = (ch.qos.logback.classic.Logger) LoggerFactory.getLogger(classQualifier);
-
-        // if both classQualifer and rawLevel are empty, reload from configuration
-        if (StringUtils.isBlank(classQualifier) && StringUtils.isBlank(rawLevel) )
-        {
-            JMXConfiguratorMBean jmxConfiguratorMBean = JMX.newMBeanProxy(ManagementFactory.getPlatformMBeanServer(),
-                    new ObjectName("ch.qos.logback.classic:Name=default,Type=ch.qos.logback.classic.jmx.JMXConfigurator"),
-                    JMXConfiguratorMBean.class);
-            jmxConfiguratorMBean.reloadDefaultConfiguration();
-            return;
-        }
-        // classQualifer is set, but blank level given
-        else if (StringUtils.isNotBlank(classQualifier) && StringUtils.isBlank(rawLevel) )
-        {
-            if (logBackLogger.getLevel() != null || hasAppenders(logBackLogger))
-                logBackLogger.setLevel(null);
-            return;
-        }
-
-        ch.qos.logback.classic.Level level = ch.qos.logback.classic.Level.toLevel(rawLevel);
-        logBackLogger.setLevel(level);
-        logger.info("set log level to {} for classes under '{}' (if the level doesn't look like '{}' then the logger couldn't parse '{}')", level, classQualifier, rawLevel, rawLevel);
+        LoggingSupportFactory.getLoggingSupport().setLoggingLevel(classQualifier, rawLevel);
     }
 
     /**
      * @return the runtime logging levels for all the configured loggers
      */
     @Override
-    public Map<String,String>getLoggingLevels()
+    public Map<String,String> getLoggingLevels()
     {
-        Map<String, String> logLevelMaps = Maps.newLinkedHashMap();
-        LoggerContext lc = (LoggerContext) LoggerFactory.getILoggerFactory();
-        for (ch.qos.logback.classic.Logger logger : lc.getLoggerList())
-        {
-            if(logger.getLevel() != null || hasAppenders(logger))
-                logLevelMaps.put(logger.getName(), logger.getLevel().toString());
-        }
-        return logLevelMaps;
-    }
-
-    private boolean hasAppenders(ch.qos.logback.classic.Logger logger)
-    {
-        Iterator<Appender<ILoggingEvent>> it = logger.iteratorForAppenders();
-        return it.hasNext();
+        return LoggingSupportFactory.getLoggingSupport().getLoggingLevels();
     }
 
     /**
@@ -4780,7 +4844,8 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
 
     public List<String> getNonSystemKeyspaces()
     {
-        return Collections.unmodifiableList(Schema.instance.getNonSystemKeyspaces());
+        List<String> nonKeyspaceNamesList = new ArrayList<>(Schema.instance.getNonSystemKeyspaces());
+        return Collections.unmodifiableList(nonKeyspaceNamesList);
     }
 
     public List<String> getNonLocalStrategyKeyspaces()
@@ -5081,6 +5146,8 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
      */
     public void loadNewSSTables(String ksName, String cfName)
     {
+        if (!isInitialized())
+            throw new RuntimeException("Not yet initialized, can't load new sstables");
         ColumnFamilyStore.loadNewSSTables(ksName, cfName);
     }
 
@@ -5115,6 +5182,11 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
     public void resetLocalSchema() throws IOException
     {
         MigrationManager.resetLocalSchema();
+    }
+
+    public void reloadLocalSchema()
+    {
+        SchemaKeyspace.reloadSchemaAndAnnounceVersion();
     }
 
     public void setTraceProbability(double probability)
@@ -5191,63 +5263,5 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
     {
         DatabaseDescriptor.setHintedHandoffThrottleInKB(throttleInKB);
         logger.info("Updated hinted_handoff_throttle_in_kb to {}", throttleInKB);
-    }
-
-    public static List<PartitionPosition> getDiskBoundaries(ColumnFamilyStore cfs, Directories.DataDirectory[] directories)
-    {
-        if (!cfs.getPartitioner().splitter().isPresent())
-            return null;
-
-        Collection<Range<Token>> lr;
-
-        if (StorageService.instance.isBootstrapMode())
-        {
-            lr = StorageService.instance.getTokenMetadata().getPendingRanges(cfs.keyspace.getName(), FBUtilities.getBroadcastAddress());
-        }
-        else
-        {
-            // Reason we use use the future settled TMD is that if we decommission a node, we want to stream
-            // from that node to the correct location on disk, if we didn't, we would put new files in the wrong places.
-            // We do this to minimize the amount of data we need to move in rebalancedisks once everything settled
-            TokenMetadata tmd = StorageService.instance.getTokenMetadata().cloneAfterAllSettled();
-            lr = cfs.keyspace.getReplicationStrategy().getAddressRanges(tmd).get(FBUtilities.getBroadcastAddress());
-        }
-
-        if (lr == null || lr.isEmpty())
-            return null;
-        List<Range<Token>> localRanges = Range.sort(lr);
-
-        return getDiskBoundaries(localRanges, cfs.getPartitioner(), directories);
-    }
-
-    public static List<PartitionPosition> getDiskBoundaries(ColumnFamilyStore cfs)
-    {
-        return getDiskBoundaries(cfs, cfs.getDirectories().getWriteableLocations());
-    }
-
-    /**
-     * Returns a list of disk boundaries, the result will differ depending on whether vnodes are enabled or not.
-     *
-     * What is returned are upper bounds for the disks, meaning everything from partitioner.minToken up to
-     * getDiskBoundaries(..).get(0) should be on the first disk, everything between 0 to 1 should be on the second disk
-     * etc.
-     *
-     * The final entry in the returned list will always be the partitioner maximum tokens upper key bound
-     */
-    public static List<PartitionPosition> getDiskBoundaries(List<Range<Token>> localRanges, IPartitioner partitioner, Directories.DataDirectory[] dataDirectories)
-    {
-        assert partitioner.splitter().isPresent();
-        Splitter splitter = partitioner.splitter().get();
-        boolean dontSplitRanges = DatabaseDescriptor.getNumTokens() > 1;
-        List<Token> boundaries = splitter.splitOwnedRanges(dataDirectories.length, localRanges, dontSplitRanges);
-        // If we can't split by ranges, split evenly to ensure utilisation of all disks
-        if (dontSplitRanges && boundaries.size() < dataDirectories.length)
-            boundaries = splitter.splitOwnedRanges(dataDirectories.length, localRanges, false);
-
-        List<PartitionPosition> diskBoundaries = new ArrayList<>();
-        for (int i = 0; i < boundaries.size() - 1; i++)
-            diskBoundaries.add(boundaries.get(i).maxKeyBound());
-        diskBoundaries.add(partitioner.getMaximumToken().maxKeyBound());
-        return diskBoundaries;
     }
 }

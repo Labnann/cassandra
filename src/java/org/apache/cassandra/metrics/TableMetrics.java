@@ -122,7 +122,7 @@ public class TableMetrics
     public final Gauge<Double> keyCacheHitRate;
     /** Tombstones scanned in queries on this CF */
     public final TableHistogram tombstoneScannedHistogram;
-    /** Live cells scanned in queries on this CF */
+    /** Live rows scanned in queries on this CF */
     public final TableHistogram liveScannedHistogram;
     /** Column update time delta on this CF */
     public final TableHistogram colUpdateTimeDeltaHistogram;
@@ -201,6 +201,7 @@ public class TableMetrics
         }
     });
 
+    public final Meter readRepairRequests;
     public final Meter shortReadProtectionRequests;
 
     public final Map<Sampler, TopKSampler<ByteBuffer>> samplers;
@@ -697,6 +698,7 @@ public class TableMetrics
         casPropose = new LatencyMetrics(factory, "CasPropose", cfs.keyspace.metric.casPropose);
         casCommit = new LatencyMetrics(factory, "CasCommit", cfs.keyspace.metric.casCommit);
 
+        readRepairRequests = Metrics.meter(factory.createMetricName("ReadRepairRequests"));
         shortReadProtectionRequests = Metrics.meter(factory.createMetricName("ShortReadProtectionRequests"));
     }
 

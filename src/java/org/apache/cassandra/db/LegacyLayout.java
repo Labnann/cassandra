@@ -24,6 +24,7 @@ import java.nio.ByteBuffer;
 import java.security.MessageDigest;
 import java.util.*;
 
+import org.apache.cassandra.cql3.ColumnIdentifier;
 import org.apache.cassandra.cql3.SuperColumnCompatibility;
 import org.apache.cassandra.config.SchemaConstants;
 import org.apache.cassandra.utils.AbstractIterator;
@@ -46,6 +47,7 @@ import org.apache.cassandra.utils.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import static com.google.common.collect.Iterables.all;
 import static org.apache.cassandra.utils.ByteBufferUtil.bytes;
 
 /**
@@ -64,6 +66,23 @@ public abstract class LegacyLayout
     public final static int COUNTER_MASK         = 0x04;
     public final static int COUNTER_UPDATE_MASK  = 0x08;
     private final static int RANGE_TOMBSTONE_MASK = 0x10;
+
+    // Used in decodeBound if the number of components in the legacy bound is greater than the clustering size,
+    // indicating a complex column deletion (i.e. a collection tombstone), but the referenced column is either
+    // not present in the current table metadata, or is not currently a complex column. In that case, we'll
+    // check the dropped columns for the table which should contain the previous column definition. If that
+    // previous definition is also not complex (indicating that the column may have been dropped and re-added
+    // with different types multiple times), we use this fake definition to ensure that the complex deletion
+    // can be safely processed. This resulting deletion should be filtered out of any row created by a
+    // CellGrouper by the dropped column check, but this gives us an extra level of confidence as that check
+    // is timestamp based and so is fallible in the face of clock drift.
+    private static final ColumnDefinition INVALID_DROPPED_COMPLEX_SUBSTITUTE_COLUMN =
+        new ColumnDefinition("",
+                             "",
+                             ColumnIdentifier.getInterned(ByteBufferUtil.EMPTY_BYTE_BUFFER, UTF8Type.instance),
+                             SetType.getInstance(UTF8Type.instance, true),
+                             ColumnDefinition.NO_POSITION,
+                             ColumnDefinition.Kind.REGULAR);
 
     private LegacyLayout() {}
 
@@ -183,7 +202,17 @@ public abstract class LegacyLayout
         return new LegacyCellName(def.isStatic() ? Clustering.STATIC_CLUSTERING : clustering, def, collectionElement);
     }
 
-    public static LegacyBound decodeBound(CFMetaData metadata, ByteBuffer bound, boolean isStart)
+    public static LegacyBound decodeSliceBound(CFMetaData metadata, ByteBuffer bound, boolean isStart)
+    {
+        return decodeBound(metadata, bound, isStart, false);
+    }
+
+    public static LegacyBound decodeTombstoneBound(CFMetaData metadata, ByteBuffer bound, boolean isStart)
+    {
+        return decodeBound(metadata, bound, isStart, true);
+    }
+
+    private static LegacyBound decodeBound(CFMetaData metadata, ByteBuffer bound, boolean isStart, boolean isDeletion)
     {
         if (!bound.hasRemaining())
             return isStart ? LegacyBound.BOTTOM : LegacyBound.TOP;
@@ -197,17 +226,45 @@ public abstract class LegacyLayout
 
         int clusteringSize = metadata.comparator.size();
 
+        boolean isStatic = metadata.isCompound() && CompositeType.isStaticName(bound);
         List<ByteBuffer> components = CompositeType.splitName(bound);
         byte eoc = CompositeType.lastEOC(bound);
 
-        // There can be  more components than the clustering size only in the case this is the bound of a collection
-        // range tombstone. In which case, there is exactly one more component, and that component is the name of the
-        // collection being selected/deleted.
-        assert components.size() <= clusteringSize || (!metadata.isCompactTable() && components.size() == clusteringSize + 1);
-
+        // if the bound we have decoded is static, 2.2 format requires there to be N empty clusterings
+        assert !isStatic ||
+                (components.size() >= clusteringSize
+                        && all(components.subList(0, clusteringSize), ByteBufferUtil.EMPTY_BYTE_BUFFER::equals));
         ColumnDefinition collectionName = null;
         if (components.size() > clusteringSize)
-            collectionName = metadata.getColumnDefinition(components.remove(clusteringSize));
+        {
+            // For a deletion, there can be more components than the clustering size only in the case this is the
+            // bound of a collection range tombstone. In such a case, there is exactly one more component, and that
+            // component is the name of the collection being selected/deleted.
+            // If the bound is not part of a deletion, it is from slice query filter. In this scnario, the column name
+            // may be a valid, non-collection column or it may be an empty buffer, representing a row marker. In either
+            // case, this needn't be included in the returned bound, so we pop the last element from the components
+            // list but ensure that the collection name remains null.
+
+            assert clusteringSize + 1 == components.size() && !metadata.isCompactTable();
+            // pop the final element from the back of the list of clusterings
+            ByteBuffer columnNameBytes = components.remove(clusteringSize);
+            if (isDeletion)
+            {
+                collectionName = metadata.getColumnDefinition(columnNameBytes);
+                if (collectionName == null || !collectionName.isComplex())
+                {
+                    collectionName = metadata.getDroppedColumnDefinition(columnNameBytes, isStatic);
+                    // if no record of the column having ever existed is found, something is badly wrong
+                    if (collectionName == null)
+                        throw new RuntimeException("Unknown collection column " + UTF8Type.instance.getString(columnNameBytes) + " during deserialization");
+
+                    // if we do have a record of dropping this column but it wasn't previously complex, use a fake
+                    // column definition for safety (see the comment on the constant declaration for details)
+                    if (!collectionName.isComplex())
+                        collectionName = INVALID_DROPPED_COMPLEX_SUBSTITUTE_COLUMN;
+                }
+            }
+        }
 
         boolean isInclusive;
         if (isStart)
@@ -231,7 +288,7 @@ public abstract class LegacyLayout
 
         ClusteringPrefix.Kind boundKind = ClusteringBound.boundKind(isStart, isInclusive);
         ClusteringBound cb = ClusteringBound.create(boundKind, components.toArray(new ByteBuffer[components.size()]));
-        return new LegacyBound(cb, metadata.isCompound() && CompositeType.isStaticName(bound), collectionName);
+        return new LegacyBound(cb, isStatic, collectionName);
     }
 
     public static ByteBuffer encodeBound(CFMetaData metadata, ClusteringBound bound, boolean isStart)
@@ -458,7 +515,7 @@ public abstract class LegacyLayout
             else if (cell.isCounterUpdate())
             {
                 out.writeLong(cell.timestamp);
-                long count = CounterContext.instance().getLocalCount(cell.value);
+                long count = CounterContext.instance().getUpdateCount(cell.value);
                 ByteBufferUtil.writeWithLength(ByteBufferUtil.bytes(count), out);
                 continue;
             }
@@ -529,7 +586,7 @@ public abstract class LegacyLayout
             else if (cell.isCounterUpdate())
             {
                 size += TypeSizes.sizeof(cell.timestamp);
-                long count = CounterContext.instance().getLocalCount(cell.value);
+                long count = CounterContext.instance().getUpdateCount(cell.value);
                 size += ByteBufferUtil.serializedSizeWithLength(ByteBufferUtil.bytes(count));
                 continue;
             }
@@ -650,7 +707,7 @@ public abstract class LegacyLayout
 
         boolean foundOne = false;
         LegacyAtom atom;
-        while ((atom = readLegacyAtom(metadata, in, false)) != null)
+        while ((atom = readLegacyAtomSkippingUnknownColumn(metadata,in)) != null)
         {
             if (atom.isCell())
             {
@@ -671,6 +728,23 @@ public abstract class LegacyLayout
         }
 
         return foundOne ? builder.build() : Rows.EMPTY_STATIC_ROW;
+    }
+
+    private static LegacyAtom readLegacyAtomSkippingUnknownColumn(CFMetaData metadata, DataInputPlus in)
+    throws IOException
+    {
+        while (true)
+        {
+            try
+            {
+                return readLegacyAtom(metadata, in, false);
+            }
+            catch (UnknownColumnException e)
+            {
+                // Simply skip, as the method name implies.
+            }
+        }
+
     }
 
     private static Row getNextRow(CellGrouper grouper, PeekingIterator<? extends LegacyAtom> cells)
@@ -777,12 +851,18 @@ public abstract class LegacyLayout
             if (!delTime.isLive())
             {
                 Clustering clustering = row.clustering();
+                boolean isStatic = clustering == Clustering.STATIC_CLUSTERING;
+                assert isStatic == col.isStatic();
 
-                ClusteringBound startBound = ClusteringBound.inclusiveStartOf(clustering);
-                ClusteringBound endBound = ClusteringBound.inclusiveEndOf(clustering);
+                ClusteringBound startBound = isStatic
+                        ? LegacyDeletionInfo.staticBound(metadata, true)
+                        : ClusteringBound.inclusiveStartOf(clustering);
+                ClusteringBound endBound = isStatic
+                        ? LegacyDeletionInfo.staticBound(metadata, false)
+                        : ClusteringBound.inclusiveEndOf(clustering);
 
-                LegacyLayout.LegacyBound start = new LegacyLayout.LegacyBound(startBound, col.isStatic(), col);
-                LegacyLayout.LegacyBound end = new LegacyLayout.LegacyBound(endBound, col.isStatic(), col);
+                LegacyLayout.LegacyBound start = new LegacyLayout.LegacyBound(startBound, isStatic, col);
+                LegacyLayout.LegacyBound end = new LegacyLayout.LegacyBound(endBound, isStatic, col);
 
                 deletions.add(start, end, delTime.markedForDeleteAt(), delTime.localDeletionTime());
             }
@@ -1021,29 +1101,36 @@ public abstract class LegacyLayout
         };
     }
 
-    public static LegacyAtom readLegacyAtom(CFMetaData metadata, DataInputPlus in, boolean readAllAsDynamic) throws IOException
+    public static LegacyAtom readLegacyAtom(CFMetaData metadata, DataInputPlus in, boolean readAllAsDynamic)
+    throws IOException, UnknownColumnException
     {
-        while (true)
-        {
-            ByteBuffer cellname = ByteBufferUtil.readWithShortLength(in);
-            if (!cellname.hasRemaining())
-                return null; // END_OF_ROW
+        ByteBuffer cellname = ByteBufferUtil.readWithShortLength(in);
+        if (!cellname.hasRemaining())
+            return null; // END_OF_ROW
 
-            try
-            {
-                int b = in.readUnsignedByte();
-                return (b & RANGE_TOMBSTONE_MASK) != 0
-                    ? readLegacyRangeTombstoneBody(metadata, in, cellname)
-                    : readLegacyCellBody(metadata, in, cellname, b, SerializationHelper.Flag.LOCAL, readAllAsDynamic);
-            }
-            catch (UnknownColumnException e)
-            {
-                // We can get there if we read a cell for a dropped column, and ff that is the case,
-                // then simply ignore the cell is fine. But also not that we ignore if it's the
-                // system keyspace because for those table we actually remove columns without registering
-                // them in the dropped columns
-                assert metadata.ksName.equals(SchemaConstants.SYSTEM_KEYSPACE_NAME) || metadata.getDroppedColumnDefinition(e.columnName) != null : e.getMessage();
-            }
+        try
+        {
+            int b = in.readUnsignedByte();
+            return (b & RANGE_TOMBSTONE_MASK) != 0
+                   ? readLegacyRangeTombstoneBody(metadata, in, cellname)
+                   : readLegacyCellBody(metadata, in, cellname, b, SerializationHelper.Flag.LOCAL, readAllAsDynamic);
+        }
+        catch (UnknownColumnException e)
+        {
+            // We legitimately can get here in 2 cases:
+            // 1) for system tables, because we've unceremoniously removed columns (without registering them as dropped)
+            // 2) for dropped columns.
+            // In any other case, there is a mismatch between the schema and the data, and we complain loudly in
+            // that case. Note that if we are in a legit case of an unknown column, we want to simply skip that cell,
+            // but we don't do this here and re-throw the exception because the calling code sometimes has to know
+            // about this happening. This does mean code calling this method should handle this case properly.
+            if (!metadata.ksName.equals(SchemaConstants.SYSTEM_KEYSPACE_NAME) && metadata.getDroppedColumnDefinition(e.columnName) == null)
+                throw new IllegalStateException(String.format("Got cell for unknown column %s in sstable of %s.%s: " +
+                                                              "This suggest a problem with the schema which doesn't list " +
+                                                              "this column. Even if that column was dropped, it should have " +
+                                                              "been listed as such", metadata.ksName, metadata.cfName, UTF8Type.instance.compose(e.columnName)), e);
+
+            throw e;
         }
     }
 
@@ -1091,8 +1178,8 @@ public abstract class LegacyLayout
 
     public static LegacyRangeTombstone readLegacyRangeTombstoneBody(CFMetaData metadata, DataInputPlus in, ByteBuffer boundname) throws IOException
     {
-        LegacyBound min = decodeBound(metadata, boundname, true);
-        LegacyBound max = decodeBound(metadata, ByteBufferUtil.readWithShortLength(in), false);
+        LegacyBound min = decodeTombstoneBound(metadata, boundname, true);
+        LegacyBound max = decodeTombstoneBound(metadata, ByteBufferUtil.readWithShortLength(in), false);
         DeletionTime dt = DeletionTime.serializer.deserialize(in);
         return new LegacyRangeTombstone(min, max, dt);
     }
@@ -1251,56 +1338,93 @@ public abstract class LegacyLayout
             return true;
         }
 
-        public boolean addRangeTombstone(LegacyRangeTombstone tombstone)
+        private boolean addRangeTombstone(LegacyRangeTombstone tombstone)
         {
             if (tombstone.isRowDeletion(metadata))
-            {
-                if (clustering != null)
-                {
-                    // If we're already in the row, there might be a chance that there were two range tombstones
-                    // written, as 2.x storage format does not guarantee just one range tombstone, unlike 3.x.
-                    // We have to make sure that clustering matches, which would mean that tombstone is for the
-                    // same row.
-                    if (rowDeletion != null && clustering.equals(tombstone.start.getAsClustering(metadata)))
-                    {
-                        // If the tombstone superceeds the previous delete, we discard the previous one
-                        if (tombstone.deletionTime.supersedes(rowDeletion.deletionTime))
-                        {
-                            builder.addRowDeletion(Row.Deletion.regular(tombstone.deletionTime));
-                            rowDeletion = tombstone;
-                        }
-                        return true;
-                    }
+                return addRowTombstone(tombstone);
+            else if (tombstone.isCollectionTombstone())
+                return addCollectionTombstone(tombstone);
+            else
+                return addGenericRangeTombstone(tombstone);
+        }
 
-                    // If we're already within a row and there was no delete written before that one, it can't be the same one
-                    return false;
+        private boolean addRowTombstone(LegacyRangeTombstone tombstone)
+        {
+            if (clustering != null)
+            {
+                // If we're already in the row, there might be a chance that there were two range tombstones
+                // written, as 2.x storage format does not guarantee just one range tombstone, unlike 3.x.
+                // We have to make sure that clustering matches, which would mean that tombstone is for the
+                // same row.
+                if (rowDeletion != null && clustering.equals(tombstone.start.getAsClustering(metadata)))
+                {
+                    // If the tombstone superceeds the previous delete, we discard the previous one
+                    if (tombstone.deletionTime.supersedes(rowDeletion.deletionTime))
+                    {
+                        builder.addRowDeletion(Row.Deletion.regular(tombstone.deletionTime));
+                        rowDeletion = tombstone;
+                    }
+                    return true;
                 }
 
+                // If we're already within a row and there was no delete written before that one, it can't be the same one
+                return false;
+            }
+
+            clustering = tombstone.start.getAsClustering(metadata);
+            builder.newRow(clustering);
+            builder.addRowDeletion(Row.Deletion.regular(tombstone.deletionTime));
+            rowDeletion = tombstone;
+
+            return true;
+        }
+
+        private boolean addCollectionTombstone(LegacyRangeTombstone tombstone)
+        {
+            if (!helper.includes(tombstone.start.collectionName))
+                return false; // see CASSANDRA-13109
+
+            // The helper needs to be informed about the current complex column identifier before
+            // it can perform the comparison between the recorded drop time and the RT deletion time.
+            // If the RT has been superceded by a drop, we still return true as we don't want the
+            // grouper to terminate yet.
+            helper.startOfComplexColumn(tombstone.start.collectionName);
+            if (helper.isDroppedComplexDeletion(tombstone.deletionTime))
+                return true;
+
+            if (clustering == null)
+            {
                 clustering = tombstone.start.getAsClustering(metadata);
                 builder.newRow(clustering);
-                builder.addRowDeletion(Row.Deletion.regular(tombstone.deletionTime));
-                rowDeletion = tombstone;
-                return true;
             }
-
-            if (tombstone.isCollectionTombstone() && helper.includes(tombstone.start.collectionName))
+            else if (!clustering.equals(tombstone.start.getAsClustering(metadata)))
             {
-                if (clustering == null)
-                {
-                    clustering = tombstone.start.getAsClustering(metadata);
-                    builder.newRow(clustering);
-                }
-                else if (!clustering.equals(tombstone.start.getAsClustering(metadata)))
-                {
-                    return false;
-                }
-
-                builder.addComplexDeletion(tombstone.start.collectionName, tombstone.deletionTime);
-                if (rowDeletion == null || tombstone.deletionTime.supersedes(rowDeletion.deletionTime))
-                    collectionDeletion = tombstone;
-                return true;
+                return false;
             }
-            return false;
+
+            builder.addComplexDeletion(tombstone.start.collectionName, tombstone.deletionTime);
+            if (rowDeletion == null || tombstone.deletionTime.supersedes(rowDeletion.deletionTime))
+                collectionDeletion = tombstone;
+
+            return true;
+        }
+
+        private boolean addGenericRangeTombstone(LegacyRangeTombstone tombstone)
+        {
+            /*
+             * We can see a non-collection, non-row deletion in two scenarios:
+             *
+             * 1. Most commonly, the tombstone's start bound is bigger than current row's clustering, which means that
+             *    the current row is over, and we should move on to the next row or RT;
+             *
+             * 2. Less commonly, the tombstone's start bound is smaller than current row's clustering, which means that
+             *    we've crossed an index boundary and are seeing a non-closed RT from the previous block, repeated;
+             *    we should ignore it and stay in the current row.
+             *
+             *  In either case, clustering should be non-null, or we shouldn't have gotten to this method at all
+             *  However, to be absolutely SURE we're in case two above, we check here.
+             */
+            return clustering != null && metadata.comparator.compare(clustering, tombstone.start.bound.clustering()) > 0;
         }
 
         public Row getRow()
@@ -1439,6 +1563,12 @@ public abstract class LegacyLayout
     {
         public boolean isCell();
 
+        // note that for static atoms, LegacyCell and LegacyRangeTombstone behave differently here:
+        //  - LegacyCell returns the modern Clustering.STATIC_CLUSTERING
+        //  - LegacyRangeTombstone returns the 2.2 bound (i.e. N empty ByteBuffer, where N is number of clusterings)
+        // in LegacyDeletionInfo.add(), we split any LRT with a static bound out into the inRowRangeTombstones collection
+        // these are merged with regular row cells, in the CellGrouper, and their clustering is obtained via start.bound.getAsClustering
+        // (also, it should be impossibly to issue raw static row deletions anyway)
         public ClusteringPrefix clustering();
         public boolean isStatic();
 
@@ -1490,7 +1620,11 @@ public abstract class LegacyLayout
         public static LegacyCell expiring(CFMetaData metadata, ByteBuffer superColumnName, ByteBuffer name, ByteBuffer value, long timestamp, int ttl, int nowInSec)
         throws UnknownColumnException
         {
-            return new LegacyCell(Kind.EXPIRING, decodeCellName(metadata, superColumnName, name), value, timestamp, nowInSec + ttl, ttl);
+            /*
+             * CASSANDRA-14092: Max expiration date capping is maybe performed here, expiration overflow policy application
+             * is done at {@link org.apache.cassandra.thrift.ThriftValidation#validateTtl(CFMetaData, Column)}
+             */
+            return new LegacyCell(Kind.EXPIRING, decodeCellName(metadata, superColumnName, name), value, timestamp, ExpirationDateOverflowHandling.computeLocalExpirationTime(nowInSec, ttl), ttl);
         }
 
         public static LegacyCell tombstone(CFMetaData metadata, ByteBuffer superColumnName, ByteBuffer name, long timestamp, int nowInSec)
@@ -1628,6 +1762,7 @@ public abstract class LegacyLayout
             this.deletionTime = deletionTime;
         }
 
+        /** @see LegacyAtom#clustering for static inconsistencies explained */
         public ClusteringPrefix clustering()
         {
             return start.bound;
@@ -1790,8 +1925,8 @@ public abstract class LegacyLayout
             LegacyDeletionInfo delInfo = new LegacyDeletionInfo(new MutableDeletionInfo(topLevel));
             for (int i = 0; i < rangeCount; i++)
             {
-                LegacyBound start = decodeBound(metadata, ByteBufferUtil.readWithShortLength(in), true);
-                LegacyBound end = decodeBound(metadata, ByteBufferUtil.readWithShortLength(in), false);
+                LegacyBound start = decodeTombstoneBound(metadata, ByteBufferUtil.readWithShortLength(in), true);
+                LegacyBound end = decodeTombstoneBound(metadata, ByteBufferUtil.readWithShortLength(in), false);
                 int delTime =  in.readInt();
                 long markedAt = in.readLong();
 
@@ -2330,8 +2465,8 @@ public abstract class LegacyLayout
                 LegacyBound start = starts[i];
                 LegacyBound end = ends[i];
 
-                CompositeType.Builder startBuilder = type.builder();
-                CompositeType.Builder endBuilder = type.builder();
+                CompositeType.Builder startBuilder = type.builder(start.isStatic);
+                CompositeType.Builder endBuilder = type.builder(end.isStatic);
                 for (int j = 0; j < start.bound.clustering().size(); j++)
                 {
                     startBuilder.add(start.bound.get(j));

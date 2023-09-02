@@ -268,6 +268,7 @@ public class OutboundTcpConnection extends FastThreadLocalThread
                         // are added between the calls of backlog.size() and backlog.clear()
                         dropped.addAndGet(backlog.size());
                         backlog.clear();
+                        currentMsgBufferCount = 0;
                         break inner;
                     }
                 }
@@ -535,13 +536,13 @@ public class OutboundTcpConnection extends FastThreadLocalThread
             catch (SSLHandshakeException e)
             {
                 logger.error("SSL handshake error for outbound connection to " + socket, e);
-                socket = null;
+                disconnect();
                 // SSL errors won't be recoverable within timeout period so we'll just abort
                 return false;
             }
             catch (IOException e)
             {
-                socket = null;
+                disconnect();
                 logger.debug("Unable to connect to {}", poolReference.endPoint(), e);
                 Uninterruptibles.sleepUninterruptibly(OPEN_RETRY_DELAY, TimeUnit.MILLISECONDS);
             }

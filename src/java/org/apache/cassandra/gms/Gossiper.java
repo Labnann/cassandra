@@ -24,16 +24,14 @@ import java.util.*;
 import java.util.Map.Entry;
 import java.util.concurrent.*;
 import java.util.concurrent.locks.ReentrantLock;
-
-import javax.management.MBeanServer;
-import javax.management.ObjectName;
+import javax.annotation.Nullable;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.util.concurrent.Uninterruptibles;
 
-import org.apache.cassandra.utils.CassandraVersion;
+import org.apache.cassandra.utils.MBeanWrapper;
 import org.apache.cassandra.utils.Pair;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -43,12 +41,14 @@ import org.apache.cassandra.concurrent.JMXEnabledThreadPoolExecutor;
 import org.apache.cassandra.concurrent.Stage;
 import org.apache.cassandra.concurrent.StageManager;
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.config.Schema;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.net.IAsyncCallback;
 import org.apache.cassandra.net.MessageIn;
 import org.apache.cassandra.net.MessageOut;
 import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.utils.CassandraVersion;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.JVMStabilityInspector;
 
@@ -75,6 +75,7 @@ public class Gossiper implements IFailureDetectionEventListener, GossiperMBean
     static final List<String> DEAD_STATES = Arrays.asList(VersionedValue.REMOVING_TOKEN, VersionedValue.REMOVED_TOKEN,
                                                           VersionedValue.STATUS_LEFT, VersionedValue.HIBERNATE);
     static ArrayList<String> SILENT_SHUTDOWN_STATES = new ArrayList<>();
+
     static
     {
         SILENT_SHUTDOWN_STATES.addAll(DEAD_STATES);
@@ -130,6 +131,7 @@ public class Gossiper implements IFailureDetectionEventListener, GossiperMBean
 
     private final Map<InetAddress, Long> expireTimeEndpointMap = new ConcurrentHashMap<InetAddress, Long>();
 
+    private volatile boolean anyNodeOn30 = false; // we assume the regular case here - all nodes are on 3.11
     private volatile boolean inShadowRound = false;
     // seeds gathered during shadow round that indicated to be in the shadow round phase as well
     private final Set<InetAddress> seedsInShadowRound = new ConcurrentSkipListSet<>(inetcomparator);
@@ -212,15 +214,7 @@ public class Gossiper implements IFailureDetectionEventListener, GossiperMBean
         FailureDetector.instance.registerFailureDetectionEventListener(this);
 
         // Register this instance with JMX
-        try
-        {
-            MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
-            mbs.registerMBean(this, new ObjectName(MBEAN_NAME));
-        }
-        catch (Exception e)
-        {
-            throw new RuntimeException(e);
-        }
+        MBeanWrapper.instance.registerMBean(this, MBEAN_NAME);
     }
 
     public void setLastProcessedMessageAt(long timeInMillis)
@@ -852,20 +846,6 @@ public class Gossiper implements IFailureDetectionEventListener, GossiperMBean
         return endpointStateMap.get(ep);
     }
 
-    public boolean valuesEqual(InetAddress ep1, InetAddress ep2, ApplicationState as)
-    {
-        EndpointState state1 = getEndpointStateForEndpoint(ep1);
-        EndpointState state2 = getEndpointStateForEndpoint(ep2);
-
-        if (state1 == null || state2 == null)
-            return false;
-
-        VersionedValue value1 = state1.getApplicationState(as);
-        VersionedValue value2 = state2.getApplicationState(as);
-
-        return !(value1 == null || value2 == null) && value1.value.equals(value2.value);
-    }
-
     public Set<Entry<InetAddress, EndpointState>> getEndpointStates()
     {
         return endpointStateMap.entrySet();
@@ -1198,6 +1178,26 @@ public class Gossiper implements IFailureDetectionEventListener, GossiperMBean
                 handleMajorStateChange(ep, remoteState);
             }
         }
+
+        boolean any30 = anyEndpointOn30();
+        if (any30 != anyNodeOn30)
+        {
+            logger.info(any30
+                        ? "There is at least one 3.0 node in the cluster - will store and announce compatible schema version"
+                        : "There are no 3.0 nodes in the cluster - will store and announce real schema version");
+
+            anyNodeOn30 = any30;
+            executor.submit(Schema.instance::updateVersionAndAnnounce);
+        }
+    }
+
+    private boolean anyEndpointOn30()
+    {
+        return endpointStateMap.values()
+                               .stream()
+                               .map(EndpointState::getReleaseVersion)
+                               .filter(Objects::nonNull)
+                               .anyMatch(CassandraVersion::is30);
     }
 
     private void applyNewStates(InetAddress addr, EndpointState localState, EndpointState remoteState)
@@ -1353,6 +1353,11 @@ public class Gossiper implements IFailureDetectionEventListener, GossiperMBean
                                                               TimeUnit.MILLISECONDS);
     }
 
+    public synchronized Map<InetAddress, EndpointState> doShadowRound()
+    {
+        return doShadowRound(Collections.EMPTY_SET);
+    }
+
     /**
      * Do a single 'shadow' round of gossip by retrieving endpoint states that will be stored exclusively in the
      * map return value, instead of endpointStateMap.
@@ -1368,16 +1373,21 @@ public class Gossiper implements IFailureDetectionEventListener, GossiperMBean
      * caller of {@link Gossiper#doShadowRound()}. Therefor only a single shadow round execution is permitted at
      * the same time.
      *
+     * @param peers Additional peers to try gossiping with.
      * @return endpoint states gathered during shadow round or empty map
      */
-    public synchronized Map<InetAddress, EndpointState> doShadowRound()
+    public synchronized Map<InetAddress, EndpointState> doShadowRound(Set<InetAddress> peers)
     {
         buildSeedsList();
-        // it may be that the local address is the only entry in the seed
+        // it may be that the local address is the only entry in the seed + peers
         // list in which case, attempting a shadow round is pointless
-        if (seeds.isEmpty())
+        if (seeds.isEmpty() && peers.isEmpty())
             return endpointShadowStateMap;
 
+        boolean isSeed = DatabaseDescriptor.getSeeds().contains(FBUtilities.getBroadcastAddress());
+        // We double RING_DELAY if we're not a seed to increase chance of successful startup during a full cluster bounce,
+        // giving the seeds a chance to startup before we fail the shadow round
+        int shadowRoundDelay =  isSeed ? StorageService.RING_DELAY : StorageService.RING_DELAY * 2;
         seedsInShadowRound.clear();
         endpointShadowStateMap.clear();
         // send a completely empty syn
@@ -1390,6 +1400,7 @@ public class Gossiper implements IFailureDetectionEventListener, GossiperMBean
                 GossipDigestSyn.serializer);
 
         inShadowRound = true;
+        boolean includePeers = false;
         int slept = 0;
         try
         {
@@ -1401,6 +1412,15 @@ public class Gossiper implements IFailureDetectionEventListener, GossiperMBean
 
                     for (InetAddress seed : seeds)
                         MessagingService.instance().sendOneWay(message, seed);
+
+                    // Send to any peers we already know about, but only if a seed didn't respond.
+                    if (includePeers)
+                    {
+                        logger.trace("Sending shadow round GOSSIP DIGEST SYN to known peers {}", peers);
+                        for (InetAddress peer : peers)
+                            MessagingService.instance().sendOneWay(message, peer);
+                    }
+                    includePeers = true;
                 }
 
                 Thread.sleep(1000);
@@ -1408,13 +1428,12 @@ public class Gossiper implements IFailureDetectionEventListener, GossiperMBean
                     break;
 
                 slept += 1000;
-                if (slept > StorageService.RING_DELAY)
+                if (slept > shadowRoundDelay)
                 {
-                    // if we don't consider ourself to be a seed, fail out
-                    if (!DatabaseDescriptor.getSeeds().contains(FBUtilities.getBroadcastAddress()))
-                        throw new RuntimeException("Unable to gossip with any seeds");
+                    // if we got here no peers could be gossiped to. If we're a seed that's OK, but otherwise we stop. See CASSANDRA-13851
+                    if (!isSeed)
+                        throw new RuntimeException("Unable to gossip with any peers");
 
-                    logger.warn("Unable to gossip with any seeds but continuing since node is in its own seed list");
                     inShadowRound = false;
                     break;
                 }
@@ -1547,12 +1566,20 @@ public class Gossiper implements IFailureDetectionEventListener, GossiperMBean
         return (scheduledGossipTask != null) && (!scheduledGossipTask.isCancelled());
     }
 
+    public boolean isAnyNodeOn30()
+    {
+        return anyNodeOn30;
+    }
+
     protected void maybeFinishShadowRound(InetAddress respondent, boolean isInShadowRound, Map<InetAddress, EndpointState> epStateMap)
     {
         if (inShadowRound)
         {
             if (!isInShadowRound)
             {
+                if (!seeds.contains(respondent))
+                    logger.warn("Received an ack from {}, who isn't a seed. Ensure your seed list includes a live node. Exiting shadow round",
+                                respondent);
                 logger.debug("Received a regular ack from {}, can now exit shadow round", respondent);
                 // respondent sent back a full ack, so we can exit our shadow round
                 endpointShadowStateMap.putAll(epStateMap);
@@ -1629,16 +1656,18 @@ public class Gossiper implements IFailureDetectionEventListener, GossiperMBean
         return System.currentTimeMillis() + Gossiper.aVeryLongTime;
     }
 
+    @Nullable
     public CassandraVersion getReleaseVersion(InetAddress ep)
     {
         EndpointState state = getEndpointStateForEndpoint(ep);
-        if (state != null)
-        {
-            VersionedValue applicationState = state.getApplicationState(ApplicationState.RELEASE_VERSION);
-            if (applicationState != null)
-                return new CassandraVersion(applicationState.value);
-        }
-        return null;
+        return state != null ? state.getReleaseVersion() : null;
+    }
+
+    @Nullable
+    public UUID getSchemaVersion(InetAddress ep)
+    {
+        EndpointState state = getEndpointStateForEndpoint(ep);
+        return state != null ? state.getSchemaVersion() : null;
     }
 
     public static void waitToSettle()

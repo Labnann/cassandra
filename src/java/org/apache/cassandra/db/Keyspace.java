@@ -46,6 +46,7 @@ import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.locator.AbstractReplicationStrategy;
 import org.apache.cassandra.metrics.KeyspaceMetrics;
 import org.apache.cassandra.schema.KeyspaceMetadata;
+import org.apache.cassandra.schema.ReplicationParams;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.tracing.Tracing;
 import org.apache.cassandra.utils.*;
@@ -82,6 +83,7 @@ public class Keyspace
     private final ConcurrentMap<UUID, ColumnFamilyStore> columnFamilyStores = new ConcurrentHashMap<>();
     private volatile AbstractReplicationStrategy replicationStrategy;
     public final ViewManager viewManager;
+    private volatile ReplicationParams replicationParams;
 
     public static final Function<String,Keyspace> keyspaceTransformer = new Function<String, Keyspace>()
     {
@@ -100,7 +102,7 @@ public class Keyspace
 
     public static Keyspace open(String keyspaceName)
     {
-        assert initialized || SchemaConstants.isSystemKeyspace(keyspaceName);
+        assert initialized || SchemaConstants.isLocalSystemKeyspace(keyspaceName);
         return open(keyspaceName, Schema.instance, true);
     }
 
@@ -344,6 +346,12 @@ public class Keyspace
                                                                                     StorageService.instance.getTokenMetadata(),
                                                                                     DatabaseDescriptor.getEndpointSnitch(),
                                                                                     ksm.params.replication.options);
+        if (!ksm.params.replication.equals(replicationParams))
+        {
+            logger.debug("New replication settings for keyspace {} - invalidating disk boundary caches", ksm.name);
+            columnFamilyStores.values().forEach(ColumnFamilyStore::invalidateDiskBoundaries);
+        }
+        replicationParams = ksm.params.replication;
     }
 
     // best invoked on the compaction mananger.
@@ -730,7 +738,7 @@ public class Keyspace
 
     public static Iterable<Keyspace> system()
     {
-        return Iterables.transform(SchemaConstants.SYSTEM_KEYSPACE_NAMES, keyspaceTransformer);
+        return Iterables.transform(SchemaConstants.LOCAL_SYSTEM_KEYSPACE_NAMES, keyspaceTransformer);
     }
 
     @Override

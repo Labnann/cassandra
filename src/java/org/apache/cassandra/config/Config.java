@@ -156,6 +156,7 @@ public class Config
     public int native_transport_max_frame_size_in_mb = 256;
     public volatile long native_transport_max_concurrent_connections = -1L;
     public volatile long native_transport_max_concurrent_connections_per_ip = -1L;
+    public boolean native_transport_flush_in_batches_legacy = true;
 
     @Deprecated
     public int thrift_max_message_length_in_mb = 16;
@@ -265,6 +266,17 @@ public class Config
 
     public Integer file_cache_size_in_mb;
 
+    /**
+     * Because of the current {@link org.apache.cassandra.utils.memory.BufferPool} slab sizes of 64 kb, we
+     * store in the file cache buffers that divide 64 kb, so we need to round the buffer sizes to powers of two.
+     * This boolean controls weather they are rounded up or down. Set it to true to round up to the
+     * next power of two, set it to false to round down to the previous power of two. Note that buffer sizes are
+     * already rounded to 4 kb and capped between 4 kb minimum and 64 kb maximum by the {@link DiskOptimizationStrategy}.
+     * By default, this boolean is set to round down when {@link #disk_optimization_strategy} is {@code ssd},
+     * and to round up when it is {@code spinning}.
+     */
+    public Boolean file_cache_round_up;
+
     public boolean buffer_pool_use_heap_if_exhausted = true;
 
     public DiskOptimizationStrategy disk_optimization_strategy = DiskOptimizationStrategy.ssd;
@@ -328,6 +340,9 @@ public class Config
 
     public boolean enable_user_defined_functions = false;
     public boolean enable_scripted_user_defined_functions = false;
+
+    public boolean enable_materialized_views = true;
+
     /**
      * Optionally disable asynchronous UDF execution.
      * Disabling asynchronous UDF execution also implicitly disables the security-manager!

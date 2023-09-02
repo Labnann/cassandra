@@ -26,6 +26,7 @@ import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.*;
+import java.util.function.Supplier;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableSet;
@@ -128,6 +129,11 @@ public class DatabaseDescriptor
 
     public static void daemonInitialization() throws ConfigurationException
     {
+        daemonInitialization(DatabaseDescriptor::loadConfig);
+    }
+
+    public static void daemonInitialization(Supplier<Config> config) throws ConfigurationException
+    {
         if (toolInitialized)
             throw new AssertionError("toolInitialization() already called");
         if (clientInitialized)
@@ -138,7 +144,7 @@ public class DatabaseDescriptor
             return;
         daemonInitialized = true;
 
-        setConfig(loadConfig());
+        setConfig(config.get());
         applyAll();
         AuthConfig.applyAuth();
     }
@@ -408,6 +414,10 @@ public class DatabaseDescriptor
 
         if (conf.file_cache_size_in_mb == null)
             conf.file_cache_size_in_mb = Math.min(512, (int) (Runtime.getRuntime().maxMemory() / (4 * 1048576)));
+
+        // round down for SSDs and round up for spinning disks
+        if (conf.file_cache_round_up == null)
+            conf.file_cache_round_up = conf.disk_optimization_strategy == Config.DiskOptimizationStrategy.spinning;
 
         if (conf.memtable_offheap_space_in_mb == null)
             conf.memtable_offheap_space_in_mb = (int) (Runtime.getRuntime().maxMemory() / (4 * 1048576));
@@ -1813,6 +1823,11 @@ public class DatabaseDescriptor
         conf.native_transport_max_concurrent_connections_per_ip = native_transport_max_concurrent_connections_per_ip;
     }
 
+    public static boolean useNativeTransportLegacyFlusher()
+    {
+        return conf.native_transport_flush_in_batches_legacy;
+    }
+
     public static double getCommitLogSyncBatchWindow()
     {
         return conf.commitlog_sync_batch_window_in_ms;
@@ -2058,6 +2073,18 @@ public class DatabaseDescriptor
         }
 
         return conf.file_cache_size_in_mb;
+    }
+
+    public static boolean getFileCacheRoundUp()
+    {
+        if (conf.file_cache_round_up == null)
+        {
+            // In client mode the value is not set.
+            assert DatabaseDescriptor.isClientInitialized();
+            return false;
+        }
+
+        return conf.file_cache_round_up;
     }
 
     public static boolean getBufferPoolUseHeapIfExhausted()
@@ -2356,6 +2383,11 @@ public class DatabaseDescriptor
         conf.user_defined_function_warn_timeout = userDefinedFunctionWarnTimeout;
     }
 
+    public static boolean enableMaterializedViews()
+    {
+        return conf.enable_materialized_views;
+    }
+
     public static long getUserDefinedFunctionFailTimeout()
     {
         return conf.user_defined_function_fail_timeout;
@@ -2394,6 +2426,11 @@ public class DatabaseDescriptor
     public static boolean isCDCEnabled()
     {
         return conf.cdc_enabled;
+    }
+
+    public static void setCDCEnabled(boolean cdc_enabled)
+    {
+        conf.cdc_enabled = cdc_enabled;
     }
 
     public static String getCDCLogLocation()

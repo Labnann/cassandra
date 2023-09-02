@@ -106,7 +106,7 @@ public abstract class AbstractCommitLogSegmentManager
                     try
                     {
                         assert availableSegment == null;
-                        logger.debug("No segments in reserve; creating a fresh one");
+                        logger.trace("No segments in reserve; creating a fresh one");
                         availableSegment = createSegment();
                         if (shutdown)
                         {
@@ -505,9 +505,11 @@ public abstract class AbstractCommitLogSegmentManager
     }
 
     /**
-     * Forces a disk flush on the commit log files that need it.  Blocking.
+     * Requests commit log files sync themselves, if needed. This may or may not involve flushing to disk.
+     *
+     * @param flush Request that the sync operation flush the file to disk.
      */
-    public void sync() throws IOException
+    public void sync(boolean flush) throws IOException
     {
         CommitLogSegment current = allocatingFrom;
         for (CommitLogSegment segment : getActiveSegments())
@@ -515,7 +517,7 @@ public abstract class AbstractCommitLogSegmentManager
             // Do not sync segments that became active after sync started.
             if (segment.id > current.id)
                 return;
-            segment.sync();
+            segment.sync(flush);
         }
     }
 

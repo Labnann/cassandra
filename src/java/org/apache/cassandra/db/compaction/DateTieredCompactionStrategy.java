@@ -73,6 +73,7 @@ public class DateTieredCompactionStrategy extends AbstractCompactionStrategy
     @SuppressWarnings("resource")
     public AbstractCompactionTask getNextBackgroundTask(int gcBefore)
     {
+        List<SSTableReader> previousCandidate = null;
         while (true)
         {
             List<SSTableReader> latestBucket = getNextBackgroundSSTables(gcBefore);
@@ -80,9 +81,20 @@ public class DateTieredCompactionStrategy extends AbstractCompactionStrategy
             if (latestBucket.isEmpty())
                 return null;
 
+            // Already tried acquiring references without success. It means there is a race with
+            // the tracker but candidate SSTables were not yet replaced in the compaction strategy manager
+            if (latestBucket.equals(previousCandidate))
+            {
+                logger.warn("Could not acquire references for compacting SSTables {} which is not a problem per se," +
+                            "unless it happens frequently, in which case it must be reported. Will retry later.",
+                            latestBucket);
+                return null;
+            }
+
             LifecycleTransaction modifier = cfs.getTracker().tryModify(latestBucket, OperationType.COMPACTION);
             if (modifier != null)
                 return new CompactionTask(cfs, modifier, gcBefore);
+            previousCandidate = latestBucket;
         }
     }
 
@@ -93,10 +105,14 @@ public class DateTieredCompactionStrategy extends AbstractCompactionStrategy
      */
     private synchronized List<SSTableReader> getNextBackgroundSSTables(final int gcBefore)
     {
-        if (sstables.isEmpty())
-            return Collections.emptyList();
+        Set<SSTableReader> uncompacting;
+        synchronized (sstables)
+        {
+            if (sstables.isEmpty())
+                return Collections.emptyList();
 
-        Set<SSTableReader> uncompacting = ImmutableSet.copyOf(filter(cfs.getUncompactingSSTables(), sstables::contains));
+            uncompacting = ImmutableSet.copyOf(filter(cfs.getUncompactingSSTables(), sstables::contains));
+        }
 
         Set<SSTableReader> expired = Collections.emptySet();
         // we only check for expired sstables every 10 minutes (by default) due to it being an expensive operation
@@ -170,6 +186,8 @@ public class DateTieredCompactionStrategy extends AbstractCompactionStrategy
         // no need to convert to collection if had an Iterables.max(), but not present in standard toolkit, and not worth adding
         List<SSTableReader> list = new ArrayList<>();
         Iterables.addAll(list, cfs.getSSTables(SSTableSet.LIVE));
+        if (list.isEmpty())
+            return 0;
         return Collections.max(list, (o1, o2) -> Long.compare(o1.getMaxTimestamp(), o2.getMaxTimestamp()))
                           .getMaxTimestamp();
     }
@@ -197,11 +215,6 @@ public class DateTieredCompactionStrategy extends AbstractCompactionStrategy
         });
     }
 
-    /**
-     *
-     * @param sstables
-     * @return
-     */
     public static List<Pair<SSTableReader, Long>> createSSTableAndMinTimestampPairs(Iterable<SSTableReader> sstables)
     {
         List<Pair<SSTableReader, Long>> sstableMinTimestampPairs = Lists.newArrayListWithCapacity(Iterables.size(sstables));
@@ -209,14 +222,15 @@ public class DateTieredCompactionStrategy extends AbstractCompactionStrategy
             sstableMinTimestampPairs.add(Pair.create(sstable, sstable.getMinTimestamp()));
         return sstableMinTimestampPairs;
     }
+
     @Override
-    public void addSSTable(SSTableReader sstable)
+    public synchronized void addSSTable(SSTableReader sstable)
     {
         sstables.add(sstable);
     }
 
     @Override
-    public void removeSSTable(SSTableReader sstable)
+    public synchronized void removeSSTable(SSTableReader sstable)
     {
         sstables.remove(sstable);
     }
@@ -462,7 +476,7 @@ public class DateTieredCompactionStrategy extends AbstractCompactionStrategy
         return uncheckedOptions;
     }
 
-    public CompactionLogger.Strategy strategyLogger() 
+    public CompactionLogger.Strategy strategyLogger()
     {
         return new CompactionLogger.Strategy()
         {

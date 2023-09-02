@@ -25,6 +25,7 @@ import java.util.*;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.*;
 import com.google.common.collect.Maps;
 import org.slf4j.Logger;
@@ -109,7 +110,7 @@ public final class SchemaKeyspace
      * for digest calculations, otherwise the nodes will never agree on the schema during a rolling upgrade, see CASSANDRA-13559.
      */
     public static final ImmutableList<String> ALL_FOR_DIGEST =
-        ImmutableList.of(KEYSPACES, TABLES, COLUMNS, DROPPED_COLUMNS, TRIGGERS, VIEWS, TYPES, FUNCTIONS, AGGREGATES, INDEXES);
+        ImmutableList.of(KEYSPACES, TABLES, COLUMNS, TRIGGERS, VIEWS, TYPES, FUNCTIONS, AGGREGATES, INDEXES);
 
     private static final CFMetaData Keyspaces =
         compile(KEYSPACES,
@@ -288,7 +289,7 @@ public final class SchemaKeyspace
         for (String schemaTable : ALL)
         {
             String query = String.format("DELETE FROM %s.%s USING TIMESTAMP ? WHERE keyspace_name = ?", SchemaConstants.SCHEMA_KEYSPACE_NAME, schemaTable);
-            for (String systemKeyspace : SchemaConstants.SYSTEM_KEYSPACE_NAMES)
+            for (String systemKeyspace : SchemaConstants.LOCAL_SYSTEM_KEYSPACE_NAMES)
                 executeOnceInternal(query, timestamp, systemKeyspace);
         }
 
@@ -311,13 +312,26 @@ public final class SchemaKeyspace
     /**
      * Read schema from system keyspace and calculate MD5 digest of every row, resulting digest
      * will be converted into UUID which would act as content-based version of the schema.
+     *
+     * This implementation is special cased for 3.11 as it returns the schema digests for 3.11
+     * <em>and</em> 3.0 - i.e. with and without the beloved {@code cdc} column.
      */
-    public static UUID calculateSchemaDigest()
+    public static Pair<UUID, UUID> calculateSchemaDigest()
+    {
+        Set<ByteBuffer> cdc = Collections.singleton(ByteBufferUtil.bytes("cdc"));
+
+        return calculateSchemaDigest(cdc);
+    }
+
+    @VisibleForTesting
+    static Pair<UUID, UUID> calculateSchemaDigest(Set<ByteBuffer> columnsToExclude)
     {
         MessageDigest digest;
+        MessageDigest digest30;
         try
         {
             digest = MessageDigest.getInstance("MD5");
+            digest30 = MessageDigest.getInstance("MD5");
         }
         catch (NoSuchAlgorithmException e)
         {
@@ -326,11 +340,6 @@ public final class SchemaKeyspace
 
         for (String table : ALL_FOR_DIGEST)
         {
-            // Due to CASSANDRA-11050 we want to exclude DROPPED_COLUMNS for schema digest computation. We can and
-            // should remove that in the next major release (so C* 4.0).
-            if (table.equals(DROPPED_COLUMNS))
-                continue;
-
             ReadCommand cmd = getReadCommandForTableSchema(table);
             try (ReadExecutionController executionController = cmd.executionController();
                  PartitionIterator schema = cmd.executeInternal(executionController))
@@ -340,12 +349,15 @@ public final class SchemaKeyspace
                     try (RowIterator partition = schema.next())
                     {
                         if (!isSystemKeyspaceSchemaPartition(partition.partitionKey()))
-                            RowIterators.digest(partition, digest);
+                        {
+                            RowIterators.digest(partition, digest, digest30, columnsToExclude);
+                        }
                     }
                 }
             }
         }
-        return UUID.nameUUIDFromBytes(digest.digest());
+
+        return Pair.create(UUID.nameUUIDFromBytes(digest.digest()), UUID.nameUUIDFromBytes(digest30.digest()));
     }
 
     /**
@@ -431,7 +443,7 @@ public final class SchemaKeyspace
 
     private static boolean isSystemKeyspaceSchemaPartition(DecoratedKey partitionKey)
     {
-        return SchemaConstants.isSystemKeyspace(UTF8Type.instance.compose(partitionKey.getKey()));
+        return SchemaConstants.isLocalSystemKeyspace(UTF8Type.instance.compose(partitionKey.getKey()));
     }
 
     /*
@@ -907,7 +919,7 @@ public final class SchemaKeyspace
 
     public static Keyspaces fetchNonSystemKeyspaces()
     {
-        return fetchKeyspacesWithout(SchemaConstants.SYSTEM_KEYSPACE_NAMES);
+        return fetchKeyspacesWithout(SchemaConstants.LOCAL_SYSTEM_KEYSPACE_NAMES);
     }
 
     private static Keyspaces fetchKeyspacesWithout(Set<String> excludedKeyspaceNames)
@@ -987,18 +999,24 @@ public final class SchemaKeyspace
             }
             catch (MissingColumns exc)
             {
-                if (!IGNORE_CORRUPTED_SCHEMA_TABLES)
+                String errorMsg = String.format("No partition columns found for table %s.%s in %s.%s.  This may be due to " +
+                                                "corruption or concurrent dropping and altering of a table. If this table is supposed " +
+                                                "to be dropped, {}run the following query to cleanup: " +
+                                                "\"DELETE FROM %s.%s WHERE keyspace_name = '%s' AND table_name = '%s'; " +
+                                                "DELETE FROM %s.%s WHERE keyspace_name = '%s' AND table_name = '%s';\" " +
+                                                "If the table is not supposed to be dropped, restore %s.%s sstables from backups.",
+                                                keyspaceName, tableName, SchemaConstants.SCHEMA_KEYSPACE_NAME, COLUMNS,
+                                                SchemaConstants.SCHEMA_KEYSPACE_NAME, TABLES, keyspaceName, tableName,
+                                                SchemaConstants.SCHEMA_KEYSPACE_NAME, COLUMNS, keyspaceName, tableName,
+                                                SchemaConstants.SCHEMA_KEYSPACE_NAME, COLUMNS);
+
+                if (IGNORE_CORRUPTED_SCHEMA_TABLES)
                 {
-                    logger.error("No columns found for table {}.{} in {}.{}.  This may be due to " +
-                                 "corruption or concurrent dropping and altering of a table.  If this table " +
-                                 "is supposed to be dropped, restart cassandra with -Dcassandra.ignore_corrupted_schema_tables=true " +
-                                 "and run the following query: \"DELETE FROM {}.{} WHERE keyspace_name = '{}' AND table_name = '{}';\"." +
-                                 "If the table is not supposed to be dropped, restore {}.{} sstables from backups.",
-                                 keyspaceName, tableName,
-                                 SchemaConstants.SCHEMA_KEYSPACE_NAME, COLUMNS,
-                                 SchemaConstants.SCHEMA_KEYSPACE_NAME, TABLES,
-                                 keyspaceName, tableName,
-                                 SchemaConstants.SCHEMA_KEYSPACE_NAME, COLUMNS);
+                    logger.error(errorMsg, "", exc);
+                }
+                else
+                {
+                    logger.error(errorMsg, "restart cassandra with -Dcassandra.ignore_corrupted_schema_tables=true and ");
                     throw exc;
                 }
             }
@@ -1081,6 +1099,10 @@ public final class SchemaKeyspace
 
         List<ColumnDefinition> columns = new ArrayList<>();
         columnRows.forEach(row -> columns.add(createColumnFromRow(row, types)));
+
+        if (columns.stream().noneMatch(ColumnDefinition::isPartitionKey))
+            throw new MissingColumns("No partition key columns found in schema table for " + keyspace + "." + table);
+
         return columns;
     }
 
@@ -1098,9 +1120,7 @@ public final class SchemaKeyspace
         if (order == ClusteringOrder.DESC)
             type = ReversedType.getInstance(type);
 
-        ColumnIdentifier name = ColumnIdentifier.getInterned(type,
-                                                             row.getBytes("column_name_bytes"),
-                                                             row.getString("column_name"));
+        ColumnIdentifier name = new ColumnIdentifier(row.getBytes("column_name_bytes"), row.getString("column_name"));
 
         return new ColumnDefinition(keyspace, table, name, type, position, kind);
     }
@@ -1329,6 +1349,18 @@ public final class SchemaKeyspace
      * Merging schema
      */
 
+    /*
+     * Reload schema from local disk. Useful if a user made changes to schema tables by hand, or has suspicion that
+     * in-memory representation got out of sync somehow with what's on disk.
+     */
+    public static synchronized void reloadSchemaAndAnnounceVersion()
+    {
+        Keyspaces before = Schema.instance.getReplicatedKeyspaces();
+        Keyspaces after = fetchNonSystemKeyspaces();
+        mergeSchema(before, after);
+        Schema.instance.updateVersionAndAnnounce();
+    }
+
     /**
      * Merge remote schema in form of mutations with local and mutate ks/cf metadata objects
      * (which also involves fs operations on add/drop ks/cf)
@@ -1362,7 +1394,11 @@ public final class SchemaKeyspace
         // fetch the new state of schema from schema tables (not applied to Schema.instance yet)
         Keyspaces after = fetchKeyspacesOnly(affectedKeyspaces);
 
-        // deal with the diff
+        mergeSchema(before, after);
+    }
+
+    private static synchronized void mergeSchema(Keyspaces before, Keyspaces after)
+    {
         MapDifference<String, KeyspaceMetadata> keyspacesDiff = before.diff(after);
 
         // dropped keyspaces
@@ -1488,7 +1524,8 @@ public final class SchemaKeyspace
                     .collect(toList());
     }
 
-    private static class MissingColumns extends RuntimeException
+    @VisibleForTesting
+    static class MissingColumns extends RuntimeException
     {
         MissingColumns(String message)
         {

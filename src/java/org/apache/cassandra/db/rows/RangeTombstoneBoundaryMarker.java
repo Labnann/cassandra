@@ -20,6 +20,7 @@ package org.apache.cassandra.db.rows;
 import java.nio.ByteBuffer;
 import java.security.MessageDigest;
 import java.util.Objects;
+import java.util.Set;
 
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.db.*;
@@ -136,12 +137,12 @@ public class RangeTombstoneBoundaryMarker extends AbstractRangeTombstoneMarker<C
 
     public RangeTombstoneBoundMarker createCorrespondingCloseMarker(boolean reversed)
     {
-        return new RangeTombstoneBoundMarker(closeBound(reversed), endDeletion);
+        return new RangeTombstoneBoundMarker(closeBound(reversed), closeDeletionTime(reversed));
     }
 
     public RangeTombstoneBoundMarker createCorrespondingOpenMarker(boolean reversed)
     {
-        return new RangeTombstoneBoundMarker(openBound(reversed), startDeletion);
+        return new RangeTombstoneBoundMarker(openBound(reversed), openDeletionTime(reversed));
     }
 
     public void digest(MessageDigest digest)
@@ -151,9 +152,18 @@ public class RangeTombstoneBoundaryMarker extends AbstractRangeTombstoneMarker<C
         startDeletion.digest(digest);
     }
 
+    @Override
+    public void digest(MessageDigest digest, Set<ByteBuffer> columnsToExclude)
+    {
+        digest(digest);
+    }
+
     public String toString(CFMetaData metadata)
     {
-        return String.format("Marker %s@%d-%d", bound.toString(metadata), endDeletion.markedForDeleteAt(), startDeletion.markedForDeleteAt());
+        return String.format("Marker %s@%d/%d-%d/%d",
+                             bound.toString(metadata),
+                             endDeletion.markedForDeleteAt(), endDeletion.localDeletionTime(),
+                             startDeletion.markedForDeleteAt(), startDeletion.localDeletionTime());
     }
 
     @Override

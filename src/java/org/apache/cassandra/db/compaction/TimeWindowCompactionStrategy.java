@@ -72,6 +72,7 @@ public class TimeWindowCompactionStrategy extends AbstractCompactionStrategy
     @SuppressWarnings("resource") // transaction is closed by AbstractCompactionTask::execute
     public AbstractCompactionTask getNextBackgroundTask(int gcBefore)
     {
+        List<SSTableReader> previousCandidate = null;
         while (true)
         {
             List<SSTableReader> latestBucket = getNextBackgroundSSTables(gcBefore);
@@ -79,9 +80,20 @@ public class TimeWindowCompactionStrategy extends AbstractCompactionStrategy
             if (latestBucket.isEmpty())
                 return null;
 
+            // Already tried acquiring references without success. It means there is a race with
+            // the tracker but candidate SSTables were not yet replaced in the compaction strategy manager
+            if (latestBucket.equals(previousCandidate))
+            {
+                logger.warn("Could not acquire references for compacting SSTables {} which is not a problem per se," +
+                            "unless it happens frequently, in which case it must be reported. Will retry later.",
+                            latestBucket);
+                return null;
+            }
+
             LifecycleTransaction modifier = cfs.getTracker().tryModify(latestBucket, OperationType.COMPACTION);
             if (modifier != null)
                 return new TimeWindowCompactionTask(cfs, modifier, gcBefore, options.ignoreOverlaps);
+            previousCandidate = latestBucket;
         }
     }
 
@@ -166,13 +178,13 @@ public class TimeWindowCompactionStrategy extends AbstractCompactionStrategy
     }
 
     @Override
-    public void addSSTable(SSTableReader sstable)
+    public synchronized void addSSTable(SSTableReader sstable)
     {
         sstables.add(sstable);
     }
 
     @Override
-    public void removeSSTable(SSTableReader sstable)
+    public synchronized void removeSSTable(SSTableReader sstable)
     {
         sstables.remove(sstable);
     }
@@ -298,7 +310,7 @@ public class TimeWindowCompactionStrategy extends AbstractCompactionStrategy
             }
             else
             {
-                logger.debug("No compaction necessary for bucket size {} , key {}, now {}", bucket.size(), key, now);
+                logger.trace("No compaction necessary for bucket size {} , key {}, now {}", bucket.size(), key, now);
             }
         }
         return Collections.<SSTableReader>emptyList();
