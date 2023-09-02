@@ -35,6 +35,7 @@ import org.apache.cassandra.serializers.CollectionSerializer;
 import org.apache.cassandra.serializers.MarshalException;
 import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.service.StorageService;
 
 /**
  * The abstract validator that is the base for maps, sets and lists (both frozen and non-frozen).
@@ -245,7 +246,10 @@ public abstract class CollectionType<T> extends AbstractType<T>
 
         public CellPath deserialize(DataInputPlus in) throws IOException
         {
-            return CellPath.create(ByteBufferUtil.readWithVIntLength(in));
+            ByteBuffer cellPath = ByteBufferUtil.readWithVIntLength(in);
+            StorageService.instance.totalReadBytes+=cellPath.limit();////
+            return CellPath.create(cellPath);
+            //return CellPath.create(ByteBufferUtil.readWithVIntLength(in));
         }
 
         public long serializedSize(CellPath path)

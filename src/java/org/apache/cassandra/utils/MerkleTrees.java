@@ -33,7 +33,10 @@ import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.io.IVersionedSerializer;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputPlus;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
+//import org.apache.cassandra.utils.MerkleTree;
 
 /**
  * Wrapper class for handling of multiple MerkleTrees at once.
@@ -42,6 +45,8 @@ import org.apache.cassandra.io.util.DataOutputPlus;
  */
 public class MerkleTrees implements Iterable<Map.Entry<Range<Token>, MerkleTree>>
 {
+    private static final Logger logger = LoggerFactory.getLogger(MerkleTrees.class);
+
     public static final MerkleTreesSerializer serializer = new MerkleTreesSerializer();
 
     private Map<Range<Token>, MerkleTree> merkleTrees = new TreeMap<>(new TokenRangeComparator());
@@ -378,9 +383,12 @@ public class MerkleTrees implements Iterable<Map.Entry<Range<Token>, MerkleTree>
     public static List<Range<Token>> difference(MerkleTrees ltree, MerkleTrees rtree)
     {
         List<Range<Token>> differences = new ArrayList<>();
+        logger.debug("ltree.size:{}, rtree.size:{}", ltree.size(), rtree.size());
         for (MerkleTree tree : ltree.merkleTrees.values())
         {
-            differences.addAll(MerkleTree.difference(tree, rtree.getMerkleTree(tree.fullRange)));
+            List<MerkleTree.TreeRange> diffRange = MerkleTree.difference(tree, rtree.getMerkleTree(tree.fullRange));
+            if(diffRange!=null) differences.addAll(diffRange);
+            //differences.addAll(MerkleTree.difference(tree, rtree.getMerkleTree(tree.fullRange)));
         }
         return differences;
     }

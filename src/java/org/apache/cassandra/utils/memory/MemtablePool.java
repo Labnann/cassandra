@@ -27,7 +27,8 @@ import com.codahale.metrics.Timer;
 import org.apache.cassandra.metrics.CassandraMetricsRegistry;
 import org.apache.cassandra.metrics.DefaultNameFactory;
 import org.apache.cassandra.utils.concurrent.WaitQueue;
-
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Represents an amount of memory used for a given purpose, that can be allocated to specific tasks through
@@ -35,11 +36,14 @@ import org.apache.cassandra.utils.concurrent.WaitQueue;
  */
 public abstract class MemtablePool
 {
+    protected static final Logger logger = LoggerFactory.getLogger(MemtablePool.class);
     final MemtableCleanerThread<?> cleaner;
 
     // the total memory used by this pool
     public final SubPool onHeap;
     public final SubPool offHeap;
+
+    public long continueWriteSize = 0;
 
     public final Timer blockedOnAllocating;
 
@@ -90,11 +94,11 @@ public abstract class MemtablePool
         public final float cleanThreshold;
 
         // total bytes allocated and reclaiming
-        volatile long allocated;
-        volatile long reclaiming;
+        volatile long allocated = 0; //////
+        volatile long reclaiming = 0; //////
 
         // a cache of the calculation determining at what allocation threshold we should next clean
-        volatile long nextClean;
+        volatile long nextClean = 0; //////
 
         public SubPool(long limit, float cleanThreshold)
         {
@@ -106,14 +110,19 @@ public abstract class MemtablePool
 
         boolean needsCleaning()
         {
+            //logger.debug("######in needsCleaning, used:{}, nextClean:{}", used(), nextClean); 
             // use strictly-greater-than so we don't clean when limit is 0
+            //nextClean += 10485760;
             return used() > nextClean && updateNextClean();
         }
 
         void maybeClean()
         {
-            if (needsCleaning() && cleaner != null)
+            if (needsCleaning() && cleaner != null){
+                //logger.debug("######in maybeClean, used:{}, nextClean:{}, limit:{}", used(), nextClean, this.limit); 
+                //allocatedUpdater.compareAndSet(this, allocated, allocated - 10485760); //////
                 cleaner.trigger();
+            }
         }
 
         private boolean updateNextClean()
@@ -135,7 +144,7 @@ public abstract class MemtablePool
             while (true)
             {
                 long cur;
-                if ((cur = allocated) + size > limit)
+                if ((cur = allocated) + size > limit*1.2)
                     return false;
                 if (allocatedUpdater.compareAndSet(this, cur, cur + size))
                     return true;
@@ -163,18 +172,28 @@ public abstract class MemtablePool
                 return;
 
             adjustAllocated(size);
+            logger.debug("######in allocated, size:{}, allocated:{}", size, allocated); 
             maybeClean();
         }
 
         void acquired(long size)
         {
+            /*continueWriteSize += size;
+            if(continueWriteSize > 504857600){
+                //logger.debug("######in acquired, size:{}, continueWriteSize:{}", size, continueWriteSize); 
+                maybeClean();
+                continueWriteSize= 0;
+            }*/
+
             maybeClean();
         }
 
         void released(long size)
         {
+            //logger.debug("######released MemTable, size:{}, allocated:{}", size, allocated); 
             assert size >= 0;
             adjustAllocated(-size);
+            //logger.debug("######after released MemTable, size:{}, allocated:{}", size, allocated); 
             hasRoom.signalAll();
         }
 
@@ -191,13 +210,15 @@ public abstract class MemtablePool
                 return;
 
             reclaimingUpdater.addAndGet(this, -size);
-            if (updateNextClean() && cleaner != null)
-                cleaner.trigger();
+            if (updateNextClean() && cleaner != null){
+                logger.debug("######in reclaimed, before trigger cleaner, size:{}", size); 
+                //cleaner.trigger();
+            }
         }
 
         public long used()
         {
-            return allocated;
+            return allocated;       
         }
 
         public float reclaimingRatio()

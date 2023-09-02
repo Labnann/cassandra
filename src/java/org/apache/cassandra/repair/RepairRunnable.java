@@ -62,6 +62,7 @@ import org.apache.cassandra.utils.progress.ProgressEvent;
 import org.apache.cassandra.utils.progress.ProgressEventNotifier;
 import org.apache.cassandra.utils.progress.ProgressEventType;
 import org.apache.cassandra.utils.progress.ProgressListener;
+import org.apache.cassandra.service.StorageService;
 
 public class RepairRunnable extends WrappedRunnable implements ProgressEventNotifier
 {
@@ -341,6 +342,9 @@ public class RepairRunnable extends WrappedRunnable implements ProgressEventNoti
                 String message = String.format("Repair command #%d finished in %s", cmd, duration);
                 fireProgressEvent(tag, new ProgressEvent(ProgressEventType.COMPLETE, progress.get(), totalProgress, message));
                 logger.info(message);
+                logger.debug("buildMTrees:{}, compareMTrees:{}, recieveWriteData:{}, recieveWriteLSM:{}", StorageService.instance.buildMTrees, StorageService.instance.compareMTrees, StorageService.instance.recieveWriteData, StorageService.instance.recieveWriteLSM);
+                logger.debug("sessionCount:{}, sessionBuildMTreeTime:{}", StorageService.instance.sessionCount, StorageService.instance.sessionBuildMTreeTime);              
+                
                 if (options.isTraced() && traceState != null)
                 {
                     for (ProgressListener listener : listeners)

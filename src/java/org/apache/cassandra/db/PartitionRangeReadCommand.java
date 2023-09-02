@@ -52,6 +52,15 @@ import org.apache.cassandra.tracing.Tracing;
 import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.FBUtilities;
 
+import org.apache.cassandra.dht.Token;
+import java.nio.ByteBuffer;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.io.util.DataInputBuffer;
+import org.apache.cassandra.io.util.FileDataInput;
+import org.apache.cassandra.db.filter.*;
+import org.apache.cassandra.db.partitions.*;
+import org.apache.cassandra.db.rows.*;
+
 /**
  * A read command that selects a (part of a) range of partitions.
  */
@@ -94,7 +103,7 @@ public class PartitionRangeReadCommand extends ReadCommand
                                              rowFilter,
                                              limits,
                                              dataRange,
-                                             findIndex(metadata, rowFilter));
+                                             findIndex(metadata, rowFilter, dataRange));
     }
 
     /**
@@ -274,11 +283,116 @@ public class PartitionRangeReadCommand extends ReadCommand
         metric.rangeLatency.addNano(latencyNanos);
     }
 
+    public ColumnFamilyStore getColumnFamilyStorefromMultiReplicas(CFMetaData cfm){
+        //PartitionPosition startKeyPP = dataRange().startKey();
+        //PartitionPosition startKeyPP = dataRange().keyRange().right;
+        //logger.debug("int getColumnFamilyStorefromMultiReplicas, dataRange().right:{}, dataRange().left:{}, dataRange().stopKey:{}", dataRange().keyRange().right, dataRange().keyRange().left, dataRange().stopKey());
+        ColumnFamilyStore cfs = null;
+        cfs = Keyspace.openAndgetColumnFamilyStoreByRingPosition(cfm.ksName, dataRange().stopKey());//////
+        if(cfs==null){//////
+            cfs = Keyspace.openAndGetStore(cfm);
+        }//////
+        return cfs;
+    }
+
+    @VisibleForTesting
+    public UnfilteredPartitionIterator queryStorage(ColumnFamilyStore cfs, ReadExecutionController executionController, int []findResults, String ksName)
+    {
+        ColumnFamilyStore newCFS = Keyspace.openAndgetColumnFamilyStoreByRingPosition(ksName, dataRange().stopKey());//////
+        logger.debug("in queryStorage cfs:{}, newCFS:{}, dataRange().left:{}, dataRange().right:{}", cfs, newCFS, dataRange().keyRange().left, dataRange().keyRange().right);
+        if(newCFS != null && !(newCFS.name.equals(cfs.name))) {
+            cfs = newCFS;
+        }
+
+        ColumnFamilyStore.ViewFragment view = cfs.select(View.selectLive(dataRange().keyRange()));
+        Tracing.trace("Executing seq scan across {} sstables for {}", view.sstables.size(), dataRange().keyRange().getString(metadata().getKeyValidator()));
+
+        findResults[1] = 0;
+        //logger.debug("int queryStorage, cfs:{}, dataRange().startKey:{}, dataRange().stopKey:{}", cfs, dataRange().startKey(), dataRange().stopKey());
+        //////////////////////////////
+        /*StackTraceElement[] elements = Thread.currentThread().getStackTrace();
+		for (int i = 0; i < elements.length; i++) {
+			StringBuffer buffer = new StringBuffer();
+			buffer.append("--index: ").append(i).append(" ClassName: ").append(elements[i].getClassName())
+					.append(" Method Name : " + elements[i].getMethodName());
+			logger.debug(buffer.toString());
+        }*/
+        //////////////////////////////
+        // fetch data from current memtable, historical memtables, and SSTables in the correct order.
+        final List<UnfilteredPartitionIterator> iterators = new ArrayList<>(Iterables.size(view.memtables) + view.sstables.size());
+
+        try
+        {
+            for (Memtable memtable : view.memtables)
+            {
+                @SuppressWarnings("resource") // We close on exception and on closing the result returned by this method
+                Memtable.MemtableUnfilteredPartitionIterator iter = memtable.makePartitionIterator(columnFilter(), dataRange(), isForThrift());
+
+                @SuppressWarnings("resource") // We close on exception and on closing the result returned by this method
+                UnfilteredPartitionIterator iterator = isForThrift() ? ThriftResultsMerger.maybeWrap(iter, metadata(), nowInSec()) : iter;
+                iterators.add(RTBoundValidator.validate(iterator, RTBoundValidator.Stage.MEMTABLE, false));
+
+                oldestUnrepairedTombstone = Math.min(oldestUnrepairedTombstone, iter.getMinLocalDeletionTime());
+            }
+
+            SSTableReadsListener readCountUpdater = newReadCountUpdater();
+            for (SSTableReader sstable : view.sstables)
+            {
+                @SuppressWarnings("resource") // We close on exception and on closing the result returned by this method
+                UnfilteredPartitionIterator iter = sstable.getScanner(columnFilter(), dataRange(), isForThrift(), readCountUpdater);
+
+                if (isForThrift())
+                    iter = ThriftResultsMerger.maybeWrap(iter, metadata(), nowInSec());
+
+                iterators.add(RTBoundValidator.validate(iter, RTBoundValidator.Stage.SSTABLE, false));
+
+                if (!sstable.isRepaired())
+                    oldestUnrepairedTombstone = Math.min(oldestUnrepairedTombstone, sstable.getMinLocalDeletionTime());
+            }
+            
+            ///////////////////////////////////
+            //scanLocalRegion();
+            if(iterators.isEmpty()){
+                findResults[0] = 0;
+                logger.debug("####Scan in queryStorage empty");
+            }
+            ////////////////////////////////////
+
+            // iterators can be empty for offline tools
+            return iterators.isEmpty() ? EmptyIterators.unfilteredPartition(metadata(), isForThrift())
+                                       : checkCacheFilter(UnfilteredPartitionIterators.mergeLazily(iterators, nowInSec()), cfs);
+        }
+        catch (RuntimeException | Error e)
+        {
+            try
+            {
+                FBUtilities.closeAll(iterators);
+            }
+            catch (Exception suppressed)
+            {
+                e.addSuppressed(suppressed);
+            }
+
+            throw e;
+        }
+    }
+
+
     @VisibleForTesting
     public UnfilteredPartitionIterator queryStorage(final ColumnFamilyStore cfs, ReadExecutionController executionController)
     {
         ColumnFamilyStore.ViewFragment view = cfs.select(View.selectLive(dataRange().keyRange()));
         Tracing.trace("Executing seq scan across {} sstables for {}", view.sstables.size(), dataRange().keyRange().getString(metadata().getKeyValidator()));
+
+        //////////////////////////////
+        StackTraceElement[] elements = Thread.currentThread().getStackTrace();
+		for (int i = 0; i < elements.length; i++) {
+			StringBuffer buffer = new StringBuffer();
+			buffer.append("index: ").append(i).append(" ClassName: ").append(elements[i].getClassName())
+					.append(" Method Name : " + elements[i].getMethodName());
+			logger.debug(buffer.toString());
+		}
+        //////////////////////////////
 
         // fetch data from current memtable, historical memtables, and SSTables in the correct order.
         final List<UnfilteredPartitionIterator> iterators = new ArrayList<>(Iterables.size(view.memtables) + view.sstables.size());
@@ -328,6 +442,67 @@ public class PartitionRangeReadCommand extends ReadCommand
 
             throw e;
         }
+    }
+
+    @SuppressWarnings("resource") //
+    protected UnfilteredPartitionIterator queryLocalRegion(ColumnFamilyStore cfs, List<UnfilteredPartitionIterator> iterators)
+    {
+        //logger.debug("in queryStorage");
+        UnfilteredRowIterator partition = null;
+        //final List<UnfilteredPartitionIterator> iterators = new ArrayList<>();
+        //ColumnFamilyStore newCFS = Keyspace.openAndgetColumnFamilyStoreByRingPosition(ksName, this.dataRange().keyRange().right);//////
+        logger.debug("###scan queryLocalRegion cfs:{}, left:{}, right:{}", cfs, this.dataRange().keyRange().left, this.dataRange().keyRange().right);
+        Token rightBound = StorageService.instance.getBoundToken(this.dataRange().keyRange().right.getToken());
+        Token leftBound = StorageService.instance.getBoundToken(this.dataRange().keyRange().left.getToken());
+
+        ArrayList<Token> tokenArray = new ArrayList<>();
+        //StorageService.instance.getRangeBoundToken(this.dataRange().keyRange().left.getToken(), rightBound, tokenArray, cfs.keyspace.getName());
+        tokenArray.add(leftBound);
+        //StorageService.instance.getRangeBoundToken(this.dataRange().keyRange().right.getToken(), leftBound, tokenArray);
+        logger.debug("###tokenArray:{}", tokenArray);
+
+//StorageService.instance.db.mutex.lock();
+    String startKey = StorageService.instance.getTokenFactory().toString(this.dataRange().keyRange().left.getToken());
+    String stopKey = StorageService.instance.getTokenFactory().toString(this.dataRange().keyRange().right.getToken());
+    //String startKey = StorageService.instance.getTokenFactory().toString(this.dataRange().keyRange().right.getToken());
+    //String stopKey = StorageService.instance.getTokenFactory().toString(this.dataRange().keyRange().left.getToken());
+    List<byte[]> valueList = new ArrayList<byte[]>();
+    for(Token boundToken: tokenArray){
+        //valueList.clear();
+        //String strToken = StorageService.instance.getTokenFactory().toString(tk);//////
+        String groupID = StorageService.instance.getTokenFactory().toString(boundToken);
+        logger.debug("----look startKey:{}, stopKey():{}, boundToken:{},  size:{}", startKey, stopKey, boundToken, valueList.size());
+        
+        if(StorageService.instance.db.groupVersionSetMap.get(groupID)!=null){
+            if(leftBound.equals(boundToken)){ //search the leftest group
+            //if(rightBound.equals(boundToken)){ //search the leftest group
+                StorageService.instance.db.iterator(groupID, startKey, stopKey, valueList, 1, iterators, isForThrift());
+            }else{
+                StorageService.instance.db.iterator(groupID, startKey, stopKey, valueList, 0, iterators, isForThrift());
+            }
+            logger.debug("look startKey:{}, stopKey():{}, boundToken:{}, valueList size:{}", startKey, stopKey, boundToken, valueList.size());
+            //UnfilteredPartitionIterator iter = sstable.getScanner(columnFilter(), dataRange(), isForThrift(), readCountUpdater);
+            //UnfilteredPartitionIterator partition = null;
+            /*for(byte[] KVEntry: valueList){
+                if(KVEntry!=null && KVEntry.length > 1000){
+                    //logger.debug("look startKey:{}, KVEntry size:{}", startKey, KVEntry.length);             
+                    try{
+                        Mutation remutation = Mutation.serializer.deserializeToMutation(new DataInputBuffer(KVEntry), MessagingService.current_version);
+                        for (PartitionUpdate update : remutation.getPartitionUpdates()){
+                            partition = update.unfilteredIterator();
+                            iterators.add(RTBoundValidator.validate(new SingletonUnfilteredPartitionIterator(partition, isForThrift()), RTBoundValidator.Stage.SSTABLE, false));                     
+                        }
+                    }catch (IOException e){
+                        logger.debug("Mutation.serializer.deserialize failed in queryLocalRegion range query!");
+                    }
+                }
+            }*/
+        }
+    }
+    //StorageService.instance.db.mutex.unlock();
+
+        //partition = cfs.isRowCacheEnabled() ? getThroughCache(cfs, executionController) : queryMemtableAndDisk(cfs, executionController);
+        return UnfilteredPartitionIterators.mergeLazily(iterators, nowInSec());
     }
 
     /**

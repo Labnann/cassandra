@@ -62,6 +62,7 @@ public abstract class AbstractReadExecutor
     protected final List<InetAddress> targetReplicas;
     protected final ReadCallback handler;
     protected final TraceState traceState;
+    protected final ConsistencyLevel consistencyLevel;//////
 
     AbstractReadExecutor(Keyspace keyspace, ReadCommand command, ConsistencyLevel consistencyLevel, List<InetAddress> targetReplicas, long queryStartNanoTime)
     {
@@ -69,7 +70,7 @@ public abstract class AbstractReadExecutor
         this.targetReplicas = targetReplicas;
         this.handler = new ReadCallback(new DigestResolver(keyspace, command, consistencyLevel, targetReplicas.size()), consistencyLevel, command, targetReplicas, queryStartNanoTime);
         this.traceState = Tracing.instance.get();
-
+        this.consistencyLevel = consistencyLevel; //////
         // Set the digest version (if we request some digests). This is the smallest version amongst all our target replicas since new nodes
         // knows how to produce older digest but the reverse is not true.
         // TODO: we need this when talking with pre-3.0 nodes. So if we preserve the digest format moving forward, we can get rid of this once
@@ -156,18 +157,73 @@ public abstract class AbstractReadExecutor
         ReadRepairDecision repairDecision = consistencyLevel == ConsistencyLevel.EACH_QUORUM
                                             ? ReadRepairDecision.NONE
                                             : command.metadata().newReadRepairDecision();
-        List<InetAddress> targetReplicas = consistencyLevel.filterForQuery(keyspace, allReplicas, repairDecision);
+        
+if(consistencyLevel == ConsistencyLevel.ONE){ //////
+    //List<InetAddress> targetReplicas = allReplicas.subList(0, 1);//////
+    List<InetAddress> targetReplicas = consistencyLevel.filterForQuery(keyspace, allReplicas, repairDecision);
 
-        // Throw UAE early if we don't have enough replicas.
-        consistencyLevel.assureSufficientLiveNodes(keyspace, targetReplicas);
-
+    consistencyLevel.assureSufficientLiveNodes(keyspace, targetReplicas);
         if (repairDecision != ReadRepairDecision.NONE)
         {
             Tracing.trace("Read-repair {}", repairDecision);
             ReadRepairMetrics.attempted.mark();
         }
-
         ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(command.metadata().cfId);
+        SpeculativeRetryParam retry = cfs.metadata.params.speculativeRetry;
+        if (retry.equals(SpeculativeRetryParam.NONE)
+            || consistencyLevel == ConsistencyLevel.EACH_QUORUM
+            || consistencyLevel.blockFor(keyspace) == allReplicas.size()){
+            //logger.debug("####before NeverSpeculatingReadExecutor, allReplicas:{}, targetReplicas:{}", allReplicas, targetReplicas);//////
+            return new NeverSpeculatingReadExecutor(keyspace, command, consistencyLevel, targetReplicas, queryStartNanoTime);
+        }
+
+        if (targetReplicas.size() == allReplicas.size())
+        {
+            //logger.debug("####before AlwaysSpeculatingReadExecutor, allReplicas:{}, targetReplicas:{}", allReplicas, targetReplicas);//////
+            return new AlwaysSpeculatingReadExecutor(keyspace, cfs, command, consistencyLevel, targetReplicas, queryStartNanoTime);
+        }
+        // RRD.NONE or RRD.DC_LOCAL w/ multiple DCs.
+        //InetAddress extraReplica = allReplicas.get(0);//////
+        //targetReplicas.add(extraReplica);
+
+        InetAddress extraReplica = allReplicas.get(targetReplicas.size());
+        // With repair decision DC_LOCAL all replicas/target replicas may be in different order, so
+        // we might have to find a replacement that's not already in targetReplicas.
+        if (repairDecision == ReadRepairDecision.DC_LOCAL && targetReplicas.contains(extraReplica))
+        {
+            for (InetAddress address : allReplicas)
+            {
+                if (!targetReplicas.contains(address))
+                {
+                    extraReplica = address;
+                    break;
+                }
+            }
+        }
+        targetReplicas.add(extraReplica);
+
+        //logger.debug("##look in getReadExecutor,tk:{}, key:{}, ep:{}",tk, theKey, targetReplicas.get(0));
+        if (retry.equals(SpeculativeRetryParam.ALWAYS)){
+            //logger.debug("####before AlwaysSpeculatingReadExecutor, allReplicas:{}, targetReplicas:{}", allReplicas, targetReplicas);//////
+            return new AlwaysSpeculatingReadExecutor(keyspace, cfs, command, consistencyLevel, targetReplicas, queryStartNanoTime);
+        }else{ // PERCENTILE or CUSTOM.
+            //logger.debug("####before SpeculatingReadExecutor, allReplicas:{}, targetReplicas:{}", allReplicas, targetReplicas);//////
+            return new SpeculatingReadExecutor(keyspace, cfs, command, consistencyLevel, targetReplicas, queryStartNanoTime);
+        }
+
+}else{ //////
+        List<InetAddress> targetReplicas = consistencyLevel.filterForQuery(keyspace, allReplicas, repairDecision);
+        // Throw UAE early if we don't have enough replicas.
+        consistencyLevel.assureSufficientLiveNodes(keyspace, targetReplicas);
+        if (repairDecision != ReadRepairDecision.NONE)
+        {
+            Tracing.trace("Read-repair {}", repairDecision);
+            ReadRepairMetrics.attempted.mark();
+        }
+        //logger.debug("####in getReadExecutor, allReplicas:{}, targetReplicas:{}", allReplicas, targetReplicas);//////
+        ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(command.metadata().cfId);
+        //ColumnFamilyStore cfs = command.getColumnFamilyStorefromMultiReplicas(command.metadata());
+        
         SpeculativeRetryParam retry = cfs.metadata.params.speculativeRetry;
 
         // Speculative retry is disabled *OR* there are simply no extra replicas to speculate.
@@ -187,6 +243,7 @@ public abstract class AbstractReadExecutor
 
         // RRD.NONE or RRD.DC_LOCAL w/ multiple DCs.
         InetAddress extraReplica = allReplicas.get(targetReplicas.size());
+
         // With repair decision DC_LOCAL all replicas/target replicas may be in different order, so
         // we might have to find a replacement that's not already in targetReplicas.
         if (repairDecision == ReadRepairDecision.DC_LOCAL && targetReplicas.contains(extraReplica))
@@ -201,11 +258,12 @@ public abstract class AbstractReadExecutor
             }
         }
         targetReplicas.add(extraReplica);
-
+        //logger.debug("####end getReadExecutor, targetReplicas:{}", targetReplicas);//////
         if (retry.equals(SpeculativeRetryParam.ALWAYS))
             return new AlwaysSpeculatingReadExecutor(keyspace, cfs, command, consistencyLevel, targetReplicas, queryStartNanoTime);
         else // PERCENTILE or CUSTOM.
             return new SpeculatingReadExecutor(keyspace, cfs, command, consistencyLevel, targetReplicas, queryStartNanoTime);
+}//////
     }
 
     public static class NeverSpeculatingReadExecutor extends AbstractReadExecutor
@@ -218,8 +276,10 @@ public abstract class AbstractReadExecutor
         public void executeAsync()
         {
             makeDataRequests(targetReplicas.subList(0, 1));
-            if (targetReplicas.size() > 1)
+            if (targetReplicas.size() > 1){
+            //if(targetReplicas.size() > 1 && consistencyLevel != ConsistencyLevel.ONE) //////
                 makeDigestRequests(targetReplicas.subList(1, targetReplicas.size()));
+            }
         }
 
         public void maybeTryAdditionalReplicas()
@@ -261,16 +321,19 @@ public abstract class AbstractReadExecutor
                 // preferred by the snitch, we do an extra data read to start with against a replica more
                 // likely to reply; better to let RR fail than the entire query.
                 makeDataRequests(initialReplicas.subList(0, 2));
-                if (initialReplicas.size() > 2)
+                if (initialReplicas.size() > 2){
+                //if(initialReplicas.size() > 2 && consistencyLevel != ConsistencyLevel.ONE) //////
                     makeDigestRequests(initialReplicas.subList(2, initialReplicas.size()));
+                }
             }
             else
             {
                 // not doing read repair; all replies are important, so it doesn't matter which nodes we
                 // perform data reads against vs digest.
                 makeDataRequests(initialReplicas.subList(0, 1));
-                if (initialReplicas.size() > 1)
+                if (initialReplicas.size() > 1){
                     makeDigestRequests(initialReplicas.subList(1, initialReplicas.size()));
+                }
             }
         }
 
@@ -336,8 +399,9 @@ public abstract class AbstractReadExecutor
         public void executeAsync()
         {
             makeDataRequests(targetReplicas.subList(0, targetReplicas.size() > 1 ? 2 : 1));
-            if (targetReplicas.size() > 2)
+            if (targetReplicas.size() > 2){
                 makeDigestRequests(targetReplicas.subList(2, targetReplicas.size()));
+            }
             cfs.metric.speculativeRetries.inc();
         }
     }

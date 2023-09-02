@@ -25,6 +25,8 @@ import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.service.ActiveRepairService;
 import org.apache.cassandra.utils.UUIDGen;
 
+import java.nio.ByteBuffer;
+
 /**
  * {@link StreamPlan} is a helper class that builds StreamOperation of given configuration.
  *
@@ -150,6 +152,12 @@ public class StreamPlan
         coordinator.transferFiles(to, sstableDetails);
         return this;
 
+    }
+
+    public StreamPlan transferReplicaFile(InetAddress to, ByteBuffer replicaFile)
+    {
+        coordinator.transferReplicaFile(to, replicaFile);
+        return this;
     }
 
     public StreamPlan listeners(StreamEventHandler handler, StreamEventHandler... handlers)

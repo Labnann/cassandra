@@ -41,6 +41,7 @@ import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.codehaus.jackson.JsonNode;
 import org.codehaus.jackson.node.JsonNodeFactory;
 import org.codehaus.jackson.node.ObjectNode;
+import org.apache.cassandra.service.StorageService;
 
 public class LeveledCompactionStrategy extends AbstractCompactionStrategy
 {
@@ -58,7 +59,7 @@ public class LeveledCompactionStrategy extends AbstractCompactionStrategy
     public LeveledCompactionStrategy(ColumnFamilyStore cfs, Map<String, String> options)
     {
         super(cfs, options);
-        int configuredMaxSSTableSize = 160;
+        int configuredMaxSSTableSize = 160; //200; //160;
         int configuredLevelFanoutSize = DEFAULT_LEVEL_FANOUT_SIZE;
         SizeTieredCompactionStrategyOptions localOptions = new SizeTieredCompactionStrategyOptions(options);
         if (options != null)
@@ -125,6 +126,7 @@ public class LeveledCompactionStrategy extends AbstractCompactionStrategy
                 if (sstable == null)
                 {
                     logger.trace("No compaction necessary for {}", this);
+                    logger.debug("No compaction necessary for {}", this);
                     return null;
                 }
                 candidate = new LeveledManifest.CompactionCandidate(Collections.singleton(sstable),
@@ -141,17 +143,27 @@ public class LeveledCompactionStrategy extends AbstractCompactionStrategy
             // the tracker but candidate SSTables were not yet replaced in the compaction strategy manager
             if (candidate.sstables.equals(previousCandidate))
             {
+                logger.debug("candidate.sstables.equals(previousCandidate)");
                 logger.warn("Could not acquire references for compacting SSTables {} which is not a problem per se," +
                             "unless it happens frequently, in which case it must be reported. Will retry later.",
                             candidate.sstables);
                 return null;
             }
+            ///////////////////////
+            if(cfs.name.equals("globalReplicaTable") && candidate.sstables.size() < StorageService.instance.minSplitSSTableNum){
+                return null;
+            }
+            //////////////////////
 
             LifecycleTransaction txn = cfs.getTracker().tryModify(candidate.sstables, OperationType.COMPACTION);
             if (txn != null)
             {
                 LeveledCompactionTask newTask = new LeveledCompactionTask(cfs, txn, candidate.level, gcBefore, candidate.maxSSTableBytes, false);
+                logger.debug("in getNextBackgroundTask, cfs.name:{}, candidate.level:{}", cfs.name, candidate.level);
+                newTask.setOutputLevel(candidate.level);//////
                 newTask.setCompactionType(op);
+                StorageService.instance.minSplitSSTableNum = 20;//////
+                StorageService.instance.splitSSTableNum = 20;//////
                 return newTask;
             }
             previousCandidate = candidate.sstables;
@@ -273,6 +285,8 @@ public class LeveledCompactionStrategy extends AbstractCompactionStrategy
     public ScannerList getScanners(Collection<SSTableReader> sstables, Collection<Range<Token>> ranges)
     {
         Set<SSTableReader>[] sstablesPerLevel = manifest.getSStablesPerLevelSnapshot();
+        logger.debug("------LSM_tree levels:{}", manifest.getLevelCount());
+        manifest.printEachLevelSize();//////
 
         Multimap<Integer, SSTableReader> byLevel = ArrayListMultimap.create();
         for (SSTableReader sstable : sstables)

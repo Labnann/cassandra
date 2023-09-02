@@ -34,24 +34,40 @@ import org.apache.cassandra.utils.JVMStabilityInspector;
 
 import static org.apache.cassandra.utils.Throwables.extractIOExceptionCause;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+import org.apache.cassandra.streaming.compress.CompressionInfo;
+import java.nio.ByteBuffer;
+import org.apache.cassandra.io.util.*;
+
 /**
  * IncomingFileMessage is used to receive the part(or whole) of a SSTable data file.
  */
 public class IncomingFileMessage extends StreamMessage
 {
+    private static final Logger logger = LoggerFactory.getLogger(IncomingFileMessage.class);
+
     public static Serializer<IncomingFileMessage> serializer = new Serializer<IncomingFileMessage>()
     {
         @SuppressWarnings("resource")
         public IncomingFileMessage deserialize(ReadableByteChannel in, int version, StreamSession session) throws IOException
         {
             DataInputPlus input = new DataInputStreamPlus(Channels.newInputStream(in));
+            int migrationFlag = input.readInt();//////
+            logger.debug("IncomingFileMessage migrationFlag:{}", migrationFlag);
             FileMessageHeader header = FileMessageHeader.serializer.deserialize(input, version);
             StreamReader reader = !header.isCompressed() ? new StreamReader(header, session)
                     : new CompressedStreamReader(header, session);
 
             try
             {
-                return new IncomingFileMessage(reader.read(in), header);
+                if(session.description().equals("Repair")){
+                    migrationFlag = 1;
+                }
+
+                return new IncomingFileMessage(reader.read(in), header, migrationFlag);
             }
             catch (Throwable t)
             {
@@ -69,11 +85,21 @@ public class IncomingFileMessage extends StreamMessage
     public FileMessageHeader header;
     public SSTableMultiWriter sstable;
 
+    public int migrationFlag;
+
     public IncomingFileMessage(SSTableMultiWriter sstable, FileMessageHeader header)
     {
         super(Type.FILE);
         this.header = header;
         this.sstable = sstable;
+    }
+
+    public IncomingFileMessage(SSTableMultiWriter sstable, FileMessageHeader header, int migrationFlag)
+    {
+        super(Type.FILE);
+        this.header = header;
+        this.sstable = sstable;
+        this.migrationFlag = migrationFlag;
     }
 
     @Override

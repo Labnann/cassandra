@@ -34,6 +34,7 @@ public abstract class AbstractCompactionTask extends WrappedRunnable
     protected LifecycleTransaction transaction;
     protected boolean isUserDefined;
     protected OperationType compactionType;
+    public int outputLevel;
 
     /**
      * @param cfs
@@ -44,11 +45,22 @@ public abstract class AbstractCompactionTask extends WrappedRunnable
         this.cfs = cfs;
         this.transaction = transaction;
         this.isUserDefined = false;
+        this.outputLevel = 0;//////
         this.compactionType = OperationType.COMPACTION;
         // enforce contract that caller should mark sstables compacting
         Set<SSTableReader> compacting = transaction.tracker.getCompacting();
         for (SSTableReader sstable : transaction.originals())
             assert compacting.contains(sstable) : sstable.getFilename() + " is not correctly marked compacting";
+    }
+
+    public void setOutputLevel(int outputLevel)
+    {
+        this.outputLevel = outputLevel;
+    }
+
+    public int getOutputLevel()
+    {
+        return this.outputLevel;
     }
 
     /**

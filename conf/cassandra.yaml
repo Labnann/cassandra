@@ -11,7 +11,7 @@ cluster_name: 'Test Cluster'
 
 # This defines the number of tokens randomly assigned to this node on the ring
 # The more tokens, relative to other nodes, the larger the proportion of data
-# that this node will store. You probably want all nodes to have the same number
+## that this node will store. You probably want all nodes to have the same number
 # of tokens assuming they have equal hardware capability.
 #
 # If you leave this unspecified, Cassandra will use the default of 1 token for legacy compatibility,
@@ -182,6 +182,7 @@ credentials_validity_in_ms: 2000
 # OrderPreservingPartitioner.
 #
 partitioner: org.apache.cassandra.dht.Murmur3Partitioner
+#partitioner: org.apache.cassandra.dht.ByteOrderedPartitioner
 
 # Directories where Cassandra should store data on disk.  Cassandra
 # will spread data evenly across them, subject to the granularity of
@@ -422,7 +423,7 @@ seed_provider:
       parameters:
           # seeds is actually a comma-delimited list of addresses.
           # Ex: "<ip1>,<ip2>,<ip3>"
-          - seeds: "127.0.0.1"
+          - seeds: "100.0.0.8"
 
 # For workloads with more data than can fit in memory, Cassandra's
 # bottleneck will be reads that need to fetch data from
@@ -438,6 +439,8 @@ seed_provider:
 concurrent_reads: 32
 concurrent_writes: 32
 concurrent_counter_writes: 32
+
+disable_stcs_inl0: false
 
 # For materialized view writes, as there is a read involved, so this should
 # be limited by the less of concurrent reads or concurrent writes.
@@ -469,8 +472,8 @@ concurrent_materialized_view_writes: 32
 # accepting writes when the limit is exceeded until a flush completes,
 # and will trigger a flush based on memtable_cleanup_threshold
 # If omitted, Cassandra will set both to 1/4 the size of the heap.
-# memtable_heap_space_in_mb: 2048
-# memtable_offheap_space_in_mb: 2048
+memtable_heap_space_in_mb: 1888 #1888 #1688 #1288 #2248
+memtable_offheap_space_in_mb: 1888 #1888 #1688 #1288 #2248
 
 # memtable_cleanup_threshold is deprecated. The default calculation
 # is the only reasonable choice. See the comments on  memtable_flush_writers
@@ -483,7 +486,7 @@ concurrent_materialized_view_writes: 32
 # under heavy write load.
 #
 # memtable_cleanup_threshold defaults to 1 / (memtable_flush_writers + 1)
-# memtable_cleanup_threshold: 0.11
+#memtable_cleanup_threshold: 0.6 #0.11
 
 # Specify the way Cassandra allocates and manages memtable memory.
 # Options are:
@@ -507,7 +510,7 @@ memtable_allocation_type: heap_buffers
 # The default value is the smaller of 8192, and 1/4 of the total space
 # of the commitlog volume.
 #
-# commitlog_total_space_in_mb: 8192
+#commitlog_total_space_in_mb: 16384 #8192
 
 # This sets the number of memtable flush writer threads per disk
 # as well as the total number of memtables that can be flushed concurrently.
@@ -536,7 +539,7 @@ memtable_allocation_type: heap_buffers
 # and flush size and frequency. More is not better you just need enough flush writers
 # to never stall waiting for flushing to free memory.
 #
-#memtable_flush_writers: 2
+#memtable_flush_writers: 1 #2
 
 # Total space to use for change-data-capture logs on disk.
 #
@@ -577,7 +580,7 @@ trickle_fsync_interval_in_kb: 10240
 
 # TCP port, for commands and data
 # For security reasons, you should not expose this port to the internet.  Firewall it if needed.
-storage_port: 7000
+storage_port: 6000 #7000
 
 # SSL port, for encrypted communication.  Unused unless enabled in
 # encryption_options
@@ -596,7 +599,7 @@ ssl_storage_port: 7001
 #
 # Setting listen_address to 0.0.0.0 is always wrong.
 #
-listen_address: localhost
+listen_address: 127.0.0.1
 
 # Set listen_address OR listen_interface, not both. Interfaces must correspond
 # to a single address, IP aliasing is not supported.
@@ -673,7 +676,7 @@ start_rpc: false
 # set broadcast_rpc_address to a value other than 0.0.0.0.
 #
 # For security reasons, you should not expose this port to the internet.  Firewall it if needed.
-rpc_address: localhost
+rpc_address: 127.0.0.1
 
 # Set rpc_address OR rpc_interface, not both. Interfaces must correspond
 # to a single address, IP aliasing is not supported.
@@ -816,7 +819,7 @@ column_index_cache_size_in_kb: 2
 # 16 to 32 times the rate you are inserting data is more than sufficient.
 # Setting this to 0 disables throttling. Note that this account for all types
 # of compaction, including validation compaction.
-compaction_throughput_mb_per_sec: 16
+compaction_throughput_mb_per_sec: 48 #16 #48 #64 #48 #32 #64 #14 #16 #14 #16
 
 # When compacting, the replacement sstable(s) can be opened before they
 # are completely written, and used in place of the prior sstables for
@@ -841,7 +844,7 @@ sstable_preemptive_open_interval_in_mb: 50
 # How long the coordinator should wait for read operations to complete
 read_request_timeout_in_ms: 5000
 # How long the coordinator should wait for seq or index scans to complete
-range_request_timeout_in_ms: 10000
+range_request_timeout_in_ms: 1000000 #10000
 # How long the coordinator should wait for writes to complete
 write_request_timeout_in_ms: 2000
 # How long the coordinator should wait for counter writes to complete
@@ -854,12 +857,12 @@ cas_contention_timeout_in_ms: 1000
 # we need to flush first so we can snapshot before removing the data.)
 truncate_request_timeout_in_ms: 60000
 # The default timeout for other, miscellaneous operations
-request_timeout_in_ms: 10000
+request_timeout_in_ms: 1000000 #10000
 
 # How long before a node logs slow queries. Select queries that take longer than
 # this timeout to execute, will generate an aggregated log message, so that slow queries
 # can be identified. Set this value to zero to disable slow query logging.
-slow_query_log_timeout_in_ms: 500
+slow_query_log_timeout_in_ms: 500000 # 500
 
 # Enable operation timeout information exchange between nodes to accurately
 # measure request timeouts.  If disabled, replicas will assume that requests

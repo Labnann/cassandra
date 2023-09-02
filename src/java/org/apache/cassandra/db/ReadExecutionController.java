@@ -74,7 +74,10 @@ public class ReadExecutionController implements AutoCloseable
     @SuppressWarnings("resource") // ops closed during controller close
     static ReadExecutionController forCommand(ReadCommand command)
     {
-        ColumnFamilyStore baseCfs = Keyspace.openAndGetStore(command.metadata());
+        //ColumnFamilyStore baseCfs = Keyspace.openAndGetStore(command.metadata());
+        //ColumnFamilyStore indexCfs = maybeGetIndexCfs(baseCfs, command);
+
+        ColumnFamilyStore baseCfs = command.getColumnFamilyStorefromMultiReplicas(command.metadata());
         ColumnFamilyStore indexCfs = maybeGetIndexCfs(baseCfs, command);
 
         if (indexCfs == null)

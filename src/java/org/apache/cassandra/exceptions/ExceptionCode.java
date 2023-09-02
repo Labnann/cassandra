@@ -49,7 +49,9 @@ public enum ExceptionCode
     INVALID         (0x2200),
     CONFIG_ERROR    (0x2300),
     ALREADY_EXISTS  (0x2400),
-    UNPREPARED      (0x2500);
+    UNPREPARED      (0x2500),
+
+    EC_ERROR (0x3000);//ZMADD
 
     public final int value;
     private static final Map<Integer, ExceptionCode> valueToCode = new HashMap<>(ExceptionCode.values().length);

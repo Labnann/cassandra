@@ -26,6 +26,7 @@ import org.apache.cassandra.db.rows.*;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.util.FileDataInput;
 import org.apache.cassandra.io.util.FileHandle;
+import org.apache.cassandra.service.StorageService;
 
 /**
  *  A Cell Iterator over SSTable
@@ -104,7 +105,7 @@ public class SSTableIterator extends AbstractSSTableIterator
         private Unfiltered handlePreSliceData() throws IOException
         {
             assert deserializer != null;
-
+            long startDataBlock = System.currentTimeMillis();
             // Note that the following comparison is not strict. The reason is that the only cases
             // where it can be == is if the "next" is a RT start marker (either a '[' of a ')[' boundary),
             // and if we had a strict inequality and an open RT marker before this, we would issue
@@ -125,9 +126,11 @@ public class SSTableIterator extends AbstractSSTableIterator
 
             // We've reached the beginning of our queried slice. If we have an open marker
             // we should return that first.
-            if (openMarker != null)
+            if (openMarker != null){
+                StorageService.instance.readSSTables += System.currentTimeMillis() - startDataBlock;
                 return new RangeTombstoneBoundMarker(sliceStart, openMarker);
-
+            }
+            StorageService.instance.readSSTables += System.currentTimeMillis() - startDataBlock;
             return null;
         }
 
@@ -137,7 +140,7 @@ public class SSTableIterator extends AbstractSSTableIterator
         protected Unfiltered computeNext() throws IOException
         {
             assert deserializer != null;
-
+            long startDataBlock = System.currentTimeMillis();
             while (true)
             {
                 // We use a same reasoning as in handlePreSliceData regarding the strictness of the inequality below.
@@ -157,8 +160,10 @@ public class SSTableIterator extends AbstractSSTableIterator
 
                 if (next.kind() == Unfiltered.Kind.RANGE_TOMBSTONE_MARKER)
                     updateOpenMarker((RangeTombstoneMarker) next);
+                StorageService.instance.readSSTables += System.currentTimeMillis() - startDataBlock;
                 return next;
             }
+            
         }
 
         protected boolean hasNextInternal() throws IOException
@@ -196,11 +201,13 @@ public class SSTableIterator extends AbstractSSTableIterator
 
         protected Unfiltered nextInternal() throws IOException
         {
+            //long startDataBlock = System.currentTimeMillis();
             if (!hasNextInternal())
                 throw new NoSuchElementException();
 
             Unfiltered toReturn = next;
             next = null;
+            //StorageService.instance.readSSTables += System.currentTimeMillis() - startDataBlock;
             return toReturn;
         }
     }
@@ -228,6 +235,8 @@ public class SSTableIterator extends AbstractSSTableIterator
         @Override
         public void setForSlice(Slice slice) throws IOException
         {
+            long startIndex = System.currentTimeMillis();
+
             super.setForSlice(slice);
 
             // if our previous slicing already got us the biggest row in the sstable, we're done
@@ -280,11 +289,15 @@ public class SSTableIterator extends AbstractSSTableIterator
             {
                 sliceDone = true;
             }
+
+            StorageService.instance.readIndexBlock += System.currentTimeMillis() - startIndex;
         }
 
         @Override
         protected Unfiltered computeNext() throws IOException
         {
+            long startIndex = System.currentTimeMillis();
+
             while (true)
             {
                 // Our previous read might have made us cross an index block boundary. If so, update our informations.
@@ -297,8 +310,10 @@ public class SSTableIterator extends AbstractSSTableIterator
                 if (indexState.isDone()
                     || indexState.currentBlockIdx() > lastBlockIdx
                     || !deserializer.hasNext()
-                    || (indexState.currentBlockIdx() == lastBlockIdx && deserializer.compareNextTo(end) >= 0))
+                    || (indexState.currentBlockIdx() == lastBlockIdx && deserializer.compareNextTo(end) >= 0)){
+                    StorageService.instance.readIndexBlock += System.currentTimeMillis() - startIndex;
                     return null;
+                }
 
 
                 Unfiltered next = deserializer.readNext();
@@ -308,8 +323,10 @@ public class SSTableIterator extends AbstractSSTableIterator
 
                 if (next.kind() == Unfiltered.Kind.RANGE_TOMBSTONE_MARKER)
                     updateOpenMarker((RangeTombstoneMarker) next);
+                StorageService.instance.readIndexBlock += System.currentTimeMillis() - startIndex;
                 return next;
             }
+
         }
     }
 }

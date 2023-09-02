@@ -31,6 +31,13 @@ import org.apache.cassandra.streaming.messages.OutgoingFileMessage;
 import org.apache.cassandra.utils.Pair;
 import org.apache.cassandra.utils.concurrent.Ref;
 
+import java.nio.ByteBuffer;
+import org.apache.cassandra.io.util.*;
+
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.Token;
+
+import org.iq80.twoLayerLog.impl.*;
 /**
  * StreamTransferTask sends sections of SSTable files in certain ColumnFamily.
  */
@@ -52,6 +59,15 @@ public class StreamTransferTask extends StreamTask
         super(session, cfId);
     }
 
+    public synchronized void addTransferFile(Ref<SSTableReader> ref, long estimatedKeys, List<Pair<Long, Long>> sections, long repairedAt, int migrationFlag)
+    {
+        assert ref.get() != null && cfId.equals(ref.get().metadata.cfId);
+        OutgoingFileMessage message = new OutgoingFileMessage(ref, sequenceNumber.getAndIncrement(), estimatedKeys, sections, repairedAt, session.keepSSTableLevel(), migrationFlag);
+        message = StreamHook.instance.reportOutgoingFile(session, ref.get(), message);
+        files.put(message.header.sequenceNumber, message);
+        totalSize += message.header.size();
+    }
+
     public synchronized void addTransferFile(Ref<SSTableReader> ref, long estimatedKeys, List<Pair<Long, Long>> sections, long repairedAt)
     {
         assert ref.get() != null && cfId.equals(ref.get().metadata.cfId);
@@ -59,6 +75,14 @@ public class StreamTransferTask extends StreamTask
         message = StreamHook.instance.reportOutgoingFile(session, ref.get(), message);
         files.put(message.header.sequenceNumber, message);
         totalSize += message.header.size();
+    }
+
+    //public synchronized void addTransferReplicaFile(ByteBuffer replicaFile, UUID cfId)
+    public synchronized void addTransferReplicaFile(UUID cfId, int NodeID, Token left, Token right, Token rightBound, FileMetaData fileMeta, boolean globalFlag, String keyspace)
+    {
+        OutgoingFileMessage message = new OutgoingFileMessage(sequenceNumber.getAndIncrement(), cfId, NodeID, left, right, rightBound, fileMeta, globalFlag, keyspace);
+        files.put(message.sequenceNumber, message);
+        //totalSize += replicaFile.limit();
     }
 
     /**

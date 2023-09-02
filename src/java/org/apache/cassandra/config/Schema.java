@@ -672,7 +672,7 @@ public class Schema
         // Make sure the keyspace is initialized
         // and init the new CF before switching the KSM to the new one
         // to avoid races as in CASSANDRA-10761
-        Keyspace.open(cfm.ksName).initCf(cfm, true);
+        Keyspace.open(cfm.ksName).initCf(cfm, true, cfm.ksName);
         // Update the keyspaces map with the updated metadata
         update(cfm.ksName, ks -> ks.withSwapped(ks.tables.with(cfm)));
         // Update the table ID <-> table name map (cfIdMap)
@@ -725,7 +725,7 @@ public class Schema
         Keyspace keyspace = Keyspace.open(view.ksName);
 
         // Make sure the keyspace is initialized and initialize the table.
-        keyspace.initCf(view.metadata, true);
+        keyspace.initCf(view.metadata, true, view.ksName);
         // Update the keyspaces map with the updated metadata
         update(view.ksName, ks -> ks.withSwapped(ks.views.with(view)));
         // Update the table ID <-> table name map (cfIdMap)

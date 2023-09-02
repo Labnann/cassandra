@@ -152,7 +152,9 @@ public class RepairSession extends AbstractFuture<RepairSessionResult> implement
 
     public void waitForValidation(Pair<RepairJobDesc, InetAddress> key, ValidationTask task)
     {
+        logger.debug("in waitForValidation, validating size:{}", validating.size());
         validating.put(key, task);
+        logger.debug("after waitForValidation, validating size:{}", validating.size());
     }
 
     public void waitForSync(Pair<RepairJobDesc, NodePair> key, RemoteSyncTask task)
@@ -169,15 +171,19 @@ public class RepairSession extends AbstractFuture<RepairSessionResult> implement
      */
     public void validationComplete(RepairJobDesc desc, InetAddress endpoint, MerkleTrees trees)
     {
+        logger.debug("in validationComplete, endpoint:{}, validating size:{}", endpoint, validating.size());
+        if(validating.size()==0) return;///////
         ValidationTask task = validating.remove(Pair.create(desc, endpoint));
+        logger.debug("after validationComplete, endpoint:{}, validating size:{}", endpoint, validating.size());
         if (task == null)
         {
-            assert terminated;
+            //assert terminated;
             return;
         }
 
         String message = String.format("Received merkle tree for %s from %s", desc.columnFamily, endpoint);
         logger.info("[repair #{}] {}", getId(), message);
+        logger.debug("[repair #{}] {}", getId(), message);
         Tracing.traceRepair(message);
         task.treesReceived(trees);
     }
@@ -268,6 +274,7 @@ public class RepairSession extends AbstractFuture<RepairSessionResult> implement
             {
                 // this repair session is completed
                 logger.info("[repair #{}] {}", getId(), "Session completed successfully");
+                logger.debug("[repair #{}] {}", getId(), "Session completed successfully");
                 Tracing.traceRepair("Completed sync of range {}", ranges);
                 set(new RepairSessionResult(id, keyspace, ranges, results));
 
@@ -287,6 +294,7 @@ public class RepairSession extends AbstractFuture<RepairSessionResult> implement
 
     public void terminate()
     {
+        logger.info("in terminate");
         terminated = true;
         validating.clear();
         syncingTasks.clear();

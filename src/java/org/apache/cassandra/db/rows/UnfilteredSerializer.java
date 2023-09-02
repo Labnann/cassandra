@@ -31,6 +31,7 @@ import org.apache.cassandra.io.util.DataOutputPlus;
 import org.apache.cassandra.io.util.FileDataInput;
 import org.apache.cassandra.utils.SearchIterator;
 import org.apache.cassandra.utils.WrappedException;
+import org.apache.cassandra.service.StorageService;
 
 /**
  * Serialize/deserialize a single Unfiltered (both on-wire and on-disk).
@@ -582,6 +583,7 @@ public class UnfilteredSerializer
             {
                 in.readUnsignedVInt(); // Skip row size
                 in.readUnsignedVInt(); // previous unfiltered size
+                StorageService.instance.totalReadBytes+=8;////
             }
 
             LivenessInfo rowLiveness = LivenessInfo.EMPTY;
@@ -665,6 +667,7 @@ public class UnfilteredSerializer
             }
 
             int count = (int) in.readUnsignedVInt();
+            StorageService.instance.totalReadBytes+=4;////
             while (--count >= 0)
             {
                 Cell cell = Cell.serializer.deserialize(in, rowLiveness, column, header, helper);

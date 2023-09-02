@@ -39,6 +39,7 @@ import org.apache.cassandra.metrics.MetricNameFactory;
 import org.apache.cassandra.utils.ObjectSizes;
 import org.apache.cassandra.utils.vint.VIntCoding;
 import org.github.jamm.Unmetered;
+import org.apache.cassandra.service.StorageService;
 
 import static org.apache.cassandra.metrics.CassandraMetricsRegistry.Metrics;
 
@@ -323,6 +324,8 @@ public class RowIndexEntry<T> implements IMeasurableMemory
             long position = in.readUnsignedVInt();
 
             int size = (int)in.readUnsignedVInt();
+            StorageService.instance.totalReadBytes+=8;////
+
             if (size == 0)
             {
                 return new RowIndexEntry<>(position);
@@ -332,7 +335,7 @@ public class RowIndexEntry<T> implements IMeasurableMemory
                 long headerLength = in.readUnsignedVInt();
                 DeletionTime deletionTime = DeletionTime.serializer.deserialize(in);
                 int columnsIndexCount = (int) in.readUnsignedVInt();
-
+                StorageService.instance.totalReadBytes+=8;////
                 int indexedPartSize = size - serializedSize(deletionTime, headerLength, columnsIndexCount);
 
                 if (size <= DatabaseDescriptor.getColumnIndexCacheSize())
@@ -626,8 +629,10 @@ public class RowIndexEntry<T> implements IMeasurableMemory
             if (version.storeRows())
             {
                 offsets = new int[this.columnsIndex.length];
-                for (int i = 0; i < offsets.length; i++)
+                for (int i = 0; i < offsets.length; i++){
                     offsets[i] = in.readInt();
+                    StorageService.instance.totalReadBytes+=4;////
+                }
             }
             this.offsets = offsets;
 

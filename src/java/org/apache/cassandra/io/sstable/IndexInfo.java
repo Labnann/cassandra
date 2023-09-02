@@ -29,6 +29,7 @@ import org.apache.cassandra.io.sstable.format.Version;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputPlus;
 import org.apache.cassandra.utils.ObjectSizes;
+import org.apache.cassandra.service.StorageService;
 
 /**
  * {@code IndexInfo} is embedded in the indexed version of {@link RowIndexEntry}.
@@ -139,6 +140,7 @@ public class IndexInfo
             {
                 offset = in.readUnsignedVInt();
                 width = in.readVInt() + WIDTH_BASE;
+                 StorageService.instance.totalReadBytes+=8;////
                 if (in.readBoolean())
                     endOpenMarker = DeletionTime.serializer.deserialize(in);
             }
@@ -146,6 +148,7 @@ public class IndexInfo
             {
                 offset = in.readLong();
                 width = in.readLong();
+                 StorageService.instance.totalReadBytes+=16;////
             }
             return new IndexInfo(firstName, lastName, offset, width, endOpenMarker);
         }

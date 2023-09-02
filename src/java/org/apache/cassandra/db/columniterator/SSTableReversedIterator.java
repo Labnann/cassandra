@@ -32,6 +32,7 @@ import org.apache.cassandra.io.util.FileDataInput;
 import org.apache.cassandra.io.util.FileHandle;
 import org.apache.cassandra.utils.AbstractIterator;
 import org.apache.cassandra.utils.btree.BTree;
+import org.apache.cassandra.service.StorageService;
 
 /**
  *  A Cell Iterator in reversed clustering order over SSTable
@@ -156,19 +157,24 @@ public class SSTableReversedIterator extends AbstractSSTableIterator
 
         protected boolean hasNextInternal() throws IOException
         {
+            //long startDataBlock = System.currentTimeMillis();
             // If we've never called setForSlice, we're reading everything
             if (iterator == null)
                 setForSlice(Slice.ALL);
 
+            //StorageService.instance.readSSTables += System.currentTimeMillis() - startDataBlock;
             return iterator.hasNext();
         }
 
         protected Unfiltered nextInternal() throws IOException
         {
+            //long startDataBlock = System.currentTimeMillis();
+
             if (!hasNext())
                 throw new NoSuchElementException();
             Unfiltered next = iterator.next();
             mostRecentlyEmitted = next;
+            //StorageService.instance.readSSTables += System.currentTimeMillis() - startDataBlock;
             return next;
         }
 
@@ -194,7 +200,7 @@ public class SSTableReversedIterator extends AbstractSSTableIterator
         {
             // start != null means it's the block covering the beginning of the slice, so it has to be the last block for this slice.
             assert start == null || !hasNextBlock;
-
+            long startDataBlock = System.currentTimeMillis();
             buffer.reset();
             skipFirstIteratedItem = false;
             skipLastIteratedItem = false;
@@ -335,6 +341,7 @@ public class SSTableReversedIterator extends AbstractSSTableIterator
             }
 
             buffer.build();
+            StorageService.instance.readSSTables += System.currentTimeMillis() - startDataBlock;
         }
     }
 
@@ -363,6 +370,8 @@ public class SSTableReversedIterator extends AbstractSSTableIterator
         @Override
         public void setForSlice(Slice slice) throws IOException
         {
+            long startIndex = System.currentTimeMillis();
+
             this.slice = slice;
 
             // if our previous slicing already got us past the beginning of the sstable, we're done
@@ -402,11 +411,15 @@ public class SSTableReversedIterator extends AbstractSSTableIterator
             indexState.setToBlock(startIdx);
 
             readCurrentBlock(false, startIdx != lastBlockIdx);
+
+            StorageService.instance.readIndexBlock += System.currentTimeMillis() - startIndex;
         }
 
         @Override
         protected boolean hasNextInternal() throws IOException
         {
+            long startIndex = System.currentTimeMillis();
+
             if (super.hasNextInternal())
                 return true;
 
@@ -414,8 +427,10 @@ public class SSTableReversedIterator extends AbstractSSTableIterator
             {
                 // We have nothing more for our current block, move the next one (so the one before on disk).
                 int nextBlockIdx = indexState.currentBlockIdx() - 1;
-                if (nextBlockIdx < 0 || nextBlockIdx < lastBlockIdx)
+                if (nextBlockIdx < 0 || nextBlockIdx < lastBlockIdx){
+                    StorageService.instance.readIndexBlock += System.currentTimeMillis() - startIndex;
                     return false;
+                }
 
                 // The slice start can be in
                 indexState.setToBlock(nextBlockIdx);
@@ -432,9 +447,12 @@ public class SSTableReversedIterator extends AbstractSSTableIterator
                 {
                     continue;
                 }
-
+                StorageService.instance.readIndexBlock += System.currentTimeMillis() - startIndex;
                 return iterator.hasNext();
             }
+
+            
+            
         }
 
         /**

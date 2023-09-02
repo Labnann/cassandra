@@ -50,6 +50,22 @@ import org.apache.cassandra.io.util.TrackedInputStream;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.Pair;
 
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+
+import org.apache.cassandra.utils.*;
+import org.apache.cassandra.io.util.DataInputBuffer;
+import org.apache.cassandra.io.util.FileDataInput;
+import org.apache.cassandra.io.util.RebufferingInputStream;
+import java.net.InetAddress;
+import java.util.*;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.io.util.DataOutputBuffer;
+import org.apache.cassandra.io.util.DataOutputBufferFixed;
+import org.apache.cassandra.db.filter.ColumnFilter;
+import org.apache.cassandra.db.partitions.PartitionUpdate;
+
 /**
  * StreamReader reads from stream and writes to SSTable.
  */
@@ -66,6 +82,9 @@ public class StreamReader
     protected final int sstableLevel;
     protected final SerializationHeader.Component header;
     protected final int fileSeqNum;
+
+    public InetAddress LOCAL = FBUtilities.getBroadcastAddress();
+    public DataOutputBuffer dob = new DataOutputBuffer();
 
     public StreamReader(FileMessageHeader header, StreamSession session)
     {
@@ -115,7 +134,7 @@ public class StreamReader
             writer = createWriter(cfs, totalSize, repairedAt, format);
             while (in.getBytesRead() < totalSize)
             {
-                writePartition(deserializer, writer);
+                writePartition(deserializer, writer, cfs);
                 // TODO move this to BytesReadTracker
                 session.progress(writer.getFilename(), ProgressInfo.Direction.IN, in.getBytesRead(), totalSize);
             }
@@ -169,6 +188,20 @@ public class StreamReader
     protected void writePartition(StreamDeserializer deserializer, SSTableMultiWriter writer) throws IOException
     {
         writer.append(deserializer.newPartition());
+        deserializer.checkForExceptions();
+    }
+
+    protected void writePartition(StreamDeserializer deserializer, SSTableMultiWriter writer, ColumnFamilyStore cfs) throws IOException
+    {
+        UnfilteredRowIterator rowIterator = deserializer.newPartition();
+        if (session.description().equals("Repair")) {
+            Mutation rowMutation = new Mutation(PartitionUpdate.fromIterator(rowIterator, ColumnFilter.all(cfs.metadata)));
+            Keyspace ks = Keyspace.open(rowMutation.getKeyspaceName());
+            //ks.apply(rowMutation, true, true, true);
+            ks.apply(rowMutation, false, true, true); //disable commitlog
+        }else{
+            writer.append(rowIterator);
+        }
         deserializer.checkForExceptions();
     }
 

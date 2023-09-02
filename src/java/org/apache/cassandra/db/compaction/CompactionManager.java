@@ -72,6 +72,32 @@ import org.apache.cassandra.utils.concurrent.Refs;
 
 import static java.util.Collections.singleton;
 
+import org.apache.cassandra.io.util.DataInputBuffer;
+import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+import org.apache.cassandra.db.partitions.PartitionUpdate;
+
+import java.net.InetAddress;
+import org.apache.cassandra.gms.Gossiper;
+import org.apache.cassandra.dht.RingPosition;
+
+import java.nio.ByteBuffer;
+import org.iq80.twoLayerLog.Options;
+import org.iq80.twoLayerLog.ReadOptions;
+import org.iq80.twoLayerLog.WriteOptions;
+import org.iq80.twoLayerLog.impl.DbImpl;
+import org.iq80.twoLayerLog.util.Slice;
+import org.iq80.twoLayerLog.util.SliceInput;
+import org.iq80.twoLayerLog.util.SliceOutput;
+import org.iq80.twoLayerLog.util.Slices;
+import org.iq80.twoLayerLog.impl.ValueType;
+import static org.iq80.twoLayerLog.impl.ValueType.DELETION;
+import static org.iq80.twoLayerLog.impl.ValueType.VALUE;
+import static org.iq80.twoLayerLog.util.SizeOf.SIZE_OF_INT;
+import static org.iq80.twoLayerLog.util.SizeOf.SIZE_OF_LONG;
+import static org.iq80.twoLayerLog.util.Slices.readLengthPrefixedBytes;
+import static org.iq80.twoLayerLog.util.Slices.writeLengthPrefixedBytes;
+
 /**
  * <p>
  * A singleton which manages a private executor of ongoing compactions.
@@ -114,6 +140,7 @@ public class CompactionManager implements CompactionManagerMBean
     private final CompactionMetrics metrics = new CompactionMetrics(executor, validationExecutor);
     @VisibleForTesting
     final Multiset<ColumnFamilyStore> compactingCF = ConcurrentHashMultiset.create();
+    final Multiset<ColumnFamilyStore> splitingCF = ConcurrentHashMultiset.create();
 
     private final RateLimiter compactionRateLimiter = RateLimiter.create(Double.MAX_VALUE);
 
@@ -151,9 +178,12 @@ public class CompactionManager implements CompactionManagerMBean
      */
     public List<Future<?>> submitBackground(final ColumnFamilyStore cfs)
     {
+        //if (cfs.isAutoCompactionDisabled() || cfs.name.equals("globalReplicaTable")) ////////
+        //if (cfs.isAutoCompactionDisabled() || StorageService.instance.doingGlobalSplit)
         if (cfs.isAutoCompactionDisabled())
         {
             logger.trace("Autocompaction is disabled");
+            logger.debug("cfs.name:{}, Autocompaction is disabled", cfs.name);
             return Collections.emptyList();
         }
 
@@ -178,10 +208,48 @@ public class CompactionManager implements CompactionManagerMBean
 
         List<Future<?>> futures = new ArrayList<>(1);
         Future<?> fut = executor.submitIfRunning(new BackgroundCompactionCandidate(cfs), "background task");
+        if (!fut.isCancelled()){
+            futures.add(fut);
+            //logger.debug("cfs.name:{}, fut is not Cancelled", cfs.name);
+        } else{
+            compactingCF.remove(cfs);
+        }
+        return futures;
+    }
+
+    public List<Future<?>> submitBackgroundSplit(final ColumnFamilyStore cfs)
+    {
+        if (cfs.isAutoCompactionDisabled())
+        {
+            logger.trace("Autocompaction is disabled");
+            return Collections.emptyList();
+        }
+
+        /**
+         * If a CF is currently being compacted, and there are no idle threads, submitBackground should be a no-op;
+         * we can wait for the current compaction to finish and re-submit when more information is available.
+         * Otherwise, we should submit at least one task to prevent starvation by busier CFs, and more if there
+         * are idle threads stil. (CASSANDRA-4310)
+         */
+        int count = splitingCF.count(cfs);
+        if (count > 0 && executor.getActiveCount() >= executor.getMaximumPoolSize())
+        {
+            logger.trace("Background compaction is still running for {}.{} ({} remaining). Skipping",
+                         cfs.keyspace.getName(), cfs.name, count);
+            return Collections.emptyList();
+        }
+
+        logger.trace("Scheduling a background task check for {}.{} with {}",
+                     cfs.keyspace.getName(),
+                     cfs.name,
+                     cfs.getCompactionStrategyManager().getName());
+
+        List<Future<?>> futures = new ArrayList<>(1);
+        Future<?> fut = executor.submitIfRunning(new BackgroundSplitCandidate(cfs), "background task"); //////
         if (!fut.isCancelled())
             futures.add(fut);
         else
-            compactingCF.remove(cfs);
+            splitingCF.remove(cfs);
         return futures;
     }
 
@@ -257,19 +325,67 @@ public class CompactionManager implements CompactionManagerMBean
                 }
 
                 CompactionStrategyManager strategy = cfs.getCompactionStrategyManager();
+                logger.debug("######Checking {}.{}", cfs.keyspace.getName(), cfs.name);
                 AbstractCompactionTask task = strategy.getNextBackgroundTask(getDefaultGcBefore(cfs, FBUtilities.nowInSeconds()));
+
                 if (task == null)
                 {
                     logger.trace("No tasks available");
                     return;
                 }
+                
                 task.execute(metrics);
             }
             finally
             {
+                //logger.debug("######before compactingCF.remove: {}.{}", cfs.keyspace.getName(), cfs.name);
                 compactingCF.remove(cfs);
             }
-            submitBackground(cfs);
+            //submitBackground(cfs);
+        }
+    }
+
+    class BackgroundSplitCandidate implements Runnable
+    {
+        private final ColumnFamilyStore cfs;
+
+        BackgroundSplitCandidate(ColumnFamilyStore cfs)
+        {
+            splitingCF.add(cfs);
+            this.cfs = cfs;
+        }
+
+        public void run()
+        {
+            try
+            {
+                logger.trace("Checking {}.{}", cfs.keyspace.getName(), cfs.name);
+                if (!cfs.isValid())
+                {
+                    logger.trace("Aborting compaction for dropped CF");
+                    return;
+                }
+
+                CompactionStrategyManager strategy = cfs.getCompactionStrategyManager();
+                AbstractCompactionTask task = strategy.getNextBackgroundTask(getDefaultGcBefore(cfs, FBUtilities.nowInSeconds()));
+                logger.debug("######in BackgroundSplitCandidate Checking {}.{}", cfs.keyspace.getName(), cfs.name);
+                if (task == null)
+                {
+                    logger.debug("No tasks available");
+                    logger.trace("No tasks available");
+                    return;
+                }
+                logger.debug("######in BackgroundSplitCandidate Checking {}.{}， before task.execute", cfs.keyspace.getName(), cfs.name);
+                task.execute(metrics);
+            }
+            finally
+            {
+                //logger.debug("######before splitingCF.remove: {}.{}", cfs.keyspace.getName(), cfs.name);
+                splitingCF.remove(cfs);
+            }
+
+            //submitBackgroundSplit(cfs);
+            
         }
     }
 
@@ -938,6 +1054,7 @@ public class CompactionManager implements CompactionManagerMBean
                 }
                 else
                 {
+                    logger.debug("In submitUserDefined");
                     List<AbstractCompactionTask> tasks = cfs.getCompactionStrategyManager().getUserDefinedTasks(sstables, gcBefore);
                     for (AbstractCompactionTask task : tasks)
                     {
@@ -1344,6 +1461,8 @@ public class CompactionManager implements CompactionManagerMBean
     @SuppressWarnings("resource")
     private void doValidationCompaction(ColumnFamilyStore cfs, Validator validator) throws IOException
     {
+        StorageService.instance.duringRepair = true;
+        long beginTime = System.currentTimeMillis();//////
         // this isn't meant to be race-proof, because it's not -- it won't cause bugs for a CFS to be dropped
         // mid-validation, or to attempt to validate a droped CFS.  this is just a best effort to avoid useless work,
         // particularly in the scenario where a validation is submitted before the drop, and there are compactions
@@ -1352,10 +1471,59 @@ public class CompactionManager implements CompactionManagerMBean
         if (!cfs.isValid())
             return;
 
+        ///////////////////////////////////////////////////
+        Options options = new Options();
+        options.createIfMissing(true);
+        Set<InetAddress> liveHosts = Gossiper.instance.getLiveMembers();
+        try {
+            String DBname = "data/replicatedData";
+            File file = new File(DBname);
+            if(!file.exists()){
+                //StorageService.instance.db = factory.open(file, options);
+                StorageService.instance.db = new DbImpl(options, file);
+            }
+            //db.close();
+        } catch(Throwable e){
+                logger.debug("open twoLayerLog failed!!");
+        }
+        InetAddress LOCAL = FBUtilities.getBroadcastAddress();
+        for (InetAddress host : liveHosts){///
+            if (!host.equals(LOCAL)) {          
+                Collection<Token> nodeToken = StorageService.instance.getTokenMetadata().getTokens(host);
+                //logger.debug("nodeIP:{}, nodeToken size:{}, nodeToken:{}", host, nodeToken.size(), nodeToken);
+                List<String> strTokensList = new ArrayList<String>();
+                for(Token tk: nodeToken){
+                    String strToken = StorageService.instance.getTokenFactory().toString(tk);//////
+                    strTokensList.add(strToken);
+                    //logger.debug("strToken size:{}, strToken:{}", strTokensList.size(), strToken);
+                }
+                try{
+                    byte ip[] = host.getAddress();  
+                    int NodeID = (int)ip[3];
+                    StorageService.instance.db.createReplicaDir(NodeID, strTokensList, cfs.keyspace.getName());
+                } catch(Throwable e){
+                    logger.debug("create replicaDir failed!!");
+                }
+            }
+        }
+        ////////////////////////////////////////////////////
+        Collection<Range<Token>> validatorRanges = validator.desc.ranges;
+        Collection<Range<Token>> mainRanges = new ArrayList<>();
+        Collection<Range<Token>> replicaRanges = new ArrayList<>();
+        for(Range<Token> curRang: validatorRanges){
+            List<InetAddress> ep = StorageService.instance.getNaturalEndpoints(cfs.keyspace.getName(), curRang.right);
+            if (!ep.get(0).equals(LOCAL)) {//the range is stored in replica copy
+                replicaRanges.add(curRang);
+            }else{
+                mainRanges.add(curRang);
+            }
+        }
+        logger.debug("validatorRanges size:{}, mainRanges size:{}, replicaRanges size:{}", validatorRanges.size(), mainRanges.size(), replicaRanges.size());
+
         Refs<SSTableReader> sstables = null;
         try
         {
-
+    if(mainRanges.size()>0){
             int gcBefore;
             int nowInSec = FBUtilities.nowInSeconds();
             UUID parentRepairSessionId = validator.desc.parentSessionId;
@@ -1373,8 +1541,6 @@ public class CompactionManager implements CompactionManagerMBean
                 // note that we populate the parent repair session when creating the snapshot, meaning the sstables in the snapshot are the ones we
                 // are supposed to validate.
                 sstables = cfs.getSnapshotSSTableReader(snapshotName);
-
-
                 // Computing gcbefore based on the current time wouldn't be very good because we know each replica will execute
                 // this at a different time (that's the whole purpose of repair with snaphsot). So instead we take the creation
                 // time of the snapshot, which should give us roughtly the same time on each replica (roughtly being in that case
@@ -1394,6 +1560,7 @@ public class CompactionManager implements CompactionManagerMBean
                     gcBefore = getDefaultGcBefore(cfs, nowInSec);
             }
 
+            logger.debug("before createMerkleTrees, validator.desc.ranges:{}", validator.desc.ranges);
             // Create Merkle trees suitable to hold estimated partitions for the given ranges.
             // We blindly assume that a partition is evenly distributed on all sstables for now.
             MerkleTrees tree = createMerkleTrees(sstables, validator.desc.ranges, cfs);
@@ -1413,6 +1580,47 @@ public class CompactionManager implements CompactionManagerMBean
                         validator.add(partition);
                     }
                 }
+                /*
+                //////////////////////////////////////
+                //InetAddress LOCAL = FBUtilities.getBroadcastAddress();
+                logger.debug("before getRangeRowAndInsertValidator, getValidated:{}", validator.getValidated());
+                for (Range<Token> range : validator.desc.ranges)
+                {                                      
+                    //ArrayList<Token> tokens = StorageService.instance.getTokenMetadata().sortedTokens();
+                    List<InetAddress> ep = StorageService.instance.getNaturalEndpoints(cfs.keyspace.getName(), range.right);
+                    if (!ep.get(0).equals(LOCAL)) {//the range is stored in replica copy
+                        Map<String, byte[]> keyValueMap = new HashMap<String, byte[]>();
+                        byte ip[] = ep.get(0).getAddress();  
+                        int NodeID = (int)ip[3];
+                        //byte[] value = StorageService.instance.db.get(partitionKey().getKey().array()); 
+                        Token rightBound = StorageService.instance.getBoundToken(range.right);
+                        int rowNumber = StorageService.instance.getRangeRowAndInsertValidator(NodeID, range.left, rightBound, keyValueMap); 
+                        logger.debug("rowNumber:{}, keyValueMap size:{}", rowNumber, keyValueMap.size());
+                        for (Map.Entry<String, byte[]> entry : keyValueMap.entrySet()) {
+                            byte[] entryValue = entry.getValue();
+                            if(entryValue!=null){
+                                //logger.debug("look Key token:{}, Value size:{}",entry.getKey(), entryValue.length);
+                                Mutation remutation = null;
+                                try{
+                                    remutation = Mutation.serializer.deserializeToMutation(new DataInputBuffer(entryValue), MessagingService.current_version);
+                                    //String strKey1=ByteBufferUtil.string(remutation.key().getKey());
+                                    //logger.debug("get strKey1:{}", strKey1);
+                                    for (PartitionUpdate update : remutation.getPartitionUpdates()){
+                                        UnfilteredRowIterator replicasIter = update.unfilteredIterator();
+                                        validator.add(replicasIter);                                      
+                                    }
+                                    
+                                }catch(Throwable e){
+                                    logger.debug("Mutation.serializer.deserialize failed in doValidationCompaction!");
+                                }                           
+                            }                                       
+                        } 
+                        logger.debug("rightBound:{}, range.right:{}, keyValueMap size:{}, getValidated:{}", rightBound, range.right, keyValueMap.size(), validator.getValidated());
+                    }              
+                }
+                logger.debug("after getRangeRowAndInsertValidator, getValidated:{}", validator.getValidated());
+                /////////////////////////////////////
+                */
                 validator.complete();
             }
             finally
@@ -1432,12 +1640,73 @@ public class CompactionManager implements CompactionManagerMBean
                              duration,
                              validator.desc);
             }
+
+        }
+
+        if(replicaRanges.size()>0){
+            logger.debug("before createMerkleTreesForReplica, replicaRanges:{}", replicaRanges);
+            // Create Merkle trees suitable to hold estimated partitions for the given ranges.
+            // We blindly assume that a partition is evenly distributed on all sstables for now.
+            MerkleTrees tree = createMerkleTreesForReplica(replicaRanges, cfs);
+            long start = System.nanoTime();
+            // validate the CF as we iterate over it
+            validator.prepare(cfs, tree);               
+            //////////////////////////////////////
+                logger.debug("before getRangeRowAndInsertValidator, getValidated:{}", validator.getValidated());
+                for (Range<Token> range : replicaRanges)
+                {                                      
+                    //ArrayList<Token> tokens = StorageService.instance.getTokenMetadata().sortedTokens();
+                    List<InetAddress> ep = StorageService.instance.getNaturalEndpoints(cfs.keyspace.getName(), range.right);
+                    if (!ep.get(0).equals(LOCAL)) {//the range is stored in replica copy
+                        Map<String, byte[]> keyValueMap = new HashMap<String, byte[]>();
+                        byte ip[] = ep.get(0).getAddress();  
+                        int NodeID = (int)ip[3];
+                        Token rightBound = StorageService.instance.getBoundToken(range.right);
+                        ////////return value one by one
+                        /*int rowNumber = StorageService.instance.getRangeRowAndInsertValidator(NodeID, range.left, rightBound, keyValueMap); 
+                        logger.debug("rowNumber:{}, keyValueMap size:{}", rowNumber, keyValueMap.size()); 
+                        int validatorCount=0;                                                          
+                        for (Map.Entry<String, byte[]> entry : keyValueMap.entrySet()) {
+                            byte[] entryValue = entry.getValue();
+                            if(entryValue!=null){
+                                //logger.debug("look Key token:{}, Value size:{}",entry.getKey(), entryValue.length);
+                                Mutation remutation = null;
+                                try{
+                                    remutation = Mutation.serializer.deserializeToMutation(new DataInputBuffer(entryValue), MessagingService.current_version);
+                                    //String strKey1=ByteBufferUtil.string(remutation.key().getKey());
+                                    //logger.debug("get strKey1:{}", strKey1);
+                                }catch(Throwable e){
+                                    logger.debug("Mutation.serializer.deserialize failed in doValidationCompaction!");
+                                }
+                                for (PartitionUpdate update : remutation.getPartitionUpdates()){
+                                    UnfilteredRowIterator replicasIter = update.unfilteredIterator();
+                                    //validator.add(replicasIter); ////////////////////////////////////////////////////////////////////////////////
+                                    validatorCount++;                                
+                                }                                                             
+                            }                                       
+                        }
+                        logger.debug("rightBound:{}, range.right:{}, keyValueMap size:{}, getValidated:{}", rightBound, range.right, keyValueMap.size(), validator.getValidated());
+                        */
+                        //logger.debug("rightBound:{}, range.right:{}, batchBytesSize:{}, entries:{}, validatorCount:{}, getValidated:{}", rightBound, range.right, batchBytesSize, entries, validatorCount, validator.getValidated());
+                    }              
+                }
+                logger.debug("after getRangeRowAndInsertValidator, getValidated:{}", validator.getValidated());
+                /////////////////////////////////////
+                validator.complete();
+                long duration = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+                logger.debug("Validation finished in {} msec, for {}",
+                             duration,
+                             validator.desc);
+        }
+
         }
         finally
         {
             if (sstables != null)
                 sstables.release();
         }
+        long endTime = System.currentTimeMillis();
+        StorageService.instance.buildMTrees+= endTime-beginTime;
     }
 
     private static MerkleTrees createMerkleTrees(Iterable<SSTableReader> sstables, Collection<Range<Token>> ranges, ColumnFamilyStore cfs)
@@ -1445,14 +1714,64 @@ public class CompactionManager implements CompactionManagerMBean
         MerkleTrees tree = new MerkleTrees(cfs.getPartitioner());
         long allPartitions = 0;
         Map<Range<Token>, Long> rangePartitionCounts = Maps.newHashMapWithExpectedSize(ranges.size());
+        //InetAddress LOCAL = FBUtilities.getBroadcastAddress();
         for (Range<Token> range : ranges)
         {
             long numPartitions = 0;
             for (SSTableReader sstable : sstables)
                 numPartitions += sstable.estimatedKeysForRanges(Collections.singleton(range));
+            logger.debug("in createMerkleTrees, numPartitions:{}, allPartitions:{}", numPartitions, allPartitions);
+            //logger.debug("before rangePartitionCounts.put, range.left:{}, range.right:{}, numPartitions:{}", range.left, range.right, numPartitions);
             rangePartitionCounts.put(range, numPartitions);
             allPartitions += numPartitions;
         }
+        logger.debug("in createMerkleTrees, allPartitions:{}", allPartitions);
+
+        for (Range<Token> range : ranges)
+        {
+            long numPartitions = rangePartitionCounts.get(range);
+            double rangeOwningRatio = allPartitions > 0 ? (double)numPartitions / allPartitions : 0;
+            // determine max tree depth proportional to range size to avoid blowing up memory with multiple tress,
+            // capping at 20 to prevent large tree (CASSANDRA-11390)
+            int maxDepth = rangeOwningRatio > 0 ? (int) Math.floor(20 - Math.log(1 / rangeOwningRatio) / Math.log(2)) : 0;
+            // determine tree depth from number of partitions, capping at max tree depth (CASSANDRA-5263)
+            int depth = numPartitions > 0 ? (int) Math.min(Math.ceil(Math.log(numPartitions) / Math.log(2)), maxDepth) : 0;
+            tree.addMerkleTree((int) Math.pow(2, depth), range);
+        }
+        if (logger.isDebugEnabled())
+        {
+            // MT serialize may take time
+            logger.debug("Created {} merkle trees with merkle trees size {}, {} partitions, {} bytes", tree.ranges().size(), tree.size(), allPartitions, MerkleTrees.serializer.serializedSize(tree, 0));
+        }
+
+        return tree;
+    }
+
+    private static MerkleTrees createMerkleTreesForReplica(Collection<Range<Token>> ranges, ColumnFamilyStore cfs)
+    {
+        MerkleTrees tree = new MerkleTrees(cfs.getPartitioner());
+        long allPartitions = 0;
+        Map<Range<Token>, Long> rangePartitionCounts = Maps.newHashMapWithExpectedSize(ranges.size());
+        InetAddress LOCAL = FBUtilities.getBroadcastAddress();
+        for (Range<Token> range : ranges)
+        {
+            long numPartitions = 0;
+            /////////////////////////////////////////
+            List<InetAddress> ep = StorageService.instance.getNaturalEndpoints(cfs.keyspace.getName(), range.right);
+            if (!ep.get(0).equals(LOCAL)) {//the range is stored in replica copy
+                byte ip[] = ep.get(0).getAddress();  
+                int NodeID = (int)ip[3];
+                Token rightBound = StorageService.instance.getBoundToken(range.right);
+                int rangeGroupRowNumber = StorageService.instance.getRangeGroupRowNumber(NodeID, rightBound);
+                numPartitions += rangeGroupRowNumber;
+                logger.debug("in createMerkleTreesForReplica, NodeID:{}, range.left:{}, range.right:{}, rightBound:{}, rangeGroupRowNumber:{}, allPartitions:{}", NodeID, range.left, range.right, rightBound, rangeGroupRowNumber, allPartitions);
+
+            }
+            //logger.debug("before rangePartitionCounts.put, range.left:{}, range.right:{}, numPartitions:{}", range.left, range.right, numPartitions);
+            rangePartitionCounts.put(range, numPartitions);
+            allPartitions += numPartitions;
+        }
+        logger.debug("in createMerkleTreesForReplica, allPartitions:{}", allPartitions);
 
         for (Range<Token> range : ranges)
         {

@@ -480,10 +480,12 @@ public class DatabaseDescriptor
                 logger.warn("Small commitlog volume detected at {}; setting commitlog_total_space_in_mb to {}.  You can override this in cassandra.yaml",
                             conf.commitlog_directory, minSize);
                 conf.commitlog_total_space_in_mb = minSize;
+                logger.debug("commitlog_total_space_in_mb:{}, minSize:{}", conf.commitlog_total_space_in_mb, minSize);
             }
             else
             {
                 conf.commitlog_total_space_in_mb = preferredSize;
+                logger.debug("commitlog_total_space_in_mb:{}, preferredSize:{}", conf.commitlog_total_space_in_mb, preferredSize);
             }
         }
 
@@ -1561,7 +1563,8 @@ public class DatabaseDescriptor
 
     public static boolean getDisableSTCSInL0()
     {
-        return disableSTCSInL0;
+        //return disableSTCSInL0;
+        return conf.disable_stcs_inl0;
     }
 
     public static int getStreamThroughputOutboundMegabitsPerSec()

@@ -70,7 +70,8 @@ public class Config
     public String hints_directory;
 
     public ParameterizedClass seed_provider;
-    public DiskAccessMode disk_access_mode = DiskAccessMode.auto;
+    //public DiskAccessMode disk_access_mode = DiskAccessMode.auto;
+    public DiskAccessMode disk_access_mode = DiskAccessMode.standard;
 
     public DiskFailurePolicy disk_failure_policy = DiskFailurePolicy.ignore;
     public CommitFailurePolicy commit_failure_policy = CommitFailurePolicy.stop;
@@ -120,6 +121,7 @@ public class Config
     public int memtable_flush_writers = 0;
     public Integer memtable_heap_space_in_mb;
     public Integer memtable_offheap_space_in_mb;
+    public boolean disable_stcs_inl0; ////////////////////////
     public Float memtable_cleanup_threshold = null;
 
     public int storage_port = 7000;

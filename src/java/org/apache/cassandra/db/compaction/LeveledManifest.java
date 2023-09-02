@@ -333,7 +333,7 @@ public class LeveledManifest
             if (!mostInteresting.isEmpty())
             {
                 logger.info("Bootstrapping - doing STCS in L0");
-                return new CompactionCandidate(mostInteresting, 0, Long.MAX_VALUE);
+                return new CompactionCandidate(mostInteresting, 0, Long.MAX_VALUE); //////
             }
             return null;
         }
@@ -364,7 +364,50 @@ public class LeveledManifest
         // This isn't a magic wand -- if you are consistently writing too fast for LCS to keep
         // up, you're still screwed.  But if instead you have intermittent bursts of activity,
         // it can help a lot.
-        for (int i = generations.length - 1; i > 0; i--)
+        //for (int i = 0; i < generations.length; i++)
+
+    if(cfs.name.equals("globalReplicaTable")){//////
+
+        if(StorageService.instance.totalSizeOfGlobalLog > 21700160){ //31700160
+            StorageService.instance.minSplitSSTableNum = 30; 
+            StorageService.instance.splitSSTableNum = 30; 
+        }
+        if(StorageService.instance.totalSizeOfGlobalLog > 41700160){ //51700160
+            StorageService.instance.minSplitSSTableNum = 40; 
+            StorageService.instance.splitSSTableNum = 40;
+        }
+        /*if(StorageService.instance.totalSizeOfGlobalLog > 61700160){
+            StorageService.instance.minSplitSSTableNum = 50; 
+            StorageService.instance.splitSSTableNum = 50; 
+        }*/
+
+        if (getLevel(0).size() > StorageService.instance.maxGlobalSSTableNum) {
+            List<SSTableReader> mostInteresting = getCandidatesForGlobalLog();
+            long pickedTotalSize = SSTableReader.getTotalBytes(mostInteresting)/1024;
+            logger.debug("mostInteresting size:{}, cfs.name:{}, getLevel(0).size:{}", mostInteresting.size(), cfs.name, getLevel(0).size());
+            if (!mostInteresting.isEmpty() && mostInteresting.size() >= StorageService.instance.splitSSTableNum && pickedTotalSize > StorageService.instance.minSplitDataSize){
+            //if (!mostInteresting.isEmpty() && mostInteresting.size() >= StorageService.instance.maxGlobalSSTableNum){
+                List<SSTableReader> pickedForSplit = new ArrayList<SSTableReader>();
+                int count=0;
+                for (SSTableReader curReader : mostInteresting){
+                    pickedForSplit.add(curReader);
+                    count++;
+                    //if (StorageService.instance.splitSSTableNum == count) break;
+                    //if(pickedForSplit.size() == StorageService.instance.splitSSTableNum) break; 
+                }
+                logger.debug("performing split first, mostInteresting size:{}, pickedForSplit size:{}, cfs.name:{}, pickedTotalSize:{}", mostInteresting.size(), pickedForSplit.size(), cfs.name, pickedTotalSize);
+                return new CompactionCandidate(pickedForSplit, 1, Long.MAX_VALUE);
+            }else{
+                logger.debug("mostInteresting is too small, mostInteresting.size:{}, cfs.name:{}", mostInteresting.size(), cfs.name);
+                return null;
+            }
+        }else{
+            logger.debug("-----L0 is too far behind, performing split first, getLevel(0) size:{}, cfs.name:{}", getLevel(0).size(), cfs.name);
+            return null;
+        }
+    }else{//////
+        //for (int i = generations.length - 1; i > 0; i--)
+        for (int i = 0; i < generations.length; i++)
         {
             List<SSTableReader> sstables = getLevel(i);
             if (sstables.isEmpty())
@@ -374,13 +417,16 @@ public class LeveledManifest
             Set<SSTableReader> remaining = Sets.difference(sstablesInLevel, cfs.getTracker().getCompacting());
             double score = (double) SSTableReader.getTotalBytes(remaining) / (double)maxBytesForLevel(i, maxSSTableSizeInBytes);
             logger.trace("Compaction score for level {} is {}", i, score);
-
-            if (score > 1.001)
+            logger.debug("Compaction score for level {} is {}, maxSize:{}", i, score, (double)maxBytesForLevel(i, maxSSTableSizeInBytes));
+            //if (score > 1.001)
+            if (score > 1.001 || i==0)
             {
                 // before proceeding with a higher level, let's see if L0 is far enough behind to warrant STCS
                 CompactionCandidate l0Compaction = getSTCSInL0CompactionCandidate();
-                if (l0Compaction != null)
+                if (l0Compaction != null){
+                    logger.debug("in getCompactionCandidates l0Compaction, cfs:{}, sstables num:{}, level:{}", cfs, l0Compaction.sstables.size(), l0Compaction.level);
                     return l0Compaction;
+                }
 
                 // L0 is fine, proceed with this level
                 Collection<SSTableReader> candidates = getCandidatesFor(i);
@@ -398,6 +444,7 @@ public class LeveledManifest
                 }
             }
         }
+    }//////
 
         // Higher levels are happy, time for a standard, non-STCS L0 compaction
         if (getLevel(0).isEmpty())
@@ -503,6 +550,25 @@ public class LeveledManifest
 
         return candidates;
     }
+
+    public void printEachLevelSize(){
+        if(!cfs.name.equals("globalReplicaTable")){
+            StorageService.instance.SSTableNumOfL0 = getLevel(0).size(); //////
+            List<SSTableReader> sstables = getLevel(0);
+            StorageService.instance.totalSizeOfPrimaryL0 = SSTableReader.getTotalBytes(sstables)/1024;
+        }else{
+            StorageService.instance.SSTableNumOfGLog = getLevel(0).size(); //////
+            List<SSTableReader> sstables = getLevel(0);
+            StorageService.instance.totalSizeOfGlobalLog = SSTableReader.getTotalBytes(sstables)/1024;
+        }
+        logger.debug("######SSTableNumOfL0:{}, SSTableNumOfGLog:{}", StorageService.instance.SSTableNumOfL0, StorageService.instance.SSTableNumOfGLog);
+        logger.debug("######totalCompactWrite:{} MB, readCommandNum:{}, totalReadBytes:{} totalSSTablesChecked:{}, totalSSTablesView:{}", StorageService.instance.totalCompactWrite, StorageService.instance.readCommandNum, StorageService.instance.totalReadBytes, StorageService.instance.totalSSTablesChecked, StorageService.instance.totalSSTablesView);
+        for (int i = 0; i < generations.length; i++){
+                List<SSTableReader> sstables = getLevel(i);
+                Long size= SSTableReader.getTotalBytes(sstables);
+                logger.debug("--------Level:{} SSTable number:{}, size: {} MB, compactSize:{} MB", i, sstables.size(), size/1048576, StorageService.instance.totalLevelWrite[i]);
+        }
+    }   
 
     public synchronized int getLevelSize(int i)
     {
@@ -618,6 +684,61 @@ public class LeveledManifest
         }
         return boundsMap;
     }
+
+    private List<SSTableReader> getCandidatesForGlobalLog()
+    {
+        assert !getLevel(0).isEmpty();
+        logger.trace("----Choosing candidates for L{}", 0);
+        long totalCandidatesSize = 0;
+        final Set<SSTableReader> compacting = cfs.getTracker().getCompacting();
+
+            Set<SSTableReader> compactingL0 = getCompacting(0);
+
+            PartitionPosition lastCompactingKey = null;
+            PartitionPosition firstCompactingKey = null;
+            for (SSTableReader candidate : compactingL0)
+            {
+                if (firstCompactingKey == null || candidate.first.compareTo(firstCompactingKey) < 0)
+                    firstCompactingKey = candidate.first;
+                if (lastCompactingKey == null || candidate.last.compareTo(lastCompactingKey) > 0)
+                    lastCompactingKey = candidate.last;
+            }
+
+           
+            List<SSTableReader> candidates = new ArrayList<>();
+            Map<SSTableReader, Bounds<Token>> remaining = genBounds(Iterables.filter(getLevel(0), Predicates.not(suspectP)));
+
+            for (SSTableReader sstable : ageSortedSSTables(remaining.keySet()))
+            {
+                if (candidates.contains(sstable))
+                    continue;
+
+                Sets.SetView<SSTableReader> overlappedL0 = Sets.union(Collections.singleton(sstable), overlappingWithBounds(sstable, remaining));
+                if (!Sets.intersection(overlappedL0, compactingL0).isEmpty())
+                    continue;
+
+                for (SSTableReader newCandidate : overlappedL0)
+                {
+                    if (firstCompactingKey == null || lastCompactingKey == null || overlapping(firstCompactingKey.getToken(), lastCompactingKey.getToken(), Arrays.asList(newCandidate)).size() == 0){
+                        candidates.add(newCandidate);
+                        totalCandidatesSize = totalCandidatesSize + newCandidate.bytesOnDisk();
+                    }
+                    remaining.remove(newCandidate);
+                    if (candidates.size() >= (StorageService.instance.splitSSTableNum+2) && totalCandidatesSize/1024 > 2985728) break; //3985728
+                }
+
+                if (candidates.size() >= (StorageService.instance.splitSSTableNum+2) && totalCandidatesSize/1024 > StorageService.instance.minSplitDataSize)
+                {
+                    // limit to only the StorageService.instance.splitSSTableNum oldest candidates
+                    // SSTableReader.getTotalBytes(candidates)
+                    //candidates = new ArrayList<>(ageSortedSSTables(candidates).subList(0, StorageService.instance.splitSSTableNum));
+                    candidates = new ArrayList<>(ageSortedSSTables(candidates));
+                    break;
+                }
+            }
+
+            return candidates;
+        }
 
     /**
      * @return highest-priority sstables to compact for the given level.
@@ -821,6 +942,7 @@ public class LeveledManifest
         int newLevel;
         if (minimumLevel == 0 && minimumLevel == maximumLevel && SSTableReader.getTotalBytes(sstables) < maxSSTableSizeInBytes)
         {
+            logger.debug("######maxSSTableSizeInBytes: {}, SSTableReader.getTotalBytes: {}", maxSSTableSizeInBytes, SSTableReader.getTotalBytes(sstables));
             newLevel = 0;
         }
         else
@@ -846,12 +968,14 @@ public class LeveledManifest
     {
         public final Collection<SSTableReader> sstables;
         public final int level;
+        //public final int outputLevel; /////
         public final long maxSSTableBytes;
 
         public CompactionCandidate(Collection<SSTableReader> sstables, int level, long maxSSTableBytes)
         {
             this.sstables = sstables;
             this.level = level;
+            //this.outputLevel = outputLevel; //////
             this.maxSSTableBytes = maxSSTableBytes;
         }
     }

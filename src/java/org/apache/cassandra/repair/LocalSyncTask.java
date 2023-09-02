@@ -69,6 +69,7 @@ public class LocalSyncTask extends SyncTask implements StreamEventHandler
 
         String message = String.format("Performing streaming repair of %d ranges with %s", differences.size(), dst);
         logger.info("[repair #{}] {}", desc.sessionId, message);
+        logger.debug("in LocalSyncTask， [repair #{}] {}", desc.sessionId, message);
         boolean isIncremental = false;
         if (desc.parentSessionId != null)
         {

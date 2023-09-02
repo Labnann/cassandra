@@ -102,6 +102,38 @@ import static java.util.stream.Collectors.toList;
 import static org.apache.cassandra.index.SecondaryIndexManager.getIndexName;
 import static org.apache.cassandra.index.SecondaryIndexManager.isIndexColumnFamily;
 
+import java.io.*;
+import java.util.zip.GZIPInputStream;
+import java.util.zip.GZIPOutputStream;
+import java.util.zip.Deflater;
+import java.util.zip.Inflater;
+import java.util.zip.DataFormatException;
+import java.util.concurrent.locks.ReentrantLock;
+import org.apache.cassandra.io.sstable.Descriptor;
+import org.apache.cassandra.io.sstable.SSTable;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.sstable.ISSTableScanner;
+import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.db.Mutation;
+import org.apache.cassandra.db.filter.ColumnFilter;
+import org.apache.cassandra.db.partitions.PartitionUpdate;
+import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+import org.apache.cassandra.utils.concurrent.Refs;
+import java.nio.*;
+import java.util.LinkedList;
+import java.util.Queue;
+
+import org.iq80.twoLayerLog.Options;
+import org.iq80.twoLayerLog.ReadOptions;
+import org.iq80.twoLayerLog.WriteOptions;
+import org.iq80.twoLayerLog.impl.DbImpl;
+import org.iq80.twoLayerLog.util.Slice;
+import org.iq80.twoLayerLog.util.SliceInput;
+import org.iq80.twoLayerLog.util.SliceOutput;
+import org.iq80.twoLayerLog.util.Slices;
+import org.apache.cassandra.repair.Validator;
+import org.iq80.twoLayerLog.impl.*;
+
 /**
  * This abstraction contains the token/identifier of this node
  * on the identifier space. This token gets gossiped around.
@@ -146,6 +178,81 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
     private volatile boolean isShutdown = false;
     private final List<Runnable> preShutdownHooks = new ArrayList<>();
     private final List<Runnable> postShutdownHooks = new ArrayList<>();
+
+    public DbImpl db;
+    public InetAddress repairNode = null;
+    public int splitDelay = 60; 
+    public int minSplitSSTableNum = 20; 
+    public int splitSSTableNum = 20;
+    public int maxGlobalSSTableNum = 30; 
+    public static int maxSegNumofGroup = 20; 
+    public boolean FlushTriggeredCompaction = true;
+    public static long minSplitDataSize = 2085728;
+    public boolean duringRepair = false;
+    public InetAddress repairNodeIP = null; 
+    public boolean doingGlobalSplit = false;
+    public boolean doingGroupMerge = false;
+    public int maxScanNumber = 10;
+    public static final int replicaBufferSize = 13 * 1048576;
+    public ColumnFamilyStore largestCFS = null;
+    public Map<String,Integer> groupAccessNumMap=new HashMap<String,Integer>();
+  
+    public ExecutorService splitExecutor = Executors.newFixedThreadPool(40);
+    public ExecutorService groupMergeExecutor = Executors.newFixedThreadPool(5);
+    public Map<String,CountDownLatch> groupCountDownMap = new HashMap<String,CountDownLatch>();
+
+    public ConsistencyLevel WriteConsistencyLevel = ConsistencyLevel.ONE;
+    public Queue<byte[]> dataByteQueue = new LinkedList<byte[]>();
+    public Queue<byte[]> MetaByteQueue = new LinkedList<byte[]>();
+
+    public long totalSizeOfGlobalLog = 0;
+    public long totalSizeOfPrimaryL0 = 0;
+    public int SSTableNumOfL0 = 0;
+    public int SSTableNumOfGLog = 0;
+    public long buildMTrees = 0;
+    public long compareMTrees = 0;
+    public long[] recieveWriteData =  new long[30];
+    public long recieveWriteLSM = 0;
+    public long beginMTrees = 0;
+    public long maxTime = 0;
+    public long[] sessionBuildMTreeTime = new long[20];
+    public int sessionCount = 0;
+
+    public long DifferentiationTime = 0;
+    public long DifferentiationNaTime = 0;
+
+    public long insertMemTable = 0;
+    public long insertLog = 0;
+    public long flushMemTable = 0;
+    public long compaction = 0;
+    public long mergeSort = 0;
+    public long mergeSortNum = 0;
+
+    public long readMemTable = 0;
+    public long readRowCache = 0;
+    public long readKeyCache = 0;
+    public long readIndexBlock = 0;
+    public long readSSTables = 0;
+    public int transferingFiles = 0;
+
+    public long totalReadBytes = 0;
+    public long ReadGroupBytes = 0;
+    public long totalCompactWrite = 0;
+    public long writeGroupBytes = 0;
+    public long readCommandNum = 0;
+    public long totalSSTablesChecked = 0;
+    public long totalSSTablesView = 0;
+    public long[] totalLevelWrite = new long[20];
+
+    public Map<Integer, BlockingQueue<ByteBuffer>> replicaBlockMap = new HashMap<Integer, BlockingQueue<ByteBuffer>>();
+    public Map<Integer, BlockingQueue<byte[]>> ECBlockMap = new HashMap<Integer, BlockingQueue<byte[]>>();
+    public Map<Integer, BlockingQueue<byte[]>> keyMap = new HashMap<Integer, BlockingQueue<byte[]>>();
+    public Map<Integer, BlockingQueue<byte[]>> valueMap = new HashMap<Integer, BlockingQueue<byte[]>>();
+
+    public BlockingQueue<Collection<Descriptor>> replayMigratedSSTablesDes = new ArrayBlockingQueue<Collection<Descriptor>>(2);
+    public ColumnFamilyStore migartedCFS = null;
+
+    public InetAddress localIP = FBUtilities.getBroadcastAddress();
 
     public static final StorageService instance = new StorageService();
 
@@ -220,6 +327,7 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
 
     private final StreamStateStore streamStateStore = new StreamStateStore();
 
+
     public boolean isSurveyMode()
     {
         return isSurveyMode;
@@ -255,12 +363,31 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
     {
         // use dedicated executor for sending JMX notifications
         super(Executors.newSingleThreadExecutor());
+        logger.info("**********path:{}",System.getProperty("java.library.path"));
 
         jmxObjectName = "org.apache.cassandra.db:type=StorageService";
         MBeanWrapper.instance.registerMBean(this, jmxObjectName);
         MBeanWrapper.instance.registerMBean(StreamManager.instance, StreamManager.OBJECT_NAME);
 
         legacyProgressSupport = new LegacyJMXProgressSupport(this, jmxObjectName);
+
+        for(int i=0; i<20; i++){
+            totalLevelWrite[i]=0;
+        }
+
+        /*
+        dataByteQueue.clear();
+        for(int i=0; i<100; i++){ //
+            byte[] dataByte = new byte[32*1024];
+            dataByteQueue.add(dataByte);
+        }
+
+        MetaByteQueue.clear();
+        for(int i=0; i<30; i++){
+            //byte[] dataByte = new byte[12*1024*1024];//16
+            byte[] dataByte = new byte[1*1024*1024];//16
+            MetaByteQueue.add(dataByte);
+        }*/
 
         /* register the verb handlers */
         MessagingService.instance().registerVerbHandlers(MessagingService.Verb.MUTATION, new MutationVerbHandler());
@@ -3654,6 +3781,120 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
         return repairingRange;
     }
 
+    public String findBoundTokenAccordingTokeny(String token){//int nodeID
+
+        Token lookToken = getTokenFactory().fromString(token);
+        ArrayList<Token> tokens = new ArrayList<>(tokenMetadata.sortedTokens());
+        Iterator<Token> iter = TokenMetadata.ringIterator(tokens, lookToken, false);
+        Token boundToken = iter.next();
+        //InetAddress ep = tokenMetadata.getEndpoint(boundToken);
+        //logger.debug("###token:{}, lookToken:{}, boundToken:{}, node IP:{}", token, lookToken, boundToken, ep);
+        return getTokenFactory().toString(boundToken);
+
+    }
+
+    public int findNodeIDAccordingToken(String dbKeySpaceName, String token){//
+
+        //logger.debug("------dbKeySpaceName:{}, token:{}", dbKeySpaceName, token);
+        Token lookToken = getTokenFactory().fromString(token);
+        List<InetAddress> ep = getNaturalEndpoints(dbKeySpaceName, lookToken);
+		byte ip[] = ep.get(0).getAddress();  
+		int nodeID = (int)ip[3];      
+        //logger.debug("------token:{}, lookToken:{}, node IP:{}", token, lookToken, ep);
+        return nodeID;
+
+    }
+
+    public void printInfo(String info){
+        logger.debug("@@@@@@:{}", info);
+    }
+
+    public Token getBoundToken(Token lookToken){//int nodeID
+
+        //Token lookToken = getTokenFactory().fromString(token);
+        ArrayList<Token> tokens = new ArrayList<>(tokenMetadata.sortedTokens());
+        Iterator<Token> iter = TokenMetadata.ringIterator(tokens, lookToken, false);
+        Token boundToken = iter.next();
+        //InetAddress ep = tokenMetadata.getEndpoint(boundToken);
+        //logger.debug("###token:{}, lookToken:{}, boundToken:{}, node IP:{}, nodeID:{}", token, lookToken, boundToken, ep, nodeID);
+        //return getTokenFactory().toString(boundToken);
+        return boundToken;
+    }
+
+    public void getRangeBoundToken(Token lookToken, Token endToken, List<Token> tokenArray, String keySpaceName){//int nodeID
+
+        //Token lookToken = getTokenFactory().fromString(token);
+        ArrayList<Token> tokens = new ArrayList<>(tokenMetadata.sortedTokens());
+        Iterator<Token> iter = TokenMetadata.ringIterator(tokens, lookToken, false);
+        List<InetAddress> primaryIP = getNaturalEndpoints(keySpaceName, lookToken);
+        //Token boundToken = iter.next();
+        while(iter.hasNext()){
+            Token boundToken = iter.next();
+            List<InetAddress> IP = getNaturalEndpoints(keySpaceName, boundToken);
+            if(primaryIP.get(0).equals(IP.get(0))){
+                tokenArray.add(boundToken);
+            }
+            if(boundToken.equals(endToken)) break;
+        }
+        //InetAddress ep = tokenMetadata.getEndpoint(boundToken);
+        //logger.debug("###token:{}, lookToken:{}, boundToken:{}, node IP:{}, nodeID:{}", token, lookToken, boundToken, ep, nodeID);
+        //return getTokenFactory().toString(boundToken);
+        //return boundToken;
+    }
+
+    public String getBoundTokenString(Token lookToken){//int nodeID
+
+        //Token lookToken = getTokenFactory().fromString(token);
+        ArrayList<Token> tokens = new ArrayList<>(tokenMetadata.sortedTokens());
+        Iterator<Token> iter = TokenMetadata.ringIterator(tokens, lookToken, false);
+        Token boundToken = iter.next();
+        //InetAddress ep = tokenMetadata.getEndpoint(boundToken);
+        //logger.debug("###token:{}, lookToken:{}, boundToken:{}, node IP:{}, nodeID:{}", token, lookToken, boundToken, ep, nodeID);
+        return getTokenFactory().toString(boundToken);      
+    }
+
+    public int getRangeGroupRowNumber(int NodeID, Token right){
+        int rangeGroupRowNumber = db.getRangeGroupRowNumber(NodeID, getTokenFactory().toString(right));
+        return rangeGroupRowNumber;
+    }
+
+    public long getGlobalLogSize(long segmentID){
+        long globalLogSize = db.getGlobalLogSize(segmentID);
+        return globalLogSize;
+    }
+
+    public int getRangeGroupSegemntNumber(int NodeID, Token right){
+        int rangeGroupSegmentNumber = db.getRangeGroupSegemntNumber(NodeID, getTokenFactory().toString(right));
+        return rangeGroupSegmentNumber;
+    }
+
+    public long[] getGroupSegementID(int NodeID, Token right){
+        long[] segmentID = db.getGroupSegementID(NodeID, getTokenFactory().toString(right));
+        return segmentID;
+    }
+
+    public long[] getGlobalSegementID(){
+        long[] globalSegmentID = db.getGlobalSegementID();
+        return globalSegmentID;
+    }
+
+    public void getGroupAllBytes(String keyspace, int NodeID, Token left, Token right, Token rightBound, FileMetaData fileMeta, boolean globalFlag, List<ByteBuffer> rangeGroupBufferList){
+        db.getGroupAllBytes(keyspace, NodeID, getTokenFactory().toString(left), getTokenFactory().toString(right), getTokenFactory().toString(rightBound), fileMeta, rangeGroupBufferList);
+    }
+
+    public boolean globalSegmentIsExist(long segmentID){
+        return db.globalSegmentIsExist(segmentID);
+    }
+
+    public int getRangeRowAndInsertValidator(int NodeID, Token rangeLeft, Token rangeRight, Map<String, byte[]> keyValueMap){
+        return db.getRangeRowAndInsertValidator(NodeID, getTokenFactory().toString(rangeLeft), getTokenFactory().toString(rangeRight), keyValueMap);
+    }
+
+    /*public ByteBuffer getGroupAllBytes(int NodeID, Token right, int offset){
+        return db.getGroupAllBytes(NodeID, getTokenFactory().toString(right), offset);
+    
+    }*/
+
     public TokenFactory getTokenFactory()
     {
         return tokenMetadata.partitioner.getTokenFactory();
@@ -3843,6 +4084,7 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
      */
     public List<InetAddress> getLiveNaturalEndpoints(Keyspace keyspace, ByteBuffer key)
     {
+        logger.debug("int getLiveNaturalEndpoints, key:{}", key);
         return getLiveNaturalEndpoints(keyspace, tokenMetadata.decorateKey(key));
     }
 
@@ -3850,6 +4092,8 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
     {
         List<InetAddress> liveEps = new ArrayList<>();
         getLiveNaturalEndpoints(keyspace, pos, liveEps);
+        //logger.debug("int getLiveNaturalEndpoints, pos:{}, liveEps:{}", pos, liveEps);
+        
         return liveEps;
     }
 
@@ -4572,8 +4816,13 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
             List<Future<?>> flushes = new ArrayList<>();
             for (Keyspace keyspace : Keyspace.nonSystem())
             {
-                for (ColumnFamilyStore cfs : keyspace.getColumnFamilyStores())
+                for (ColumnFamilyStore cfs : keyspace.getColumnFamilyStores()){
                     flushes.add(cfs.forceFlush());
+                    /*if(cfs.getCFSMemTableSize() > 10485760){
+                        logger.debug("###flushing memtable, size: {}", cfs.getCFSMemTableSize());
+                        flushes.add(cfs.forceFlush());
+                    }*/
+                }               
             }
             // wait for the flushes.
             // TODO this is a godawful way to track progress, since they flush in parallel.  a long one could
@@ -4604,8 +4853,13 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
             flushes.clear();
             for (Keyspace keyspace : Keyspace.system())
             {
-                for (ColumnFamilyStore cfs : keyspace.getColumnFamilyStores())
+                for (ColumnFamilyStore cfs : keyspace.getColumnFamilyStores()){
                     flushes.add(cfs.forceFlush());
+                    /*if(cfs.getCFSMemTableSize() > 10485760){
+                        logger.debug("##flushing memtable, size: {}", cfs.getCFSMemTableSize());
+                        flushes.add(cfs.forceFlush());
+                    }*/
+                }
             }
             FBUtilities.waitOnFutures(flushes);
 

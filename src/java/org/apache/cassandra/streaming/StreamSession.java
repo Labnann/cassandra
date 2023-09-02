@@ -53,6 +53,10 @@ import org.apache.cassandra.utils.JVMStabilityInspector;
 import org.apache.cassandra.utils.Pair;
 import org.apache.cassandra.utils.concurrent.Ref;
 import org.apache.cassandra.utils.concurrent.Refs;
+import org.apache.cassandra.service.StorageService;
+
+import org.iq80.twoLayerLog.impl.*;
+
 
 /**
  * Handles the streaming a one or more section of one of more sstables to and from a specific
@@ -308,12 +312,69 @@ public class StreamSession implements IEndpointStateChangeSubscriber
     public synchronized void addTransferRanges(String keyspace, Collection<Range<Token>> ranges, Collection<String> columnFamilies, boolean flushTables, long repairedAt)
     {
         failIfFinished();
-        Collection<ColumnFamilyStore> stores = getColumnFamilyStores(keyspace, columnFamilies);
+        Collection<ColumnFamilyStore> stores = getColumnFamilyStores(keyspace, columnFamilies); //////
         if (flushTables)
             flushSSTables(stores);
 
-        List<Range<Token>> normalizedRanges = Range.normalize(ranges);
-        List<SSTableStreamingSections> sections = getSSTableSectionsForRanges(normalizedRanges, stores, repairedAt, isIncremental);
+        logger.debug("ranges size:{}", ranges.size());
+        //List<Range<Token>> normalizedRanges = Range.normalize(ranges);
+        List<Range<Token>> mainRanges = new ArrayList<Range<Token>>(ranges.size());
+        List<Range<Token>> replicaRanges = new ArrayList<Range<Token>>(ranges.size());
+        Map<Token,Range<Token>> rightBoundMap = new HashMap<Token,Range<Token>>();
+        InetAddress LOCAL = FBUtilities.getBroadcastAddress();
+        //logger.debug("normalizedRanges size:{}", normalizedRanges.size());
+        //for(Range<Token> curRange: normalizedRanges){
+        for(Range<Token> curRange: ranges){
+            List<InetAddress> ep = StorageService.instance.getNaturalEndpoints(keyspace, curRange.right);
+            if (ep.get(0).equals(LOCAL)) {  
+                mainRanges.add(curRange);
+            }else{
+                //Range<Token> newRange;
+                replicaRanges.add(curRange);
+                Token rightBound = StorageService.instance.getBoundToken(curRange.right);
+                rightBoundMap.put(rightBound, curRange);                      
+            }
+            //logger.debug("range left:{}, range right:{}, IP of main range:{}, LOCAL:{}", curRange.left, curRange.right, ep.get(0), LOCAL);
+        }
+        ////////////////////////////////////////
+        UUID cfId = UUID.randomUUID();
+        logger.debug("rightBoundMap size:{}", rightBoundMap.size());
+        List<FileMetaData> groupMetaList = new ArrayList<FileMetaData>();
+
+        for (Map.Entry<Token,Range<Token>> boundEntry: rightBoundMap.entrySet()) {
+            groupMetaList.clear();
+            List<InetAddress> ep = StorageService.instance.getNaturalEndpoints(keyspace, boundEntry.getKey());
+            byte ip[] = ep.get(0).getAddress();  
+            int NodeID = (int)ip[3];                   
+            //long[] segmentID = StorageService.instance.getGroupSegementID(NodeID, boundEntry.getKey());
+            StorageService.instance.db.getGroupFileMeta(StorageService.instance.getTokenFactory().toString(boundEntry.getKey()), groupMetaList);
+            logger.debug("--nodeID:{}, rightBound:{}", NodeID, boundEntry.getKey());   
+            //if(segmentID!=null){
+            if(groupMetaList!=null && groupMetaList.size() > 0){
+                logger.debug("--groupMetaList size:{}", groupMetaList.size());   
+                Range<Token> curRange = boundEntry.getValue();                    
+                addTransferReplicaFile(cfId, NodeID, curRange.left, curRange.right, boundEntry.getKey(), groupMetaList, false, keyspace); 
+            }                
+        }
+
+        ///////////////////////////////////////
+        //List<Range<Token>> mainNormalizedRanges = Range.normalize(ranges);
+        List<Range<Token>> mainNormalizedRanges = Range.normalize(mainRanges);
+        logger.debug("ranges size:{}, mainNormalizedRanges:{}, mainRanges size:{}, replicaRanges size:{}, stores:{}", ranges.size(), mainNormalizedRanges.size(), mainRanges.size(), replicaRanges.size(), stores);
+        //List<SSTableStreamingSections> sections = getSSTableSectionsForRanges(normalizedRanges, stores, repairedAt, isIncremental);
+        List<SSTableStreamingSections> sections = getSSTableSectionsForRanges(mainNormalizedRanges, stores, repairedAt, isIncremental);
+        //@param ranges Transfer ranges
+        logger.debug("Beginning addTransferRanges, sections size:{}", sections.size());
+        Iterator<SSTableStreamingSections> iter = sections.iterator();
+        /*while (iter.hasNext())
+        {
+            logger.debug("in addTransferRanges iter.hasNext");
+            SSTableStreamingSections details = iter.next();
+            if (details.sections.isEmpty())
+            {
+                 logger.debug("in addTransferRanges, details.sections.isEmpty");
+            }
+        }*/
         try
         {
             addTransferFiles(sections);
@@ -350,6 +411,8 @@ public class StreamSession implements IEndpointStateChangeSubscriber
         {
             for (String cf : columnFamilies)
                 stores.add(Keyspace.open(keyspace).getColumnFamilyStore(cf));
+
+            stores.add(Keyspace.open(keyspace).getColumnFamilyStore("globalReplicaTable"));//////
         }
         return stores;
     }
@@ -362,6 +425,8 @@ public class StreamSession implements IEndpointStateChangeSubscriber
         {
             for (ColumnFamilyStore cfStore : stores)
             {
+                //if(cfStore.name.equals("globalReplicaTable")) continue; //////
+
                 final List<Range<PartitionPosition>> keyRanges = new ArrayList<>(ranges.size());
                 for (Range<Token> range : ranges)
                     keyRanges.add(Range.makeRowRange(range));
@@ -431,11 +496,38 @@ public class StreamSession implements IEndpointStateChangeSubscriber
                 //guarantee atomicity
                 StreamTransferTask newTask = new StreamTransferTask(this, cfId);
                 task = transfers.putIfAbsent(cfId, newTask);
+                logger.debug("in new StreamTransferTask, task == null:{}", task == null);
                 if (task == null)
                     task = newTask;
             }
-            task.addTransferFile(details.ref, details.estimatedKeys, details.sections, details.repairedAt);
+            logger.debug("before task.addTransferFile");
+            int migrationFlag = 0;
+
+            task.addTransferFile(details.ref, details.estimatedKeys, details.sections, details.repairedAt, migrationFlag);
             iter.remove();
+        }
+    }
+
+    //public synchronized void addTransferReplicaFile(ByteBuffer replicaFile)
+    public synchronized void addTransferReplicaFile(UUID cfId, int NodeID, Token left, Token right, Token rightBound, List<FileMetaData> groupMetaList, boolean globalFlag, String keyspace) 
+    {
+        failIfFinished();
+        for (FileMetaData fileMeta : groupMetaList) {          
+            StorageService.instance.transferingFiles++;
+            logger.debug("nodeID:{}, group:{}, rightBound:{}, fileMeta:{}, transferingFiles:{}", NodeID, right, rightBound, fileMeta, StorageService.instance.transferingFiles);
+            StreamTransferTask task = transfers.get(cfId);
+            if (task == null)
+            {
+                //guarantee atomicity
+                StreamTransferTask newTask = new StreamTransferTask(this, cfId);
+                task = transfers.putIfAbsent(cfId, newTask);
+                logger.debug("in new StreamTransferTask2222, task == null:{}", task == null);
+                if (task == null)
+                    task = newTask;
+            }
+            //task.addTransferReplicaFile(replicaFile, cfId);
+            fileMeta.flagR = 1;
+            task.addTransferReplicaFile(cfId, NodeID, left, right, rightBound, fileMeta, globalFlag, keyspace);
         }
     }
 
@@ -521,6 +613,10 @@ public class StreamSession implements IEndpointStateChangeSubscriber
 
             case FILE:
                 receive((IncomingFileMessage) message);
+                break;
+
+            case REPLICAFILE:
+                receiveReplicaFile((IncomingReplicaFileMessage) message);
                 break;
 
             case RECEIVED:
@@ -653,7 +749,24 @@ public class StreamSession implements IEndpointStateChangeSubscriber
         metrics.incomingBytes.inc(headerSize);
         // send back file received message
         handler.sendMessage(new ReceivedMessage(message.header.cfId, message.header.sequenceNumber));
-        receivers.get(message.header.cfId).received(message.sstable);
+        receivers.get(message.header.cfId).received(message.sstable, message.migrationFlag);
+    }
+
+    /**
+     * Call back after receiving replica file.
+     *
+     * @param message received replica file
+     */
+    public void receiveReplicaFile(IncomingReplicaFileMessage message)
+    {
+        //if message is replica file, message.ECTag == 2
+        // just send back ECBlock received message
+        logger.debug("in receiveReplicaFile, SreamSession cfId:{}, sequenceNumber:{}",message.cfId, message.sequenceNumber);
+        if (handler.isOutgoingConnected()){
+            handler.sendMessage(new ReceivedMessage(message.cfId, message.sequenceNumber));
+        }
+        if(receivers.get(message.cfId)!=null) receivers.get(message.cfId).receivedReplica();
+        logger.debug("in receiveReplicaFile, after receivers.get(cfId).receivedReplica");
     }
 
     public void progress(String filename, ProgressInfo.Direction direction, long bytes, long total)
@@ -784,8 +897,9 @@ public class StreamSession implements IEndpointStateChangeSubscriber
     private void flushSSTables(Iterable<ColumnFamilyStore> stores)
     {
         List<Future<?>> flushes = new ArrayList<>();
-        for (ColumnFamilyStore cfs : stores)
+        for (ColumnFamilyStore cfs : stores){
             flushes.add(cfs.forceFlush());
+        }
         FBUtilities.waitOnFutures(flushes);
     }
 
@@ -821,6 +935,7 @@ public class StreamSession implements IEndpointStateChangeSubscriber
             if (last == null || last.wasSent())
             {
                 logger.trace("[Stream #{}] Sending keep-alive to {}.", planId(), peer);
+                //logger.debug("totalSSTablesChecked:{}, totalSSTablesView:{}",  StorageService.instance.totalSSTablesChecked, StorageService.instance.totalSSTablesView);
                 last = new KeepAliveMessage();
                 try
                 {

@@ -52,6 +52,11 @@ import org.apache.cassandra.utils.JVMStabilityInspector;
 import org.apache.cassandra.utils.Pair;
 import org.apache.cassandra.utils.Throwables;
 import org.apache.cassandra.utils.concurrent.Refs;
+import org.apache.cassandra.dht.*;
+
+import org.apache.cassandra.io.sstable.Descriptor;
+import org.apache.cassandra.io.sstable.SSTable;
+import org.apache.cassandra.service.StorageService;
 
 /**
  * Task that manages receiving files for the session for certain ColumnFamily.
@@ -78,6 +83,8 @@ public class StreamReceiveTask extends StreamTask
 
     private int remoteSSTablesReceived = 0;
 
+    public int migrationFlag = 0;
+
     public StreamReceiveTask(StreamSession session, UUID cfId, int totalFiles, long totalSize)
     {
         super(session, cfId);
@@ -87,6 +94,8 @@ public class StreamReceiveTask extends StreamTask
         // this should be revisited at a later date, so that LifecycleTransaction manages all sstable state changes
         this.txn = LifecycleTransaction.offline(OperationType.STREAM);
         this.sstables = new ArrayList<>(totalFiles);
+
+        this.migrationFlag = 0;
     }
 
     /**
@@ -94,8 +103,10 @@ public class StreamReceiveTask extends StreamTask
      *
      * @param sstable SSTable file received.
      */
-    public synchronized void received(SSTableMultiWriter sstable)
+    public synchronized void received(SSTableMultiWriter sstable, int migration)
     {
+
+    if(migration==0){
         if (done)
         {
             logger.warn("[{}] Received sstable {} on already finished stream received task. Aborting sstable.", session.planId(),
@@ -103,6 +114,7 @@ public class StreamReceiveTask extends StreamTask
             Throwables.maybeFail(sstable.abort(null));
             return;
         }
+        migrationFlag = migration;
 
         remoteSSTablesReceived++;
         assert cfId.equals(sstable.getCfId());
@@ -116,11 +128,55 @@ public class StreamReceiveTask extends StreamTask
         {
             Throwables.maybeFail(sstable.abort(t));
         }
+        logger.debug("[{}] Received sstable {} from:{}", session.planId(), sstable.getFilename(), session.peer);
         txn.update(finished, false);
         sstables.addAll(finished);
 
         if (remoteSSTablesReceived == totalFiles)
         {
+            done = true;
+            executor.submit(new OnCompletionRunnable(this));
+        }
+    }else{
+        if (done)
+        {
+            logger.debug("[{}] Received replicaFile  on already finished stream received task. Aborting sstable.", session.planId());
+            Throwables.maybeFail(sstable.abort(null));
+            return;
+        }
+        remoteSSTablesReceived++;
+        Collection<SSTableReader> finished = null;
+        try
+        {
+            finished = sstable.finish(true);
+        }
+        catch (Throwable t)
+        {
+            Throwables.maybeFail(sstable.abort(t));
+        }
+        logger.debug("[{}] Received sstable {} from:{}, finished size:{}", session.planId(), sstable.getFilename(), session.peer, finished.size());
+        txn.update(finished, false);
+        if (remoteSSTablesReceived == totalFiles){
+            done = true;
+            logger.debug("after recieve repaired SSTable and write to replica copy!");
+            executor.submit(new OnCompletionRunnable(this));
+        }
+    }
+
+    }
+
+    public synchronized void receivedReplica()
+    {
+        if (done)
+        {
+            logger.debug("[{}] Received replicaFile  on already finished stream received task. Aborting sstable.", session.planId());
+            //Throwables.maybeFail(sstable.abort(null));
+            return;
+        }
+        remoteSSTablesReceived++;
+        //migrationFlag = migration;
+        logger.debug("in receivedReplica, remoteSSTablesReceived:{}, totalFiles:{}", remoteSSTablesReceived, totalFiles);
+        if (remoteSSTablesReceived == totalFiles){
             done = true;
             executor.submit(new OnCompletionRunnable(this));
         }
@@ -185,6 +241,7 @@ public class StreamReceiveTask extends StreamTask
             boolean hasViews = false;
             boolean hasCDC = false;
             ColumnFamilyStore cfs = null;
+            logger.debug("OnCompletionRunnable migrationFlag:{}", task.migrationFlag);
             try
             {
                 Pair<String, String> kscf = Schema.instance.getCF(task.cfId);
@@ -201,9 +258,16 @@ public class StreamReceiveTask extends StreamTask
                 hasCDC = cfs.metadata.params.cdc;
 
                 Collection<SSTableReader> readers = task.sstables;
-
+        if(readers!=null && readers.size()>0){
                 try (Refs<SSTableReader> refs = Refs.ref(readers))
                 {
+
+                    Collection<Descriptor> migratedReadersDes = new ArrayList();
+                    for(SSTableReader reader : readers){
+                        migratedReadersDes.add(reader.descriptor);
+                    }
+                    StorageService.instance.replayMigratedSSTablesDes.put(migratedReadersDes);
+                    StorageService.instance.migartedCFS = cfs;
                     /*
                      * We have a special path for views and for CDC.
                      *
@@ -215,6 +279,7 @@ public class StreamReceiveTask extends StreamTask
                      */
                     if (hasViews || hasCDC)
                     {
+                        logger.debug("@@@@[Stream #{}] Received {} sstables from {} ({})", task.session.planId(), readers.size(), task.session.peer, readers);   
                         for (SSTableReader reader : readers)
                         {
                             Keyspace ks = Keyspace.open(reader.getKeyspaceName());
@@ -240,8 +305,7 @@ public class StreamReceiveTask extends StreamTask
                     else
                     {
                         task.finishTransaction();
-
-                        logger.debug("[Stream #{}] Received {} sstables from {} ({})", task.session.planId(), readers.size(), task.session.peer, readers);
+                        logger.debug("------[Stream #{}] Received {} sstables from {} ({})", task.session.planId(), readers.size(), task.session.peer, readers);
                         // add sstables and build secondary indexes
                         cfs.addSSTables(readers);
                         cfs.indexManager.buildAllIndexesBlocking(readers);
@@ -273,6 +337,11 @@ public class StreamReceiveTask extends StreamTask
                         }
                     }
                 }
+        }else{
+            logger.debug("------before task.finishTransaction, [Stream #{}] Received replica File from {}", task.session.planId(), task.session.peer);                    
+            task.finishTransaction();
+        }
+
                 task.session.taskCompleted(task);
             }
             catch (Throwable t)
