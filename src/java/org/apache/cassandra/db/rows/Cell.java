@@ -34,6 +34,7 @@ import org.apache.cassandra.io.util.DataOutputPlus;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.memory.AbstractAllocator;
+import org.apache.cassandra.service.StorageService;
 
 /**
  * A cell is our atomic unit for a single value of a single column.
@@ -223,6 +224,7 @@ public abstract class Cell extends ColumnData
         public Cell deserialize(DataInputPlus in, LivenessInfo rowLiveness, ColumnDefinition column, SerializationHeader header, SerializationHelper helper) throws IOException
         {
             int flags = in.readUnsignedByte();
+            StorageService.instance.totalReadBytes+=1;////
             boolean hasValue = (flags & HAS_EMPTY_VALUE_MASK) == 0;
             boolean isDeleted = (flags & IS_DELETED_MASK) != 0;
             boolean isExpiring = (flags & IS_EXPIRING_MASK) != 0;
@@ -230,7 +232,7 @@ public abstract class Cell extends ColumnData
             boolean useRowTTL = (flags & USE_ROW_TTL_MASK) != 0;
 
             long timestamp = useRowTimestamp ? rowLiveness.timestamp() : header.readTimestamp(in);
-
+            StorageService.instance.totalReadBytes+=8;////
             int localDeletionTime = useRowTTL
                                     ? rowLiveness.localExpirationTime()
                                     : (isDeleted || isExpiring ? header.readLocalDeletionTime(in) : NO_DELETION_TIME);
@@ -257,7 +259,7 @@ public abstract class Cell extends ColumnData
                         value = helper.maybeClearCounterValue(value);
                 }
             }
-
+            StorageService.instance.totalReadBytes+=value.limit();////
             return new BufferCell(column, timestamp, ttl, localDeletionTime, value, path);
         }
 

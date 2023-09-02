@@ -47,6 +47,56 @@ import org.apache.cassandra.io.sstable.metadata.MetadataCollector;
 import org.apache.cassandra.service.ActiveRepairService;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.concurrent.Refs;
+import org.apache.cassandra.service.StorageService;
+
+import org.apache.cassandra.io.sstable.*;
+import org.apache.cassandra.io.util.FileDataInput;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.rows.*;
+import org.apache.cassandra.io.util.RandomAccessReader;
+import org.apache.cassandra.io.util.DataIntegrityMetadata;
+import org.apache.cassandra.io.util.DataIntegrityMetadata.ChecksumValidator;
+import org.apache.cassandra.db.filter.ColumnFilter;
+import org.apache.cassandra.io.util.DataInputPlus;
+import org.apache.cassandra.io.util.DataInputPlus.DataInputStreamPlus;
+import org.apache.cassandra.io.util.DataOutputStreamPlus;
+import java.nio.channels.Channels;
+import java.nio.channels.ReadableByteChannel;
+import org.apache.cassandra.io.util.DataInputBuffer;
+import org.apache.cassandra.io.util.DataOutputBuffer;
+import org.apache.cassandra.net.MessagingService;
+import java.io.ByteArrayInputStream;
+import java.net.InetAddress;
+import org.apache.cassandra.gms.Gossiper;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+import org.apache.cassandra.io.erasurecode.*;
+import org.apache.cassandra.io.sstable.format.*;
+import java.util.*;
+import org.apache.cassandra.config.*;
+import org.apache.cassandra.utils.*;
+import org.apache.cassandra.dht.*;
+import java.nio.ByteBuffer;
+import java.io.*;
+
+
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
+import org.apache.cassandra.streaming.*;
+import org.apache.cassandra.io.FSWriteError;
+import org.apache.cassandra.db.partitions.PartitionUpdate;
+
+import org.iq80.twoLayerLog.Options;
+import org.iq80.twoLayerLog.ReadOptions;
+import org.iq80.twoLayerLog.WriteOptions;
+import org.iq80.twoLayerLog.impl.DbImpl;
+import static org.iq80.twoLayerLog.impl.DbImpl.CompactionState;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.*;
+
 
 public class CompactionTask extends AbstractCompactionTask
 {
@@ -162,8 +212,11 @@ public class CompactionTask extends AbstractCompactionTask
         long inputSizeBytes;
         try (CompactionController controller = getCompactionController(transaction.originals()))
         {
-            Set<SSTableReader> actuallyCompact = Sets.difference(transaction.originals(), controller.getFullyExpiredSSTables());
+            Set<SSTableReader> actuallyCompact = null;
+            actuallyCompact = Sets.difference(transaction.originals(), controller.getFullyExpiredSSTables());
+
             Collection<SSTableReader> newSStables;
+            logger.debug("transaction.originals size:{}, actuallyCompact size:{}", transaction.originals().size(), actuallyCompact.size());
 
             long[] mergedRowCounts;
             long totalSourceCQLRows;
@@ -193,27 +246,140 @@ public class CompactionTask extends AbstractCompactionTask
                 try (CompactionAwareWriter writer = getCompactionAwareWriter(cfs, getDirectories(), transaction, actuallyCompact))
                 {
                     estimatedKeys = writer.estimatedKeys();
-                    while (ci.hasNext())
-                    {
-                        if (ci.isStopRequested())
-                            throw new CompactionInterruptedException(ci.getCompactionInfo());
+                    ///////////////////////////////////////////////////////
+                    logger.debug("during compaction, cfs.name:{}, getLevel:{}",cfs.name, getLevel());
+                    if(cfs.name.equals("globalReplicaTable") && getLevel()>0 ){
+                        
+                        StorageService.instance.doingGlobalSplit = true;
+                        //StorageService.instance.db.mutex.lock();   
+                        CompactionState compactionState = new CompactionState(null);////
+                        logger.debug("######actuallyCompact.size:{}, output size:{}", actuallyCompact.size(), compactionState.outputs.size()); 
+                        
+                        DataOutputBuffer dob = new DataOutputBuffer();                      
+                        while (ci.hasNext())
+                        {
+                            if(StorageService.instance.groupCountDownMap.size() > 5) {
+                                for (Map.Entry<String,CountDownLatch> latchEntry: StorageService.instance.groupCountDownMap.entrySet()) {
+                                    //String groupID =  latchEntry.getKey();		
+                                    try {		
+                                        CountDownLatch curLatch = latchEntry.getValue();
+                                        if(curLatch!=null) {
+                                            curLatch.await();
+                                            //groupCountDownMap.remove(groupID);
+                                        }					
+                                    } catch (InterruptedException e1) {
+                                        // TODO Auto-generated catch block
+                                        e1.printStackTrace();
+                                    }
+                                }
+                                StorageService.instance.groupCountDownMap.clear();
+                            }                                            
+                            dob.clear();      
+                               
+                            if (ci.isStopRequested())
+                                throw new CompactionInterruptedException(ci.getCompactionInfo());
 
-                        if (writer.append(ci.next()))
+                            UnfilteredRowIterator rowIterator = ci.next();
+                            Mutation mutation = new Mutation(PartitionUpdate.fromIterator(rowIterator, ColumnFilter.all(cfs.metadata)));
+                            try{
+                                Mutation.serializer.serializeToValue(mutation, dob, MessagingService.current_version);   
+                            } catch(Throwable e){
+                                logger.debug("in splitToRangeGroups, Mutation.serializer.deserialize failed, strToken:{}!!", mutation.key().getToken());
+                            } 
+                            String strToken = StorageService.instance.getTokenFactory().toString(mutation.key().getToken());         
+                            String groupID = StorageService.instance.findBoundTokenAccordingTokeny(strToken);                                          
+
+                            try {		
+                                CountDownLatch curLatch = StorageService.instance.groupCountDownMap.get(groupID);
+                                if(curLatch!=null) {
+                                    curLatch.await();
+                                    StorageService.instance.groupCountDownMap.remove(groupID);
+                                    //logger.debug("after await, curLatch size:{}", curLatch.getCount());
+                                }					
+                            } catch (InterruptedException e1) {
+                                // TODO Auto-generated catch block
+                                e1.printStackTrace();
+                            }
+
+                            CountDownLatch latch = new CountDownLatch(1);
+                            StorageService.instance.groupCountDownMap.put(groupID,latch);
+                            byte[] value = Arrays.copyOfRange(dob.toByteArray(), 0, dob.toByteArray().length);
+                            Runnable runThread = new Runnable() {
+                                public void run() {
+                                    //StorageService.instance.db.splitToRangeGroups(strToken.getBytes(), dob.toByteArray(), groupID, compactionState);
+                                    StorageService.instance.db.splitToRangeGroups(strToken.getBytes(), value, groupID, compactionState);
+                                    CountDownLatch myLatch = StorageService.instance.groupCountDownMap.get(groupID);
+                                    if(myLatch!=null) myLatch.countDown();                   	
+                                }
+                            };
+                            StorageService.instance.splitExecutor.submit(runThread);
+
                             totalKeysWritten++;
 
+                            long bytesScanned = scanners.getTotalBytesScanned();
 
-                        long bytesScanned = scanners.getTotalBytesScanned();
+                            //Rate limit the scanners, and account for compression
+                            CompactionManager.compactionRateLimiterAcquire(limiter, bytesScanned, lastBytesScanned, compressionRatio);
 
-                        //Rate limit the scanners, and account for compression
-                        CompactionManager.compactionRateLimiterAcquire(limiter, bytesScanned, lastBytesScanned, compressionRatio);
+                            lastBytesScanned = bytesScanned;
 
-                        lastBytesScanned = bytesScanned;
-
-                        if (System.nanoTime() - lastCheckObsoletion > TimeUnit.MINUTES.toNanos(1L))
-                        {
-                            controller.maybeRefreshOverlaps();
-                            lastCheckObsoletion = System.nanoTime();
+                            if (System.nanoTime() - lastCheckObsoletion > TimeUnit.MINUTES.toNanos(1L))
+                            {
+                                controller.maybeRefreshOverlaps();
+                                lastCheckObsoletion = System.nanoTime();
+                            }
                         }
+
+                        for (Map.Entry<String,CountDownLatch> latchEntry: StorageService.instance.groupCountDownMap.entrySet()) {                                
+                            try {		
+                                CountDownLatch curLatch = latchEntry.getValue();
+                                if(curLatch!=null) {
+                                    curLatch.await();                                         
+                                }					
+                            } catch (InterruptedException e1) {
+                                // TODO Auto-generated catch block
+                                e1.printStackTrace();
+                            }
+                        }
+                        StorageService.instance.groupCountDownMap.clear();
+
+                        logger.debug("------actuallyCompact.size:{}, output size:{}", actuallyCompact.size(), compactionState.outputs.size());
+                        if(actuallyCompact.size()>0 && compactionState.currentFileNumberMap.size()>0){
+                            logger.debug("------before installSplitResults, compactionState.currentFileNumber:{}", compactionState.currentFileNumber);
+                            StorageService.instance.db.installSplitResults(compactionState);
+                        }
+                        //StorageService.instance.db.mutex.unlock();
+                        StorageService.instance.doingGlobalSplit = false;      
+                        StorageService.instance.mergeSort += System.currentTimeMillis() - startTime;
+                        StorageService.instance.db.performGroupMerge();    
+
+                    }else{/////////////////////////////////////////////
+
+                        while (ci.hasNext())
+                        {
+                            if (ci.isStopRequested())
+                                throw new CompactionInterruptedException(ci.getCompactionInfo());
+
+                            if (writer.append(ci.next()))
+                                totalKeysWritten++;
+
+
+                            long bytesScanned = scanners.getTotalBytesScanned();
+
+                            //Rate limit the scanners, and account for compression
+                            CompactionManager.compactionRateLimiterAcquire(limiter, bytesScanned, lastBytesScanned, compressionRatio);
+
+                            lastBytesScanned = bytesScanned;
+
+                            if (System.nanoTime() - lastCheckObsoletion > TimeUnit.MINUTES.toNanos(1L))
+                            {
+                                controller.maybeRefreshOverlaps();
+                                lastCheckObsoletion = System.nanoTime();
+                            }
+                        }
+
+                        StorageService.instance.compaction += System.currentTimeMillis() - startTime;//////
+                    
                     }
 
                     // point of no return
@@ -230,6 +396,12 @@ public class CompactionTask extends AbstractCompactionTask
                 }
             }
 
+            for (SSTableReader sstable : newSStables){
+                int level = sstable.getSSTableLevel();
+                long size = sstable.bytesOnDisk();
+                StorageService.instance.totalLevelWrite[level]+= size/1048576;
+            }
+
             if (transaction.isOffline())
             {
                 Refs.release(Refs.selfRefs(newSStables));
@@ -243,6 +415,8 @@ public class CompactionTask extends AbstractCompactionTask
                 long startsize = inputSizeBytes;
                 long endsize = SSTableReader.getTotalBytes(newSStables);
                 double ratio = (double) endsize / (double) startsize;
+
+                StorageService.instance.totalCompactWrite+= endsize/1048576;//////
 
                 StringBuilder newSSTableNames = new StringBuilder();
                 for (SSTableReader reader : newSStables)
@@ -267,6 +441,14 @@ public class CompactionTask extends AbstractCompactionTask
                                            totalSourceRows,
                                            totalKeysWritten,
                                            mergeSummary));
+                logger.debug("######insertMemTable:{} s, insertLog:{} s, flushMemTable:{} s, compaction:{} s, mergeSort:{} s, mergeSortNum:{}", StorageService.instance.insertMemTable/1000, StorageService.instance.insertLog/1000, StorageService.instance.flushMemTable/1000, StorageService.instance.compaction/1000, StorageService.instance.mergeSort/1000, StorageService.instance.mergeSortNum);
+                logger.debug("######readMemTable:{} ms, readRowCache:{} ms, readKeyCache:{} ms, readIndexBlock:{} ms, readSSTables:{} ms", StorageService.instance.readMemTable, StorageService.instance.readRowCache, StorageService.instance.readKeyCache, StorageService.instance.readIndexBlock, StorageService.instance.readSSTables);
+
+                logger.debug("------totalCompactWrite:{} MB, readCommandNum:{}, totalReadBytes:{} totalSSTablesChecked:{}, totalSSTablesView:{}", StorageService.instance.totalCompactWrite, StorageService.instance.readCommandNum, StorageService.instance.totalReadBytes, StorageService.instance.totalSSTablesChecked, StorageService.instance.totalSSTablesView);
+                logger.debug("------ReadGroupBytes:{} , writeGroupBytes:{}", StorageService.instance.ReadGroupBytes, StorageService.instance.writeGroupBytes);
+                logger.debug("------DifferentiationTime:{} ms, DifferentiationNaTime:{} ns", StorageService.instance.DifferentiationTime, StorageService.instance.DifferentiationNaTime);
+                
+                strategy.getScanners(newSStables);
                 logger.trace("CF Total Bytes Compacted: {}", FBUtilities.prettyPrintMemory(CompactionTask.addToTotalBytesCompacted(endsize)));
                 logger.trace("Actual #keys: {}, Estimated #keys:{}, Err%: {}", totalKeysWritten, estimatedKeys, ((double)(totalKeysWritten - estimatedKeys)/totalKeysWritten));
                 cfs.getCompactionStrategyManager().compactionLogger.compaction(startTime, transaction.originals(), System.currentTimeMillis(), newSStables);
@@ -274,6 +456,8 @@ public class CompactionTask extends AbstractCompactionTask
                 // update the metrics
                 cfs.metric.compactionBytesWritten.inc(endsize);
             }
+            //StorageService.instance.compaction += System.currentTimeMillis() - startTime;
+
         }
     }
 

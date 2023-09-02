@@ -70,6 +70,7 @@ import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.UUIDGen;
 import org.apache.cassandra.utils.concurrent.Ref;
 import org.apache.cassandra.utils.concurrent.Refs;
+import org.apache.cassandra.service.StorageService;
 
 /**
  * ActiveRepairService is the starting point for manual "active" repairs.
@@ -456,17 +457,40 @@ public class ActiveRepairService implements IEndpointStateChangeSubscriber, IFai
         assert prs.ranges.containsAll(successfulRanges) : "Trying to perform anticompaction on unknown ranges";
 
         List<ListenableFuture<?>> futures = new ArrayList<>();
+
         // if we don't have successful repair ranges, then just skip anticompaction
         if (!successfulRanges.isEmpty())
         {
             for (Map.Entry<UUID, ColumnFamilyStore> columnFamilyStoreEntry : prs.columnFamilyStores.entrySet())
             {
-                Refs<SSTableReader> sstables = prs.getActiveRepairedSSTableRefsForAntiCompaction(columnFamilyStoreEntry.getKey(), parentRepairSession);
+                //Refs<SSTableReader> sstables = prs.getActiveRepairedSSTableRefsForAntiCompaction(columnFamilyStoreEntry.getKey(), parentRepairSession);
                 ColumnFamilyStore cfs = columnFamilyStoreEntry.getValue();
-                futures.add(CompactionManager.instance.submitAntiCompaction(cfs, successfulRanges, sstables, prs.repairedAt, parentRepairSession));
+                //futures.add(CompactionManager.instance.submitAntiCompaction(cfs, successfulRanges, sstables, prs.repairedAt, parentRepairSession));
+                //////////////////////////////////////////////////////////
+                InetAddress LOCAL = FBUtilities.getBroadcastAddress();
+                Collection<Range<Token>> mainRanges = new ArrayList<>();
+                Collection<Range<Token>> replicaRanges = new ArrayList<>();
+                for(Range<Token> curRang: successfulRanges){
+                    List<InetAddress> ep = StorageService.instance.getNaturalEndpoints(cfs.keyspace.getName(), curRang.right);
+                    if (!ep.get(0).equals(LOCAL)) {//the range is stored in replica copy
+                        replicaRanges.add(curRang);
+                    }else{
+                        mainRanges.add(curRang);
+                    }
+                }
+                logger.debug("successfulRanges size:{}, mainRanges size:{}, replicaRanges size:{}", successfulRanges.size(), mainRanges.size(), replicaRanges.size());
+                /////////////////////////////////////////////////////////
+
+                if(mainRanges.size() >0 && !cfs.name.equals("globalReplicaTable")){//////
+                    Refs<SSTableReader> sstables = prs.getActiveRepairedSSTableRefsForAntiCompaction(columnFamilyStoreEntry.getKey(), parentRepairSession);       
+                    //futures.add(CompactionManager.instance.submitAntiCompaction(cfs, successfulRanges, sstables, prs.repairedAt, parentRepairSession));
+                    logger.debug("before submitAntiCompaction, repsstableslicaRanges size:{}",sstables.size());
+                    //futures.add(CompactionManager.instance.submitAntiCompaction(cfs, mainRanges, sstables, prs.repairedAt, parentRepairSession));
+                }//////
             }
         }
 
+        StorageService.instance.duringRepair = false;
         ListenableFuture<List<Object>> allAntiCompactionResults = Futures.successfulAsList(futures);
         allAntiCompactionResults.addListener(new Runnable()
         {
@@ -491,6 +515,11 @@ public class ActiveRepairService implements IEndpointStateChangeSubscriber, IFai
             case VALIDATION_COMPLETE:
                 ValidationComplete validation = (ValidationComplete) message;
                 session.validationComplete(desc, endpoint, validation.trees);
+               long curTime = System.currentTimeMillis();
+                long costTime= curTime-StorageService.instance.beginMTrees;
+                StorageService.instance.buildMTrees+=costTime;
+                if(costTime>StorageService.instance.maxTime) StorageService.instance.maxTime = costTime;
+                logger.debug("##costTime:{}, endpoint:{}, StorageService.instance.maxTime:{}", costTime, endpoint, StorageService.instance.maxTime);
                 break;
             case SYNC_COMPLETE:
                 // one of replica is synced.

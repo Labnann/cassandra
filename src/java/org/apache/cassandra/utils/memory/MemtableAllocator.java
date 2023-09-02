@@ -24,9 +24,12 @@ import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.rows.*;
 import org.apache.cassandra.utils.concurrent.OpOrder;
 import org.apache.cassandra.utils.concurrent.WaitQueue;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public abstract class MemtableAllocator
 {
+    protected static final Logger logger = LoggerFactory.getLogger(MemtableAllocator.class);
     private final SubAllocator onHeap;
     private final SubAllocator offHeap;
     volatile LifeCycle state = LifeCycle.LIVE;
@@ -144,6 +147,7 @@ public abstract class MemtableAllocator
             {
                 if (parent.tryAllocate(size))
                 {
+                    //logger.debug("######in parent.tryAllocate, size:{}", size); 
                     acquired(size);
                     return;
                 }
@@ -152,10 +156,12 @@ public abstract class MemtableAllocator
                 if (allocated || opGroup.isBlocking())
                 {
                     signal.cancel();
-                    if (allocated) // if we allocated, take ownership
+                    if (allocated){ // if we allocated, take ownership
                         acquired(size);
-                    else // otherwise we're blocking so we're permitted to overshoot our constraints, to just allocate without blocking
+                    }else{ // otherwise we're blocking so we're permitted to overshoot our constraints, to just allocate without blocking
+                        //logger.debug("----before allocated, size:{}", size); 
                         allocated(size);
+                    }
                     return;
                 }
                 else

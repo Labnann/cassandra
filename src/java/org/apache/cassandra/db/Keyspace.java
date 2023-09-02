@@ -52,6 +52,19 @@ import org.apache.cassandra.tracing.Tracing;
 import org.apache.cassandra.utils.*;
 import org.apache.cassandra.utils.concurrent.OpOrder;
 
+import java.net.InetAddress;
+import org.apache.cassandra.gms.Gossiper;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.RingPosition;
+import org.apache.cassandra.io.util.DataOutputBuffer;
+import org.apache.cassandra.net.MessagingService;
+
+import org.iq80.twoLayerLog.Options;
+import org.iq80.twoLayerLog.ReadOptions;
+import org.iq80.twoLayerLog.WriteOptions;
+import org.iq80.twoLayerLog.impl.DbImpl;
+
 /**
  * It represents a Keyspace.
  */
@@ -81,6 +94,8 @@ public class Keyspace
 
     /* ColumnFamilyStore per column family */
     private final ConcurrentMap<UUID, ColumnFamilyStore> columnFamilyStores = new ConcurrentHashMap<>();
+    public final Map<Integer, UUID> globalNodeIDtoCFIDMap = new HashMap<Integer, UUID>();
+    public final Map<Integer, UUID> replicaNodeIDtoCFIDMap = new HashMap<Integer, UUID>();
     private volatile AbstractReplicationStrategy replicationStrategy;
     public final ViewManager viewManager;
     private volatile ReplicationParams replicationParams;
@@ -159,6 +174,17 @@ public class Keyspace
         return open(cfm.ksName).getColumnFamilyStore(cfm.cfId);
     }
 
+    public static ColumnFamilyStore openAndgetColumnFamilyStoreByToken(CFMetaData cfm, Token keyToken)
+    {
+        return open(cfm.ksName).getColumnFamilyStoreByToken(cfm.ksName, keyToken);
+    }
+
+    public static ColumnFamilyStore openAndgetColumnFamilyStoreByRingPosition(String ksName, RingPosition pos)
+    {
+        //logger.debug("int openAndgetColumnFamilyStoreByRingPosition, pos:{}", pos);
+        return open(ksName).getColumnFamilyStoreByRingPosition(pos);
+    }
+
     /**
      * Removes every SSTable in the directory from the appropriate Tracker's view.
      * @param directory the unreadable directory, possibly with SSTables in it, but not necessarily.
@@ -185,6 +211,44 @@ public class Keyspace
     {
         return metadata;
     }
+
+    //////////////////////////////////////
+    public ColumnFamilyStore getColumnFamilyStoreByRingPosition(RingPosition pos){
+        List<InetAddress> replicasIP = StorageService.instance.getLiveNaturalEndpoints(this, pos);
+        //logger.debug("int getColumnFamilyStoreByRingPosition, pos:{}, replicasIP:{}, localIP:{}, keyspace:{}", pos, replicasIP, StorageService.instance.localIP, this);
+        UUID replicaUUID = null;
+        if(StorageService.instance.localIP.equals(replicasIP.get(0))){
+            replicaUUID = globalNodeIDtoCFIDMap.get(0);
+        }else{
+            replicaUUID = globalNodeIDtoCFIDMap.get(1);
+        }
+        if(columnFamilyStores!=null && replicaUUID!=null){
+            ColumnFamilyStore cfs = columnFamilyStores.get(replicaUUID);
+            //logger.debug("keyToken:{}, primaryIP:{}, replicaUUID:{}, ksname:{}, cfs name:{}",keyToken, primaryIP, replicaUUID, ksName, cfs.metadata.cfName);
+            return cfs;
+        }else{
+            return null;
+        }
+    }
+
+    public ColumnFamilyStore getColumnFamilyStoreByToken(String ksName, Token keyToken){
+        List<InetAddress> ep = StorageService.instance.getNaturalEndpoints(ksName, keyToken);
+        UUID replicaUUID = null;
+        if(StorageService.instance.localIP.equals(ep.get(0))){
+            replicaUUID = globalNodeIDtoCFIDMap.get(0);
+        }else{
+            replicaUUID = globalNodeIDtoCFIDMap.get(1);
+        }
+
+        if(columnFamilyStores!=null && replicaUUID!=null){
+            ColumnFamilyStore cfs = columnFamilyStores.get(replicaUUID);
+            //logger.debug("keyToken:{}, primaryIP:{}, replicaUUID:{}, ksname:{}, cfs name:{}",keyToken, primaryIP, replicaUUID, ksName, cfs.metadata.cfName);
+            return cfs;
+        }else{
+            return null;
+        }
+    }
+    /////////////////////////////////////
 
     public Collection<ColumnFamilyStore> getColumnFamilyStores()
     {
@@ -321,7 +385,7 @@ public class Keyspace
         for (CFMetaData cfm : metadata.tablesAndViews())
         {
             logger.trace("Initializing {}.{}", getName(), cfm.cfName);
-            initCf(cfm, loadSSTables);
+            initCf(cfm, loadSSTables, keyspaceName);
         }
         this.viewManager.reload();
     }
@@ -341,6 +405,44 @@ public class Keyspace
 
     private void createReplicationStrategy(KeyspaceMetadata ksm)
     {
+        //////
+        Options options = new Options();
+        options.createIfMissing(true);
+        Set<InetAddress> liveHosts = Gossiper.instance.getLiveMembers();
+        try {
+            String DBname = "data/replicatedData";
+            File file = new File(DBname);
+            if(!file.exists()){
+                //StorageService.instance.db = factory.open(file, options);
+                StorageService.instance.db = new DbImpl(options, file);
+            }
+            //db.close();
+        } catch(Throwable e){
+                logger.debug("open twoLayerLog failed!!");
+        }
+        InetAddress LOCAL = FBUtilities.getBroadcastAddress();
+        for (InetAddress host : liveHosts){///
+            if (!host.equals(LOCAL)) {          
+                Collection<Token> nodeToken = StorageService.instance.getTokenMetadata().getTokens(host);
+                //logger.debug("nodeIP:{}, nodeToken size:{}, nodeToken:{}", host, nodeToken.size(), nodeToken);
+                List<String> strTokensList = new ArrayList<String>();
+                for(Token tk: nodeToken){
+                    String strToken = StorageService.instance.getTokenFactory().toString(tk);//////
+                    strTokensList.add(strToken);
+                    StorageService.instance.groupAccessNumMap.put(strToken, 0);
+                    //logger.debug("strToken size:{}, strToken:{}", strTokensList.size(), strToken);
+                }
+                try{
+                    byte ip[] = host.getAddress();  
+                    int NodeID = (int)ip[3];
+                    StorageService.instance.db.createReplicaDir(NodeID, strTokensList, ksm.name);
+                } catch(Throwable e){
+                    logger.debug("create replicaDir failed!!");
+                }
+            }
+        }
+        //////
+        
         replicationStrategy = AbstractReplicationStrategy.createReplicationStrategy(ksm.name,
                                                                                     ksm.params.replication.klass,
                                                                                     StorageService.instance.getTokenMetadata(),
@@ -405,7 +507,7 @@ public class Keyspace
     /**
      * adds a cf to internal structures, ends up creating disk files).
      */
-    public void initCf(CFMetaData metadata, boolean loadSSTables)
+    public void initCf(CFMetaData metadata, boolean loadSSTables, String keyspaceName)
     {
         ColumnFamilyStore cfs = columnFamilyStores.get(metadata.cfId);
 
@@ -415,6 +517,29 @@ public class Keyspace
             // We don't worry about races here; startup is safe, and adding multiple idential CFs
             // simultaneously is a "don't do that" scenario.
             ColumnFamilyStore oldCfs = columnFamilyStores.putIfAbsent(metadata.cfId, ColumnFamilyStore.createColumnFamilyStore(this, metadata, loadSSTables));
+            /////////////////////////////////////////////////////
+            if(keyspaceName.equals("ycsb")){
+                for (ColumnFamilyStore cfStore : columnFamilyStores.values())
+                {
+                    logger.debug("##name:{}, cfStore.metadata.cfId:{}, columnFamilyStores size:{}, loadSSTables:{}", cfStore.name, cfStore.metadata.cfId, columnFamilyStores.size(), loadSSTables);                          
+                }
+                InetAddress LOCAL = FBUtilities.getBroadcastAddress();
+                byte localIP[] = LOCAL.getAddress();  
+                int localID = (int)localIP[3];
+                ColumnFamilyStore newCFS = columnFamilyStores.get(metadata.cfId);
+
+                //if(globalNodeIDtoCFIDMap.isEmpty() && newCFS!=null && !newCFS.name.equals("globalReplicaTable")){
+                if(newCFS!=null && !newCFS.name.equals("globalReplicaTable")){
+                    globalNodeIDtoCFIDMap.put(0, metadata.cfId);  
+                }else{
+                    globalNodeIDtoCFIDMap.put(1, metadata.cfId);  
+                }
+
+                for (Map.Entry<Integer, UUID> entry : globalNodeIDtoCFIDMap.entrySet()) {
+                    logger.debug("in globalNodeIDtoCFIDMap, nodeID:{}, cfId:{}",entry.getKey(), entry.getValue());
+                }
+            }
+            /////////////////////////////////////////////////////
             // CFS mbean instantiation will error out before we hit this, but in case that changes...
             if (oldCfs != null)
                 throw new IllegalStateException("added multiple mappings for cf id " + metadata.cfId);
@@ -430,7 +555,29 @@ public class Keyspace
 
     public CompletableFuture<?> applyFuture(Mutation mutation, boolean writeCommitLog, boolean updateIndexes)
     {
-        return applyInternal(mutation, writeCommitLog, updateIndexes, true, true, new CompletableFuture<>());
+        String keyspaceName = mutation.getKeyspaceName();
+        //AbstractReplicationStrategy rs = Keyspace.open(keyspaceName).getReplicationStrategy();
+        long startTime = System.currentTimeMillis();
+        long startNaTime = System.nanoTime();
+        Token tk = mutation.key().getToken();
+        InetAddress LOCAL = FBUtilities.getBroadcastAddress();
+        List<InetAddress> ep = StorageService.instance.getNaturalEndpoints(keyspaceName, tk);
+        //List<InetAddress> ep = StorageService.instance.getLiveNaturalEndpoints(keyspaceName, tk);
+        UUID replicaUUID = null;
+        if(StorageService.instance.localIP.equals(ep.get(0))){
+            replicaUUID = globalNodeIDtoCFIDMap.get(0);
+        }else{
+            replicaUUID = globalNodeIDtoCFIDMap.get(1);
+        }
+        StorageService.instance.DifferentiationTime += System.currentTimeMillis() - startTime;
+        StorageService.instance.DifferentiationNaTime += System.nanoTime() - startNaTime;
+        
+        if(replicaUUID==null){
+            return applyInternal(mutation, writeCommitLog, updateIndexes, true, true, new CompletableFuture<>());
+        }else{
+            return applyInternal(replicaUUID, mutation, writeCommitLog, updateIndexes, true, true, new CompletableFuture<>());
+        }
+
     }
 
     public CompletableFuture<?> applyFuture(Mutation mutation, boolean writeCommitLog, boolean updateIndexes, boolean isDroppable,
@@ -467,7 +614,22 @@ public class Keyspace
                       boolean updateIndexes,
                       boolean isDroppable)
     {
-        applyInternal(mutation, writeCommitLog, updateIndexes, isDroppable, false, null);
+        String keyspaceName = mutation.getKeyspaceName();
+        Token tk = mutation.key().getToken();
+        List<InetAddress> ep = StorageService.instance.getNaturalEndpoints(keyspaceName, tk);
+        //List<InetAddress> ep = StorageService.instance.getLiveNaturalEndpoints(keyspaceName, tk);
+        UUID replicaUUID = null;
+        if(StorageService.instance.localIP.equals(ep.get(0))){
+            replicaUUID = globalNodeIDtoCFIDMap.get(0);
+        }else{
+            replicaUUID = globalNodeIDtoCFIDMap.get(1);
+        }
+
+        if(replicaUUID==null){
+            applyInternal(mutation, writeCommitLog, updateIndexes, isDroppable, false, null);
+        }else{
+            applyInternal(replicaUUID, mutation, writeCommitLog, updateIndexes, isDroppable, false, null);
+        }
     }
 
     /**
@@ -644,6 +806,216 @@ public class Keyspace
         }
     }
 
+    private CompletableFuture<?> applyInternal(UUID replicaUUID, final Mutation mutation,
+                                               final boolean writeCommitLog,
+                                               boolean updateIndexes,
+                                               boolean isDroppable,
+                                               boolean isDeferrable,
+                                               CompletableFuture<?> future)
+    {
+        if (TEST_FAIL_WRITES && metadata.name.equals(TEST_FAIL_WRITES_KS))
+            throw new RuntimeException("Testing write failures");
+
+        Lock[] locks = null;
+
+        boolean requiresViewUpdate = updateIndexes && viewManager.updatesAffectView(Collections.singleton(mutation), false);
+
+        if (requiresViewUpdate)
+        {
+            mutation.viewLockAcquireStart.compareAndSet(0L, System.currentTimeMillis());
+
+            // the order of lock acquisition doesn't matter (from a deadlock perspective) because we only use tryLock()
+            Collection<UUID> columnFamilyIds = mutation.getColumnFamilyIds();
+            Iterator<UUID> idIterator = columnFamilyIds.iterator();
+
+            locks = new Lock[columnFamilyIds.size()];
+            for (int i = 0; i < columnFamilyIds.size(); i++)
+            {
+                UUID cfid = idIterator.next();
+                int lockKey = Objects.hash(mutation.key().getKey(), cfid);
+                while (true)
+                {
+                    Lock lock = null;
+
+                    if (TEST_FAIL_MV_LOCKS_COUNT == 0)
+                        lock = ViewManager.acquireLockFor(lockKey);
+                    else
+                        TEST_FAIL_MV_LOCKS_COUNT--;
+
+                    if (lock == null)
+                    {
+                        //throw WTE only if request is droppable
+                        if (isDroppable && (System.currentTimeMillis() - mutation.createdAt) > DatabaseDescriptor.getWriteRpcTimeout())
+                        {
+                            for (int j = 0; j < i; j++)
+                                locks[j].unlock();
+
+                            logger.trace("Could not acquire lock for {} and table {}", ByteBufferUtil.bytesToHex(mutation.key().getKey()), columnFamilyStores.get(cfid).name);
+                            Tracing.trace("Could not acquire MV lock");
+                            if (future != null)
+                            {
+                                future.completeExceptionally(new WriteTimeoutException(WriteType.VIEW, ConsistencyLevel.LOCAL_ONE, 0, 1));
+                                return future;
+                            }
+                            else
+                                throw new WriteTimeoutException(WriteType.VIEW, ConsistencyLevel.LOCAL_ONE, 0, 1);
+                        }
+                        else if (isDeferrable)
+                        {
+                            for (int j = 0; j < i; j++)
+                                locks[j].unlock();
+
+                            // This view update can't happen right now. so rather than keep this thread busy
+                            // we will re-apply ourself to the queue and try again later
+                            final CompletableFuture<?> mark = future;
+                            StageManager.getStage(Stage.MUTATION).execute(() ->
+                                                                          applyInternal(mutation, writeCommitLog, true, isDroppable, true, mark)
+                            );
+                            return future;
+                        }
+                        else
+                        {
+                            // Retry lock on same thread, if mutation is not deferrable.
+                            // Mutation is not deferrable, if applied from MutationStage and caller is waiting for future to finish
+                            // If blocking caller defers future, this may lead to deadlock situation with all MutationStage workers
+                            // being blocked by waiting for futures which will never be processed as all workers are blocked
+                            try
+                            {
+                                // Wait a little bit before retrying to lock
+                                Thread.sleep(10);
+                            }
+                            catch (InterruptedException e)
+                            {
+                                // Just continue
+                            }
+                            continue;
+                        }
+                    }
+                    else
+                    {
+                        locks[i] = lock;
+                    }
+                    break;
+                }
+            }
+
+            long acquireTime = System.currentTimeMillis() - mutation.viewLockAcquireStart.get();
+            // Metrics are only collected for droppable write operations
+            // Bulk non-droppable operations (e.g. commitlog replay, hint delivery) are not measured
+            if (isDroppable)
+            {
+                for(UUID cfid : columnFamilyIds)
+                    columnFamilyStores.get(cfid).metric.viewLockAcquireTime.update(acquireTime, TimeUnit.MILLISECONDS);
+            }
+        }
+        int nowInSec = FBUtilities.nowInSeconds();
+        try (OpOrder.Group opGroup = writeOrder.start())
+        {
+            ColumnFamilyStore cfs = columnFamilyStores.get(replicaUUID);
+            // write the mutation to the commitlog and memtables
+            CommitLogPosition commitLogPosition = null;
+            if (writeCommitLog)
+            {
+                long startLog = System.currentTimeMillis();
+                Tracing.trace("Appending to commitlog");
+                commitLogPosition = CommitLog.instance.add(mutation);
+                StorageService.instance.insertLog += System.currentTimeMillis() - startLog;
+                
+            }
+
+            for (PartitionUpdate upd : mutation.getPartitionUpdates())
+            {
+                if (cfs == null)
+                {
+                    logger.error("Attempting to mutate non-existant table {} ({}.{})", upd.metadata().cfId, upd.metadata().ksName, upd.metadata().cfName);
+                    continue;
+                }
+                AtomicLong baseComplete = new AtomicLong(Long.MAX_VALUE);
+
+                if (requiresViewUpdate)
+                {
+                    try
+                    {
+                        Tracing.trace("Creating materialized view mutations from base table replica");
+                        viewManager.forTable(upd.metadata()).pushViewReplicaUpdates(upd, writeCommitLog, baseComplete);
+                    }
+                    catch (Throwable t)
+                    {
+                        JVMStabilityInspector.inspectThrowable(t);
+                        logger.error(String.format("Unknown exception caught while attempting to update MaterializedView! %s.%s",
+                                     upd.metadata().ksName, upd.metadata().cfName), t);
+                        throw t;
+                    }
+                }
+
+                long startMem = System.currentTimeMillis();
+                Tracing.trace("Adding to {} memtable", upd.metadata().cfName);
+                UpdateTransaction indexTransaction = updateIndexes
+                                                     ? cfs.indexManager.newUpdateTransaction(upd, opGroup, nowInSec)
+                                                     : UpdateTransaction.NO_OP;
+                cfs.apply(upd, indexTransaction, opGroup, commitLogPosition);
+                StorageService.instance.insertMemTable += System.currentTimeMillis() - startMem;
+                
+                if (requiresViewUpdate)
+                    baseComplete.set(System.currentTimeMillis());
+            }
+            /////////////////////////////////////////////
+            boolean hasSleep = false;
+            if((StorageService.instance.SSTableNumOfL0 > 100 && StorageService.instance.SSTableNumOfL0 < 350 && !cfs.name.equals("globalReplicaTable")) && StorageService.instance.repairNodeIP==null){
+                try{
+                    Thread.currentThread().sleep(1);
+                } catch (InterruptedException e) {
+                    e.printStackTrace();
+                }
+                hasSleep = true;
+            }
+
+            if(StorageService.instance.SSTableNumOfL0 >= 350 && !cfs.name.equals("globalReplicaTable") && StorageService.instance.repairNodeIP==null ){
+                try{
+                    Thread.currentThread().sleep(2);
+                } catch (InterruptedException e) {
+                    e.printStackTrace();
+                }
+                hasSleep = true;
+            }
+
+            
+        if(!hasSleep){
+            int sleepThreshold = 46700160;
+            if(StorageService.instance.WriteConsistencyLevel == ConsistencyLevel.THREE) sleepThreshold = 38700160;
+            if(StorageService.instance.WriteConsistencyLevel == ConsistencyLevel.TWO) sleepThreshold = 43700160;
+
+            int replicationFactor = getReplicationStrategy().getReplicationFactor();
+            if(replicationFactor == 4) sleepThreshold = 48700160;
+            if(replicationFactor >= 5) sleepThreshold = 75700160;
+            if((StorageService.instance.maxSegNumofGroup < 8 && StorageService.instance.totalSizeOfGlobalLog > 16700160)
+               || (StorageService.instance.maxSegNumofGroup >= 8 && StorageService.instance.maxSegNumofGroup < 16 && StorageService.instance.totalSizeOfGlobalLog > 24700160) 
+               || (StorageService.instance.maxSegNumofGroup >= 16 && StorageService.instance.totalSizeOfGlobalLog > sleepThreshold)){
+                    try{
+                        Thread.currentThread().sleep(1);
+                    } catch (InterruptedException e) {
+                        e.printStackTrace();
+                    }
+            }
+        }
+        ///////////////////////////////////////////////
+
+            if (future != null) {
+                future.complete(null);
+            }
+            return future;
+        }
+        finally
+        {
+            if (locks != null)
+            {
+                for (Lock lock : locks)
+                    if (lock != null)
+                        lock.unlock();
+            }
+        }
+    }
+
     public AbstractReplicationStrategy getReplicationStrategy()
     {
         return replicationStrategy;
@@ -652,8 +1024,10 @@ public class Keyspace
     public List<Future<?>> flush()
     {
         List<Future<?>> futures = new ArrayList<>(columnFamilyStores.size());
-        for (ColumnFamilyStore cfs : columnFamilyStores.values())
+        for (ColumnFamilyStore cfs : columnFamilyStores.values()){
+            //logger.debug("------flushing memtable, size: {}", cfs.getCFSMemTableSize());
             futures.add(cfs.forceFlush());
+        }
         return futures;
     }
 

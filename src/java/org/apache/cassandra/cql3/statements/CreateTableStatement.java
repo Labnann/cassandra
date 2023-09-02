@@ -38,9 +38,18 @@ import org.apache.cassandra.service.MigrationManager;
 import org.apache.cassandra.service.QueryState;
 import org.apache.cassandra.transport.Event;
 
+import com.google.common.collect.Lists;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import java.net.InetAddress;
+import org.apache.cassandra.gms.Gossiper;
+import org.apache.cassandra.utils.FBUtilities;
+
 /** A {@code CREATE TABLE} parsed from a CQL query statement. */
 public class CreateTableStatement extends SchemaAlteringStatement
 {
+    protected static final Logger logger = LoggerFactory.getLogger(CreateTableStatement.class);
+    
     private static final Pattern PATTERN_WORD_CHARS = Pattern.compile("\\w+");
 
     private List<AbstractType<?>> keyTypes;
@@ -87,6 +96,25 @@ public class CreateTableStatement extends SchemaAlteringStatement
         try
         {
             MigrationManager.announceNewColumnFamily(getCFMetaData(), isLocalOnly);
+            //////////////////////////////////////////////////////////
+            logger.debug("before announceNewColumnFamily: {}", "globalReplicaTable");
+            MigrationManager.announceNewColumnFamily(getCFMetaData("globalReplicaTable"), isLocalOnly);
+           
+            /*String replicaTableName = "replicaTable";
+            InetAddress LOCAL = FBUtilities.getBroadcastAddress();
+            Set<InetAddress> liveHosts = Gossiper.instance.getLiveMembers();
+            //String[] nameArray = new String[liveHosts.size()];
+            int count = 0;
+            for (InetAddress host : liveHosts){///
+                if (!host.equals(LOCAL)) {                                                      
+                    byte ip[] = host.getAddress();  
+                    int NodeID = (int)ip[3];  
+                    String tableName = replicaTableName + NodeID;
+                    logger.debug("before announceNewColumnFamily: {}", tableName);
+                    MigrationManager.announceNewColumnFamily(getCFMetaData(tableName), isLocalOnly);
+                }
+            }*/
+            //////////////////////////////////////////////////////////        
             return new Event.SchemaChange(Event.SchemaChange.Change.CREATED, Event.SchemaChange.Target.TABLE, keyspace(), columnFamily());
         }
         catch (AlreadyExistsException e)
@@ -117,6 +145,51 @@ public class CreateTableStatement extends SchemaAlteringStatement
     {
         CFMetaData.Builder builder = CFMetaData.Builder.create(keyspace(), columnFamily(), isDense, isCompound, hasCounters);
         builder.withId(id);
+        logger.debug("######keyspace:{}, columnFamily:{}, id:{}", keyspace(), columnFamily(), id);
+
+        for (int i = 0; i < keyAliases.size(); i++)
+            builder.addPartitionKey(keyAliases.get(i), keyTypes.get(i));
+        for (int i = 0; i < columnAliases.size(); i++)
+            builder.addClusteringColumn(columnAliases.get(i), clusteringTypes.get(i));
+
+        boolean isStaticCompact = !isDense && !isCompound;
+        for (Map.Entry<ColumnIdentifier, AbstractType> entry : columns.entrySet())
+        {
+            ColumnIdentifier name = entry.getKey();
+            // Note that for "static" no-clustering compact storage we use static for the defined columns
+            if (staticColumns.contains(name) || isStaticCompact)
+                builder.addStaticColumn(name, entry.getValue());
+            else
+                builder.addRegularColumn(name, entry.getValue());
+        }
+
+        boolean isCompactTable = isDense || !isCompound;
+        if (isCompactTable)
+        {
+            CompactTables.DefaultNames names = CompactTables.defaultNameGenerator(builder.usedColumnNames());
+            // Compact tables always have a clustering and a single regular value.
+            if (isStaticCompact)
+            {
+                builder.addClusteringColumn(names.defaultClusteringName(), UTF8Type.instance);
+                builder.addRegularColumn(names.defaultCompactValueName(), hasCounters ? CounterColumnType.instance : BytesType.instance);
+            }
+            else if (isDense && !builder.hasRegulars())
+            {
+                // Even for dense, we might not have our regular column if it wasn't part of the declaration. If
+                // that's the case, add it but with a specific EmptyType so we can recognize that case later
+                builder.addRegularColumn(names.defaultCompactValueName(), EmptyType.instance);
+            }
+        }
+
+        return builder;
+    }
+
+    public CFMetaData.Builder metadataBuilder(String tableName)
+    {
+        CFMetaData.Builder builder = CFMetaData.Builder.create(keyspace(), tableName, isDense, isCompound, hasCounters);
+        builder.withId(id);
+        logger.debug("------keyspace:{}, columnFamily:{}, id:{}", keyspace(), tableName, id);
+
         for (int i = 0; i < keyAliases.size(); i++)
             builder.addPartitionKey(keyAliases.get(i), keyTypes.get(i));
         for (int i = 0; i < columnAliases.size(); i++)
@@ -164,6 +237,11 @@ public class CreateTableStatement extends SchemaAlteringStatement
     public CFMetaData getCFMetaData()
     {
         return metadataBuilder().build().params(params);
+    }
+
+    public CFMetaData getCFMetaData(String tableName)
+    {
+        return metadataBuilder(tableName).build().params(params);
     }
 
     public TableParams params()
@@ -218,6 +296,8 @@ public class CreateTableStatement extends SchemaAlteringStatement
             TableParams params = properties.properties.asNewTableParams();
 
             CreateTableStatement stmt = new CreateTableStatement(cfName, params, ifNotExists, staticColumns, properties.properties.getId());
+
+            logger.debug("######cfName:{}, params:{}, id:{}", cfName, params, properties.properties.getId());
 
             for (Map.Entry<ColumnIdentifier, CQL3Type.Raw> entry : definitions.entrySet())
             {

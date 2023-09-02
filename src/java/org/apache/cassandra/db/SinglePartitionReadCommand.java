@@ -61,6 +61,21 @@ import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.SearchIterator;
 import org.apache.cassandra.utils.btree.BTreeSet;
 
+import java.net.InetAddress;
+import org.apache.cassandra.gms.Gossiper;
+import org.apache.cassandra.dht.Token;
+import java.nio.ByteBuffer;
+import org.apache.cassandra.service.StorageService;
+import java.util.*;
+import org.apache.cassandra.utils.*;
+import org.apache.cassandra.config.Schema;
+import org.apache.cassandra.io.util.DataInputBuffer;
+import org.apache.cassandra.io.util.FileDataInput;
+import org.apache.cassandra.io.util.RebufferingInputStream;
+import org.iq80.twoLayerLog.Options;
+import org.iq80.twoLayerLog.ReadOptions;
+import org.iq80.twoLayerLog.WriteOptions;
+import org.iq80.twoLayerLog.impl.DbImpl;
 
 /**
  * A read command that selects a (part of a) single partition.
@@ -68,6 +83,7 @@ import org.apache.cassandra.utils.btree.BTreeSet;
 public class SinglePartitionReadCommand extends ReadCommand
 {
     protected static final SelectionDeserializer selectionDeserializer = new Deserializer();
+    private InetAddress LOCAL = FBUtilities.getBroadcastAddress();
 
     private final DecoratedKey partitionKey;
     private final ClusteringIndexFilter clusteringIndexFilter;
@@ -185,7 +201,7 @@ public class SinglePartitionReadCommand extends ReadCommand
                       limits,
                       partitionKey,
                       clusteringIndexFilter,
-                      findIndex(metadata, rowFilter));
+                      findIndex(metadata, rowFilter, partitionKey));
     }
 
     /**
@@ -496,12 +512,102 @@ public class SinglePartitionReadCommand extends ReadCommand
         metric.readLatency.addNano(latencyNanos);
     }
 
+    public ColumnFamilyStore getColumnFamilyStorefromMultiReplicas(CFMetaData cfm){
+        
+        ColumnFamilyStore cfs = null;
+        cfs = Keyspace.openAndgetColumnFamilyStoreByToken(cfm, this.partitionKey.getToken());//////
+        if(cfs==null){//////
+            cfs = Keyspace.openAndGetStore(cfm);
+        }//////
+        return cfs;
+    }
+
     @SuppressWarnings("resource") // we close the created iterator through closing the result of this method (and SingletonUnfilteredPartitionIterator ctor cannot fail)
     protected UnfilteredPartitionIterator queryStorage(final ColumnFamilyStore cfs, ReadExecutionController executionController)
     {
         UnfilteredRowIterator partition = cfs.isRowCacheEnabled()
                                         ? getThroughCache(cfs, executionController)
                                         : queryMemtableAndDisk(cfs, executionController);
+        
+        return new SingletonUnfilteredPartitionIterator(partition, isForThrift());
+    }
+
+    @SuppressWarnings("resource") // we close the created iterator through closing the result of this method (and SingletonUnfilteredPartitionIterator ctor cannot fail)
+    protected UnfilteredPartitionIterator queryStorage(final ColumnFamilyStore cfs, ReadExecutionController executionController, int []findResults, String ksName)
+    {
+        UnfilteredRowIterator partition = cfs.isRowCacheEnabled()
+                                        ? getThroughCache(cfs, executionController)
+                                        : queryMemtableAndDisk(cfs, executionController);
+        
+        if(partition.isEmpty()){
+            findResults[0] = 0;
+            //logger.debug("####read in queryStorage empty, key token:{}", this.partitionKey().getToken());
+        }
+        return new SingletonUnfilteredPartitionIterator(partition, isForThrift());
+    }
+
+    @SuppressWarnings("resource") // we close the created iterator through closing the result of this method (and SingletonUnfilteredPartitionIterator ctor cannot fail)
+    protected UnfilteredPartitionIterator queryLocalRegion(ColumnFamilyStore cfs, List<UnfilteredPartitionIterator> iterators)
+    {
+        //logger.debug("in queryStorage");
+        UnfilteredRowIterator partition = null;
+        Token tk = this.partitionKey().getToken();
+        /*List<String> keyspaceName = cfs.getUserKeyspaceName();
+        //InetAddress ep = StorageService.instance.getHashEndpoints(keyspaceName.get(0), tk);
+        //int keyLength = partitionKey().getKey().array().length;
+        List<InetAddress> ep = StorageService.instance.getNaturalEndpoints(keyspaceName.get(0), tk);
+            //if(ep.get(0)!=null && !ep.get(0).equals(LOCAL) && keyLength > 10 && keyLength < 26){//////
+                String theKey=null;
+                try{
+                    theKey=ByteBufferUtil.string(partitionKey().getKey());
+                }catch(Throwable e){
+                    logger.debug("get key failed in getThroughCache, token:{}!!",tk);
+                }
+                logger.debug("##look in queryInternal,name:{},tk:{}, key:{}, key length:{}, ep:{}, LOCAL:{}",keyspaceName.get(0), tk, theKey, partitionKey().getKey().array().length, ep, LOCAL);
+                */
+                //if (ep!=null && !ep.equals(LOCAL)) {
+                //byte[] value = StorageService.instance.db.get(partitionKey().getKey().array());
+                //byte ip[] = ep.get(0).getAddress();  
+                //int NodeID = (int)ip[3];
+                //DbImpl replicaDB = StorageService.instance.replicasDBMap.get(NodeID);
+                //if(replicaDB!=null){
+                    //byte[] value = replicaDB.get(partitionKey().getKey().array());  
+
+//StorageService.instance.db.mutex.lock();    
+                if(StorageService.instance.db!=null){
+                    //byte[] value = null;
+                    Token rightBound = StorageService.instance.getBoundToken(tk);
+                    String strToken = StorageService.instance.getTokenFactory().toString(tk);//////
+                    String groupID = StorageService.instance.getTokenFactory().toString(rightBound);
+                    int groupAccessNum = StorageService.instance.groupAccessNumMap.get(groupID);
+                    StorageService.instance.groupAccessNumMap.put(groupID, groupAccessNum + 1 );
+                    //byte[] value = StorageService.instance.db.get(strToken.getBytes(), NodeID, StorageService.instance.getTokenFactory().toString(rightBound));
+                    //logger.debug("look strToken:{}, rightBound:{}", strToken, rightBound);
+                    byte[] value = StorageService.instance.db.get(strToken.getBytes());//cfs.metadata
+                    //byte[] value = null;
+                    if(value!=null){
+                        //logger.debug("look strToken:{}, Value size:{}",strToken, value.length);
+                        //RebufferingInputStream bufIn = new DataInputBuffer(value);
+                        try{
+                            Mutation remutation = Mutation.serializer.deserializeToMutation(new DataInputBuffer(value), MessagingService.current_version);
+                            //String strKey1=ByteBufferUtil.string(remutation.key().getKey());
+                            //logger.debug("get key:{} in replicas,strKey1:{}", theKey, strKey1);
+                            for (PartitionUpdate update : remutation.getPartitionUpdates()){
+                                partition = update.unfilteredIterator();
+                                //UnfilteredRowIterator replicasIter = update.unfilteredIterator();
+                                //return replicasIter;
+                            }
+                        }catch(Throwable e){
+                            logger.debug("Mutation.serializer.deserialize failed in queryMemtableAndDiskInternal!");
+                        }
+                    }else{////////////////////////////////
+                        ClusteringIndexFilter filter = clusteringIndexFilter();
+                        partition = EmptyIterators.unfilteredRow(cfs.metadata, partitionKey(), filter.isReversed());
+                    }
+                }
+            //}
+//StorageService.instance.db.mutex.unlock();
+
         return new SingletonUnfilteredPartitionIterator(partition, isForThrift());
     }
 
@@ -519,6 +625,8 @@ public class SinglePartitionReadCommand extends ReadCommand
         assert !cfs.isIndex(); // CASSANDRA-5732
         assert cfs.isRowCacheEnabled() : String.format("Row cache is not enabled on table [%s]", cfs.name);
 
+        long startCache = System.currentTimeMillis();
+
         RowCacheKey key = new RowCacheKey(metadata().ksAndCFName, partitionKey());
 
         // Attempt a sentinel-read-cache sequence.  if a write invalidates our sentinel, we'll return our
@@ -532,6 +640,7 @@ public class SinglePartitionReadCommand extends ReadCommand
                 // Some other read is trying to cache the value, just do a normal non-caching read
                 Tracing.trace("Row cache miss (race)");
                 cfs.metric.rowCacheMiss.inc();
+                StorageService.instance.readRowCache += System.currentTimeMillis() - startCache;
                 return queryMemtableAndDisk(cfs, executionController);
             }
 
@@ -542,11 +651,13 @@ public class SinglePartitionReadCommand extends ReadCommand
                 Tracing.trace("Row cache hit");
                 UnfilteredRowIterator unfilteredRowIterator = clusteringIndexFilter().getUnfilteredRowIterator(columnFilter(), cachedPartition);
                 cfs.metric.updateSSTableIterated(0);
+                StorageService.instance.readRowCache += System.currentTimeMillis() - startCache;
                 return unfilteredRowIterator;
             }
 
             cfs.metric.rowCacheHitOutOfRange.inc();
             Tracing.trace("Ignoring row cache as cached value could not satisfy query");
+            StorageService.instance.readRowCache += System.currentTimeMillis() - startCache;
             return queryMemtableAndDisk(cfs, executionController);
         }
 
@@ -642,7 +753,7 @@ public class SinglePartitionReadCommand extends ReadCommand
                     cfs.invalidateCachedPartition(key);
             }
         }
-
+        StorageService.instance.readRowCache += System.currentTimeMillis() - startCache;
         Tracing.trace("Fetching data but not populating cache as query does not query from the start of the partition");
         return queryMemtableAndDisk(cfs, executionController);
     }
@@ -664,6 +775,7 @@ public class SinglePartitionReadCommand extends ReadCommand
      */
     public UnfilteredRowIterator queryMemtableAndDisk(ColumnFamilyStore cfs, ReadExecutionController executionController)
     {
+        //logger.debug("------in queryMemtableAndDisk:{}, totalSSTablesChecked:{}", StorageService.instance.totalSSTablesChecked); 
         assert executionController != null && executionController.validForReadOn(cfs);
         Tracing.trace("Executing single-partition query on {}", cfs.name);
 
@@ -677,7 +789,8 @@ public class SinglePartitionReadCommand extends ReadCommand
     }
 
     private UnfilteredRowIterator queryMemtableAndDiskInternal(ColumnFamilyStore cfs)
-    {
+    {     
+        StorageService.instance.readCommandNum++;
         /*
          * We have 2 main strategies:
          *   1) We query memtables and sstables simulateneously. This is our most generic strategy and the one we use
@@ -700,6 +813,8 @@ public class SinglePartitionReadCommand extends ReadCommand
 
         try
         {
+            logger.debug("--in queryMemtableAndDiskInternal, partitionKey token:{}, partitionKey:{}", partitionKey().getToken(), partitionKey());
+            long startMem = System.currentTimeMillis();
             for (Memtable memtable : view.memtables)
             {
                 Partition partition = memtable.getPartition(partitionKey());
@@ -715,7 +830,7 @@ public class SinglePartitionReadCommand extends ReadCommand
                 oldestUnrepairedTombstone = Math.min(oldestUnrepairedTombstone, partition.stats().minLocalDeletionTime);
                 iterators.add(RTBoundValidator.validate(iter, RTBoundValidator.Stage.MEMTABLE, false));
             }
-
+            StorageService.instance.readMemTable += System.currentTimeMillis() - startMem;
             /*
              * We can't eliminate full sstables based on the timestamp of what we've already read like
              * in collectTimeOrderedData, but we still want to eliminate sstable whose maxTimestamp < mostRecentTombstone
@@ -733,7 +848,7 @@ public class SinglePartitionReadCommand extends ReadCommand
             int nonIntersectingSSTables = 0;
             List<SSTableReader> skippedSSTablesWithTombstones = null;
             SSTableReadMetricsCollector metricsCollector = new SSTableReadMetricsCollector();
-
+            int checkedSSTableNum = 0;
             for (SSTableReader sstable : view.sstables)
             {
                 // if we've already seen a partition tombstone with a timestamp greater
@@ -763,6 +878,7 @@ public class SinglePartitionReadCommand extends ReadCommand
                     oldestUnrepairedTombstone = Math.min(oldestUnrepairedTombstone, sstable.getMinLocalDeletionTime());
 
                 iterators.add(iter);
+                checkedSSTableNum++;
                 mostRecentPartitionTombstone = Math.max(mostRecentPartitionTombstone,
                                                         iter.partitionLevelDeletion().markedForDeleteAt());
             }
@@ -783,13 +899,16 @@ public class SinglePartitionReadCommand extends ReadCommand
                         oldestUnrepairedTombstone = Math.min(oldestUnrepairedTombstone, sstable.getMinLocalDeletionTime());
 
                     iterators.add(iter);
+                    checkedSSTableNum++;
                     includedDueToTombstones++;
                 }
             }
             if (Tracing.isTracing())
                 Tracing.trace("Skipped {}/{} non-slice-intersecting sstables, included {} due to tombstones",
                                nonIntersectingSSTables, view.sstables.size(), includedDueToTombstones);
-
+            StorageService.instance.totalSSTablesChecked+=checkedSSTableNum;
+            StorageService.instance.totalSSTablesView+=view.sstables.size();
+            //logger.debug("------in queryMemtableAndDiskInternal:{}, totalSSTablesChecked:{}, checkedSSTableNum:{}", StorageService.instance.totalSSTablesChecked, checkedSSTableNum);   
             if (iterators.isEmpty())
                 return EmptyIterators.unfilteredRow(cfs.metadata, partitionKey(), filter.isReversed());
 
@@ -894,6 +1013,7 @@ public class SinglePartitionReadCommand extends ReadCommand
 
         ImmutableBTreePartition result = null;
 
+        long startMem = System.currentTimeMillis();
         Tracing.trace("Merging memtable contents");
         for (Memtable memtable : view.memtables)
         {
@@ -914,12 +1034,15 @@ public class SinglePartitionReadCommand extends ReadCommand
                 );
             }
         }
+        StorageService.instance.readMemTable += System.currentTimeMillis() - startMem;
+        //logger.debug("--in queryMemtableAndSSTablesInTimestampOrder, partitionKey token:{}, partitionKey:{}", partitionKey().getToken(), partitionKey());
 
         /* add the SSTables on disk */
         Collections.sort(view.sstables, SSTableReader.maxTimestampDescending);
         boolean onlyUnrepaired = true;
         // read sorted sstables
         SSTableReadMetricsCollector metricsCollector = new SSTableReadMetricsCollector();
+        int checkedSSTableNum = 0;
         for (SSTableReader sstable : view.sstables)
         {
             // if we've already seen a partition tombstone with a timestamp greater
@@ -952,6 +1075,7 @@ public class SinglePartitionReadCommand extends ReadCommand
                                                                                        isForThrift(),
                                                                                        metricsCollector))
                 {
+                    checkedSSTableNum++;
                     if (!iter.partitionLevelDeletion().isLive())
                     {
                         result = add(
@@ -1000,9 +1124,14 @@ public class SinglePartitionReadCommand extends ReadCommand
                     filter,
                     sstable.isRepaired()
                 );
+                checkedSSTableNum++;
             }
         }
 
+        StorageService.instance.totalSSTablesChecked+=checkedSSTableNum;
+        StorageService.instance.totalSSTablesView+=view.sstables.size();
+        //logger.debug("------in queryMemtableAndSSTablesInTimestampOrder, totalSSTablesChecked:{}, checkedSSTableNum:{}, totalSSTablesView:{}", StorageService.instance.totalSSTablesChecked, checkedSSTableNum, StorageService.instance.totalSSTablesView);   
+           
         cfs.metric.updateSSTableIterated(metricsCollector.getMergedSSTables());
 
         if (result == null || result.isEmpty())

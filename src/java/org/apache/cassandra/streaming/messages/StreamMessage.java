@@ -92,6 +92,7 @@ public abstract class StreamMessage
     /** StreamMessage types */
     public static enum Type
     {
+        REPLICAFILE(0, 0, IncomingReplicaFileMessage.serializer, OutgoingFileMessage.serializer),/////
         PREPARE(1, 5, PrepareMessage.serializer),
         FILE(2, 0, IncomingFileMessage.serializer, OutgoingFileMessage.serializer),
         RECEIVED(3, 4, ReceivedMessage.serializer),

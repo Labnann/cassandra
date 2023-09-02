@@ -26,6 +26,8 @@ import org.slf4j.LoggerFactory;
 import org.apache.cassandra.concurrent.DebuggableThreadPoolExecutor;
 import org.apache.cassandra.utils.FBUtilities;
 
+import java.nio.ByteBuffer;
+
 /**
  * {@link StreamCoordinator} is a helper class that abstracts away maintaining multiple
  * StreamSession and ProgressInfo instances per peer.
@@ -201,6 +203,13 @@ public class StreamCoordinator
             StreamSession session = sessionList.getOrCreateNextSession(to, to);
             session.addTransferFiles(sstableDetails);
         }
+    }
+
+    public synchronized void transferReplicaFile(InetAddress to, ByteBuffer replicaFile)
+    {
+        HostStreamingData sessionList = getOrCreateHostData(to);
+        StreamSession session = sessionList.getOrCreateNextSession(to, to);
+        //session.addTransferReplicaFile(replicaFile);
     }
 
     private List<List<StreamSession.SSTableStreamingSections>> sliceSSTableDetails(Collection<StreamSession.SSTableStreamingSections> sstableDetails)

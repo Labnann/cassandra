@@ -41,6 +41,7 @@ import org.apache.cassandra.utils.btree.BTree;
 import org.apache.cassandra.utils.btree.BTreeSearchIterator;
 import org.apache.cassandra.utils.btree.BTreeRemoval;
 import org.apache.cassandra.utils.btree.UpdateFunction;
+import org.apache.cassandra.service.StorageService;
 
 /**
  * An immutable and sorted list of (non-PK) columns for a given table.
@@ -523,6 +524,7 @@ public class Columns extends AbstractCollection<ColumnDefinition> implements Col
         public Columns deserializeSubset(Columns superset, DataInputPlus in) throws IOException
         {
             long encoded = in.readUnsignedVInt();
+            StorageService.instance.totalReadBytes+=4;////
             if (encoded == 0L)
             {
                 return superset;
@@ -622,6 +624,7 @@ public class Columns extends AbstractCollection<ColumnDefinition> implements Col
                 for (int i = 0 ; i < columnCount ; i++)
                 {
                     int idx = (int) in.readUnsignedVInt();
+                    StorageService.instance.totalReadBytes+=4;////
                     builder.add(BTree.findByIndex(superset.columns, idx));
                 }
             }
@@ -633,6 +636,7 @@ public class Columns extends AbstractCollection<ColumnDefinition> implements Col
                 while (true)
                 {
                     int nextMissingIndex = skipped < delta ? (int)in.readUnsignedVInt() : supersetCount;
+                    //StorageService.instance.totalReadBytes+=4;////
                     while (idx < nextMissingIndex)
                     {
                         ColumnDefinition def = iter.next();

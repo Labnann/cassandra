@@ -34,6 +34,7 @@ import org.apache.cassandra.io.util.FileDataInput;
 import org.apache.cassandra.io.util.DataPosition;
 import org.apache.cassandra.io.util.FileHandle;
 import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.service.StorageService;
 
 public abstract class AbstractSSTableIterator implements UnfilteredRowIterator
 {
@@ -84,6 +85,7 @@ public abstract class AbstractSSTableIterator implements UnfilteredRowIterator
             boolean shouldCloseFile = file == null;
             try
             {
+                long startDataBlock = System.currentTimeMillis();
                 // We seek to the beginning to the partition if either:
                 //   - the partition is not indexed; we then have a single block to read anyway
                 //     (and we need to read the partition deletion time).
@@ -124,6 +126,9 @@ public abstract class AbstractSSTableIterator implements UnfilteredRowIterator
 
                 if (reader == null && file != null && shouldCloseFile)
                     file.close();
+
+            StorageService.instance.readSSTables += System.currentTimeMillis() - startDataBlock;
+
             }
             catch (IOException e)
             {

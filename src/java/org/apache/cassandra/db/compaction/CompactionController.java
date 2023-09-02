@@ -165,13 +165,14 @@ public class CompactionController implements AutoCloseable
                                                              boolean ignoreOverlaps)
     {
         logger.trace("Checking droppable sstables in {}", cfStore);
-
+        logger.debug("Checking droppable sstables in {}", cfStore);
         if (NEVER_PURGE_TOMBSTONES || compacting == null)
             return Collections.emptySet();
 
         if (cfStore.getCompactionStrategyManager().onlyPurgeRepairedTombstones() && !Iterables.all(compacting, SSTableReader::isRepaired))
             return Collections.emptySet();
 
+        //if (ignoreOverlaps || cfStore.name.equals("globalReplicaTable"))
         if (ignoreOverlaps)
         {
             Set<SSTableReader> fullyExpired = new HashSet<>();
@@ -184,6 +185,7 @@ public class CompactionController implements AutoCloseable
                                  candidate, candidate.getSSTableMetadata().maxLocalDeletionTime, gcBefore);
                 }
             }
+            logger.debug("in ignoreOverlaps, cfStore:{}, fullyExpired size:{}", cfStore.name, fullyExpired.size());
             return fullyExpired;
         }
 
@@ -228,6 +230,7 @@ public class CompactionController implements AutoCloseable
                         candidate, candidate.getSSTableMetadata().maxLocalDeletionTime, gcBefore);
             }
         }
+        logger.debug("------cfStore:{}, candidates size:{}", cfStore.name, candidates.size());
         return new HashSet<>(candidates);
     }
 

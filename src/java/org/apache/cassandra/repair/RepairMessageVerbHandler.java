@@ -36,6 +36,7 @@ import org.apache.cassandra.net.MessageOut;
 import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.repair.messages.*;
 import org.apache.cassandra.service.ActiveRepairService;
+import org.apache.cassandra.service.StorageService;
 
 /**
  * Handles all repair related message.
@@ -55,6 +56,8 @@ public class RepairMessageVerbHandler implements IVerbHandler<RepairMessage>
             {
                 case PREPARE_MESSAGE:
                     PrepareMessage prepareMessage = (PrepareMessage) message.payload;
+                    StorageService.instance.repairNodeIP = message.from;
+                    logger.debug("message.from: {}", message.from);
                     logger.debug("Preparing, {}", prepareMessage);
                     List<ColumnFamilyStore> columnFamilyStores = new ArrayList<>(prepareMessage.cfIds.size());
                     for (UUID cfId : prepareMessage.cfIds)

@@ -72,6 +72,9 @@ import org.apache.cassandra.thrift.ThriftServer;
 import org.apache.cassandra.tracing.Tracing;
 import org.apache.cassandra.utils.*;
 import org.apache.cassandra.security.ThreadAwareSecurityManager;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /**
  * The <code>CassandraDaemon</code> is an abstraction for a Cassandra daemon
@@ -432,7 +435,15 @@ public class CassandraDaemon
 
         // schedule periodic background compaction task submission. this is simply a backstop against compactions stalling
         // due to scheduling errors or race conditions
-        ScheduledExecutors.optionalTasks.scheduleWithFixedDelay(ColumnFamilyStore.getBackgroundCompactionTaskSubmitter(), 5, 1, TimeUnit.MINUTES);
+        //ScheduleskSubmitter(), 5, 1, TimeUnit.MINUTES);
+        ScheduledExecutors.optionalTasks.scheduleWithFixedDelay(ColumnFamilyStore.getBackgroundCompactionTaskSubmitter(), 5, 30, TimeUnit.SECONDS);//20
+        //ScheduledExecutors.optionalTasks.scheduleWithFixedDelay(ColumnFamilyStore.getBackgroundCompactionTaskSubmitter(), 5, 4, TimeUnit.MINUTES);
+
+        //ScheduledExecutors.optionalTasks.scheduleWithFixedDelay(ColumnFamilyStore.getBackgroundGlobalSplitTaskSubmitter(), 5, StorageService.instance.splitDelay, TimeUnit.SECONDS);
+        //ScheduledExecutors.optionalTasks.scheduleWithFixedDelay(ColumnFamilyStore.getBackgroundGlobalSplitTaskSubmitter(), 10, 6, TimeUnit.MINUTES);
+
+        ScheduledExecutorService splitExecutor = Executors.newSingleThreadScheduledExecutor();
+        splitExecutor.scheduleWithFixedDelay(ColumnFamilyStore.getBackgroundGlobalSplitTaskSubmitter(), 5, 10, TimeUnit.SECONDS);//60//30//10
 
         // Thrift
         InetAddress rpcAddr = DatabaseDescriptor.getRpcAddress();

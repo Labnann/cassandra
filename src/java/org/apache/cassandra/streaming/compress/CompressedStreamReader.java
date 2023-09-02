@@ -37,6 +37,7 @@ import org.apache.cassandra.streaming.StreamSession;
 import org.apache.cassandra.streaming.messages.FileMessageHeader;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.Pair;
+import org.apache.cassandra.service.StorageService;
 
 import static org.apache.cassandra.utils.Throwables.extractIOExceptionCause;
 
@@ -63,8 +64,10 @@ public class CompressedStreamReader extends StreamReader
     @SuppressWarnings("resource") // channel needs to remain open, streams on top of it can't be closed
     public SSTableMultiWriter read(ReadableByteChannel channel) throws IOException
     {
+        long beginTime = System.currentTimeMillis();//////
         long totalSize = totalSize();
-
+        logger.debug("session desc:{}, in StreamReader read,totalSize:{}",session.description(), totalSize);
+        
         Pair<String, String> kscf = Schema.instance.getCF(cfId);
         ColumnFamilyStore cfs = null;
         if (kscf != null)
@@ -104,13 +107,17 @@ public class CompressedStreamReader extends StreamReader
 
                 while (in.getBytesRead() < sectionLength)
                 {
-                    writePartition(deserializer, writer);
+                    writePartition(deserializer, writer, cfs); //////
                     // when compressed, report total bytes of compressed chunks read since remoteFile.size is the sum of chunks transferred
                     session.progress(filename, ProgressInfo.Direction.IN, cis.getTotalCompressedBytesRead(), totalSize);
                 }
             }
             logger.debug("[Stream #{}] Finished receiving file #{} from {} readBytes = {}, totalSize = {}", session.planId(), fileSeqNum,
                          session.peer, FBUtilities.prettyPrintMemory(cis.getTotalCompressedBytesRead()), FBUtilities.prettyPrintMemory(totalSize));
+            
+            long endTime = System.currentTimeMillis();
+            StorageService.instance.recieveWriteLSM+= endTime-beginTime;
+
             return writer;
         }
         catch (Throwable e)

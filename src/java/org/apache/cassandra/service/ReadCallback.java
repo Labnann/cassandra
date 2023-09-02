@@ -164,12 +164,13 @@ public class ReadCallback implements IAsyncCallbackWithFailure<ReadResponse>
             condition.signalAll();
             // kick off a background digest comparison if this is a result that (may have) arrived after
             // the original resolve that get() kicks off as soon as the condition is signaled
+            
             if (blockfor < endpoints.size() && n == endpoints.size())
             {
                 TraceState traceState = Tracing.instance.get();
                 if (traceState != null)
                     traceState.trace("Initiating read-repair");
-                StageManager.getStage(Stage.READ_REPAIR).execute(new AsyncRepairRunner(traceState, queryStartNanoTime));
+                //StageManager.getStage(Stage.READ_REPAIR).execute(new AsyncRepairRunner(traceState, queryStartNanoTime));
             }
         }
     }

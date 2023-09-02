@@ -59,6 +59,7 @@ import org.apache.cassandra.utils.memory.MemtableAllocator;
 import org.apache.cassandra.utils.memory.MemtablePool;
 import org.apache.cassandra.utils.memory.NativePool;
 import org.apache.cassandra.utils.memory.SlabPool;
+import org.apache.cassandra.service.StorageService;
 
 public class Memtable implements Comparable<Memtable>
 {
@@ -453,6 +454,8 @@ public class Memtable implements Comparable<Memtable>
 
         private void writeSortedContents()
         {
+            long startFlush = System.currentTimeMillis();
+
             logger.debug("Writing {}, flushed range = ({}, {}]", Memtable.this.toString(), from, to);
 
             boolean trackContention = logger.isTraceEnabled();
@@ -488,6 +491,8 @@ public class Memtable implements Comparable<Memtable>
                                                                               commitLogUpperBound);
             // Update the metrics
             cfs.metric.bytesFlushed.inc(bytesFlushed);
+            
+            StorageService.instance.flushMemTable += System.currentTimeMillis() - startFlush;
 
             if (heavilyContendedRowCount > 0)
                 logger.trace("High update contention in {}/{} partitions of {} ", heavilyContendedRowCount, toFlush.size(), Memtable.this);

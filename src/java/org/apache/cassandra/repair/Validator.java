@@ -86,6 +86,10 @@ public class Validator implements Runnable
         this.evenTreeDistribution = evenTreeDistribution;
     }
 
+    public long getValidated(){
+        return validated;
+    }
+
     public void prepare(ColumnFamilyStore cfs, MerkleTrees tree)
     {
         this.trees = tree;

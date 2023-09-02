@@ -46,6 +46,7 @@ import org.apache.cassandra.io.sstable.ISSTableScanner;
 import org.apache.cassandra.io.sstable.metadata.MetadataCollector;
 import org.apache.cassandra.schema.CompactionParams;
 import org.apache.cassandra.utils.JVMStabilityInspector;
+import org.apache.cassandra.service.StorageService;
 
 /**
  * Pluggable compaction strategy determines how SSTables get merged.
@@ -248,7 +249,7 @@ public abstract class AbstractCompactionStrategy
     public void replaceFlushed(Memtable memtable, Collection<SSTableReader> sstables)
     {
         cfs.getTracker().replaceFlushed(memtable, sstables);
-        if (sstables != null && !sstables.isEmpty())
+        if (sstables != null && !sstables.isEmpty() && StorageService.instance.FlushTriggeredCompaction && !cfs.name.equals("globalReplicaTable")) //////
             CompactionManager.instance.submitBackground(cfs);
     }
 

@@ -37,6 +37,7 @@ import org.apache.cassandra.io.sstable.metadata.IMetadataComponentSerializer;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputPlus;
 import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.service.StorageService;
 
 public class SerializationHeader
 {
@@ -186,16 +187,19 @@ public class SerializationHeader
 
     public long readTimestamp(DataInputPlus in) throws IOException
     {
+        StorageService.instance.totalReadBytes+=4;////
         return in.readUnsignedVInt() + stats.minTimestamp;
     }
 
     public int readLocalDeletionTime(DataInputPlus in) throws IOException
     {
+        StorageService.instance.totalReadBytes+=4;////
         return (int)in.readUnsignedVInt() + stats.minLocalDeletionTime;
     }
 
     public int readTTL(DataInputPlus in) throws IOException
     {
+        StorageService.instance.totalReadBytes+=4;////
         return (int)in.readUnsignedVInt() + stats.minTTL;
     }
 

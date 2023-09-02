@@ -371,7 +371,13 @@ public abstract class ReadCommand extends MonitorableImpl implements ReadQuery
      */
     public abstract ReadCommand copyAsDigestQuery();
 
+    protected abstract UnfilteredPartitionIterator queryStorage(ColumnFamilyStore cfs, ReadExecutionController executionController, int []findResults, String ksName);
+
     protected abstract UnfilteredPartitionIterator queryStorage(ColumnFamilyStore cfs, ReadExecutionController executionController);
+
+    protected abstract UnfilteredPartitionIterator queryLocalRegion(ColumnFamilyStore cfs, List<UnfilteredPartitionIterator> iterators);
+
+    public abstract ColumnFamilyStore getColumnFamilyStorefromMultiReplicas(CFMetaData cfm);
 
     protected abstract int oldestUnrepairedTombstone();
 
@@ -400,12 +406,44 @@ public abstract class ReadCommand extends MonitorableImpl implements ReadQuery
              : null;
     }
 
-    static IndexMetadata findIndex(CFMetaData table, RowFilter rowFilter)
+    /*static IndexMetadata findIndex(CFMetaData table, RowFilter rowFilter)
     {
         if (table.getIndexes().isEmpty() || rowFilter.isEmpty())
             return null;
 
         ColumnFamilyStore cfs = Keyspace.openAndGetStore(table);
+
+        Index index = cfs.indexManager.getBestIndexFor(rowFilter);
+
+        return null != index
+             ? index.getIndexMetadata()
+             : null;
+    }*/
+
+    static IndexMetadata findIndex(CFMetaData table, RowFilter rowFilter, DecoratedKey partitionKey)
+    {
+        if (table.getIndexes().isEmpty() || rowFilter.isEmpty())
+            return null;
+
+        //ColumnFamilyStore cfs = Keyspace.openAndGetStore(table);
+        ColumnFamilyStore cfs = Keyspace.openAndgetColumnFamilyStoreByToken(table, partitionKey.getToken());//////
+        //ColumnFamilyStore cfs = command.getColumnFamilyStorefromMultiReplicas(table);
+
+        Index index = cfs.indexManager.getBestIndexFor(rowFilter);
+
+        return null != index
+             ? index.getIndexMetadata()
+             : null;
+    }
+
+    static IndexMetadata findIndex(CFMetaData table, RowFilter rowFilter, DataRange dataRange)
+    {
+        if (table.getIndexes().isEmpty() || rowFilter.isEmpty())
+            return null;
+
+        //ColumnFamilyStore cfs = Keyspace.openAndGetStore(table);
+        ColumnFamilyStore cfs = Keyspace.openAndgetColumnFamilyStoreByRingPosition(table.ksName, dataRange.stopKey());
+        //ColumnFamilyStore cfs = command.getColumnFamilyStorefromMultiReplicas(table);
 
         Index index = cfs.indexManager.getBestIndexFor(rowFilter);
 
@@ -422,7 +460,8 @@ public abstract class ReadCommand extends MonitorableImpl implements ReadQuery
      */
     public void maybeValidateIndex()
     {
-        Index index = getIndex(Keyspace.openAndGetStore(metadata));
+        //Index index = getIndex(Keyspace.openAndGetStore(metadata));
+        Index index = getIndex(getColumnFamilyStorefromMultiReplicas(metadata));
         if (null != index)
             index.validate(this);
     }
@@ -440,7 +479,9 @@ public abstract class ReadCommand extends MonitorableImpl implements ReadQuery
     {
         long startTimeNanos = System.nanoTime();
 
-        ColumnFamilyStore cfs = Keyspace.openAndGetStore(metadata());
+        //ColumnFamilyStore cfs = Keyspace.openAndGetStore(metadata());
+        ColumnFamilyStore cfs = getColumnFamilyStorefromMultiReplicas(metadata());
+
         Index index = getIndex(cfs);
 
         Index.Searcher searcher = null;
@@ -453,7 +494,32 @@ public abstract class ReadCommand extends MonitorableImpl implements ReadQuery
             Tracing.trace("Executing read on {}.{} using index {}", cfs.metadata.ksName, cfs.metadata.cfName, index.getIndexMetadata().name);
         }
 
-        UnfilteredPartitionIterator iterator = (null == searcher) ? queryStorage(cfs, executionController) : searcher.search(executionController);
+        int []findResults = new int[2];
+        findResults[0] = 1;
+        findResults[1] = 1;
+        //logger.debug("int executeLocally, read from cfs:{}, cfs.name:{}", cfs, cfs.name);
+        UnfilteredPartitionIterator iterator = (null == searcher) ? queryStorage(cfs, executionController, findResults, metadata().ksName) : searcher.search(executionController);
+        /////////////////////////////////////////////////
+        //if(cfs.name.equals("globalReplicaTable") && findResults[0]==0 ){  //read not find in global log, then search local log
+        if(cfs.name.equals("globalReplicaTable")){  
+
+            if(findResults[0]==0){
+                List<UnfilteredPartitionIterator> iterators = new ArrayList<>(1); 
+                //logger.debug("####read in globalReplicaTable failed! then read local region");
+                iterator = queryLocalRegion(cfs, iterators);
+            }
+
+            if(findResults[1]==0){
+                List<UnfilteredPartitionIterator> iterators = new ArrayList<>(); 
+                iterators.add(iterator);   
+                logger.debug("####Scan in globalReplicaTable failed! then scan local region");
+                iterator = queryLocalRegion(cfs, iterators);
+            }
+            //iterator = (null == searcher) ? queryStorage(cfs, executionController) : searcher.search(executionController);
+        }
+        
+        ////////////////////////////////////////////////
+
         iterator = RTBoundValidator.validate(iterator, Stage.MERGED, false);
 
         try

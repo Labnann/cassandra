@@ -1070,6 +1070,8 @@ public class StorageProxy implements StorageProxyMBean
         String keyspaceName = mutation.getKeyspaceName();
         AbstractReplicationStrategy rs = Keyspace.open(keyspaceName).getReplicationStrategy();
 
+        ////
+        StorageService.instance.WriteConsistencyLevel = consistency_level; //////
         Token tk = mutation.key().getToken();
         List<InetAddress> naturalEndpoints = StorageService.instance.getNaturalEndpoints(keyspaceName, tk);
         Collection<InetAddress> pendingEndpoints = StorageService.instance.getTokenMetadata().pendingEndpointsFor(tk, keyspaceName);
@@ -1702,8 +1704,11 @@ public class StorageProxy implements StorageProxyMBean
             readMetrics.addNano(latency);
             readMetricsMap.get(consistencyLevel).addNano(latency);
             // TODO avoid giving every command the same latency number.  Can fix this in CASSADRA-5329
-            for (ReadCommand command : group.commands)
+            for (ReadCommand command : group.commands){
                 Keyspace.openAndGetStore(command.metadata()).metric.coordinatorReadLatency.update(latency, TimeUnit.NANOSECONDS);
+                //command.getColumnFamilyStorefromMultiReplicas(command.metadata()).metric.coordinatorReadLatency.update(latency, TimeUnit.NANOSECONDS);
+                //logger.debug("---in readRegular, cfs cfId:{}, cfs:{}", command.metadata().cfId, command.metadata().cfName);
+            }
         }
     }
 
@@ -1912,7 +1917,20 @@ public class StorageProxy implements StorageProxyMBean
     public static List<InetAddress> getLiveSortedEndpoints(Keyspace keyspace, RingPosition pos)
     {
         List<InetAddress> liveEndpoints = StorageService.instance.getLiveNaturalEndpoints(keyspace, pos);
+        InetAddress primaryIP = liveEndpoints.get(0);//////
+        //logger.debug("####primaryIP:{}, liveEndpoints:{}", primaryIP, liveEndpoints);
         DatabaseDescriptor.getEndpointSnitch().sortByProximity(FBUtilities.getBroadcastAddress(), liveEndpoints);
+        if(StorageService.instance.repairNodeIP==null || (StorageService.instance.repairNodeIP!=null && !StorageService.instance.repairNodeIP.equals(primaryIP))){
+            liveEndpoints.remove(primaryIP);//////
+            liveEndpoints.add(0, primaryIP);//////
+        }else{
+            liveEndpoints.remove(primaryIP);//////
+        }
+            
+        if(StorageService.instance.repairNodeIP!=null){
+            liveEndpoints.remove(StorageService.instance.repairNodeIP);
+        }
+        //logger.debug("####after sortByProximity, primaryIP:{}, liveEndpoints:{}", primaryIP, liveEndpoints);//////
         return liveEndpoints;
     }
 
@@ -1989,6 +2007,7 @@ public class StorageProxy implements StorageProxyMBean
                 return endOfData();
 
             AbstractBounds<PartitionPosition> range = ranges.next();
+            //logger.debug("####in RangeIterator, range:{}", range);//////
             List<InetAddress> liveEndpoints = getLiveSortedEndpoints(keyspace, range.right);
             return new RangeForQuery(range,
                                      liveEndpoints,
@@ -2196,7 +2215,7 @@ public class StorageProxy implements StorageProxyMBean
             PartitionRangeReadCommand rangeCommand = command.forSubRange(toQuery.range, isFirst);
 
             DataResolver resolver = new DataResolver(keyspace, rangeCommand, consistency, toQuery.filteredEndpoints.size(), queryStartNanoTime);
-
+            //logger.debug("####in PartitionRange query, toQuery.range:{}, toQuery.filteredEndpoints:{}", toQuery.range, toQuery.filteredEndpoints);//////
             int blockFor = consistency.blockFor(keyspace);
             int minResponses = Math.min(toQuery.filteredEndpoints.size(), blockFor);
             List<InetAddress> minimalEndpoints = toQuery.filteredEndpoints.subList(0, minResponses);
@@ -2250,6 +2269,9 @@ public class StorageProxy implements StorageProxyMBean
                 long latency = System.nanoTime() - startTime;
                 rangeMetrics.addNano(latency);
                 Keyspace.openAndGetStore(command.metadata()).metric.coordinatorScanLatency.update(latency, TimeUnit.NANOSECONDS);
+                //command.getColumnFamilyStorefromMultiReplicas(command.metadata()).metric.coordinatorScanLatency.update(latency, TimeUnit.NANOSECONDS);
+                //logger.debug("---in close(), cfs cfId:{}, cfs:{}", command.metadata().cfId, command.getColumnFamilyStorefromMultiReplicas(command.metadata()).name);
+                logger.debug("---in close(), cfs cfId:{}, cfs:{}", command.metadata().cfId, Keyspace.openAndGetStore(command.metadata()).name);
             }
         }
     }

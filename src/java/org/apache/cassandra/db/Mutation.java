@@ -393,6 +393,18 @@ public class Mutation implements IMutation
                 PartitionUpdate.serializer.serialize(entry.getValue(), out, version);
         }
 
+        public void serializeToValue(Mutation mutation, DataOutputPlus out, int version) throws IOException
+        {
+            if (version < MessagingService.VERSION_20)
+                out.writeUTF(mutation.getKeyspaceName());
+            /* serialize the modifications in the mutation */
+            int size = mutation.modifications.size();
+            out.writeUnsignedVInt(size);
+            assert size > 0;
+            for (Map.Entry<UUID, PartitionUpdate> entry : mutation.modifications.entrySet())
+                PartitionUpdate.serializer.serialize(entry.getValue(), out, version);
+        }
+
         public Mutation deserialize(DataInputPlus in, int version, SerializationHelper.Flag flag) throws IOException
         {
             if (version < MessagingService.VERSION_20)
@@ -427,6 +439,35 @@ public class Mutation implements IMutation
             }
 
             return new Mutation(update.metadata().ksName, dk, modifications);
+        }
+
+        public Mutation deserializeToMutation(DataInputPlus in, int version, SerializationHelper.Flag flag) throws IOException
+        {
+            if (version < MessagingService.VERSION_20)
+                in.readUTF(); // read pre-2.0 keyspace name
+            ByteBuffer key = null;
+            int size;
+            size = (int)in.readUnsignedVInt();
+            assert size > 0;
+            PartitionUpdate update = PartitionUpdate.serializer.deserialize(in, version, flag, key);
+            if (size == 1)
+                return new Mutation(update);
+
+            Map<UUID, PartitionUpdate> modifications = new HashMap<>(size);
+            DecoratedKey dk = update.partitionKey();
+
+            modifications.put(update.metadata().cfId, update);
+            for (int i = 1; i < size; ++i)
+            {
+                update = PartitionUpdate.serializer.deserialize(in, version, flag, dk);
+                modifications.put(update.metadata().cfId, update);
+            }
+            return new Mutation(update.metadata().ksName, dk, modifications);
+        }
+
+        public Mutation deserializeToMutation(DataInputPlus in, int version) throws IOException
+        {
+            return deserializeToMutation(in, version, SerializationHelper.Flag.FROM_REMOTE);
         }
 
         public Mutation deserialize(DataInputPlus in, int version) throws IOException

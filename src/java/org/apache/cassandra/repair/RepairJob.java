@@ -29,6 +29,7 @@ import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.tracing.Tracing;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.Pair;
+import org.apache.cassandra.service.StorageService;
 
 /**
  * RepairJob runs repair on given ColumnFamily.
@@ -66,6 +67,9 @@ public class RepairJob extends AbstractFuture<RepairResult> implements Runnable
      */
     public void run()
     {
+        StorageService.instance.beginMTrees = System.currentTimeMillis();//////
+        StorageService.instance.maxTime = 0;//////
+
         List<InetAddress> allEndpoints = new ArrayList<>(session.endpoints);
         allEndpoints.add(FBUtilities.getBroadcastAddress());
 
@@ -105,6 +109,12 @@ public class RepairJob extends AbstractFuture<RepairResult> implements Runnable
         {
             public ListenableFuture<List<SyncStat>> apply(List<TreeResponse> trees)
             {
+                 ///////////////////////
+                //StorageService.instance.buildMTrees+=StorageService.instance.maxTime;
+                StorageService.instance.sessionBuildMTreeTime[StorageService.instance.sessionCount++]=StorageService.instance.maxTime;
+                logger.debug("sessionCount:{}, maxTime:{}, buildMTrees:{}, trees.size:{}", StorageService.instance.sessionCount, StorageService.instance.maxTime, StorageService.instance.buildMTrees, trees.size());              
+                //////////////////////////
+
                 InetAddress local = FBUtilities.getLocalAddress();
 
                 List<SyncTask> syncTasks = new ArrayList<>();

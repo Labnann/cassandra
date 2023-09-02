@@ -308,10 +308,12 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean
 
     void scheduleFlush()
     {
-        int period = metadata.params.memtableFlushPeriodInMs;
+        int period = metadata.params.memtableFlushPeriodInMs*6;
+        //int period = 20;
         if (period > 0)
         {
             logger.trace("scheduling flush in {} ms", period);
+            logger.debug("scheduling flush in {} ms, metadata.params.memtableFlushPeriodInMs:{}", period, metadata.params.memtableFlushPeriodInMs);
             WrappedRunnable runnable = new WrappedRunnable()
             {
                 protected void runMayThrow()
@@ -320,8 +322,10 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean
                     {
                         Memtable current = data.getView().getCurrentMemtable();
                         // if we're not expired, we've been hit by a scheduled flush for an already flushed memtable, so ignore
+                        //if (current.isExpired() && current.getLiveDataSize() > 10485760)///////////////
                         if (current.isExpired())
                         {
+                            logger.debug("----flushing memtable, size: {}", current.getLiveDataSize());
                             if (current.isClean())
                             {
                                 // if we're still clean, instead of swapping just reschedule a flush for later
@@ -340,18 +344,48 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean
         }
     }
 
+    public long getCFSMemTableSize(){
+        Memtable current = data.getView().getCurrentMemtable();
+        return current.getLiveDataSize();
+    }
+
     public static Runnable getBackgroundCompactionTaskSubmitter()
     {
         return new Runnable()
         {
             public void run()
             {
-                for (Keyspace keyspace : Keyspace.all())
-                    for (ColumnFamilyStore cfs : keyspace.getColumnFamilyStores())
-                        CompactionManager.instance.submitBackground(cfs);
+                for (Keyspace keyspace : Keyspace.all()){
+                    for (ColumnFamilyStore cfs : keyspace.getColumnFamilyStores()){
+                        if(!cfs.name.equals("globalReplicaTable")){
+                            logger.debug("in getBackgroundCompactionTaskSubmitter, cfs.name:{}",cfs.name);
+                            CompactionManager.instance.submitBackground(cfs);
+                        }
+                    }
+                }
             }
         };
     }
+
+////////////////////
+    public static Runnable getBackgroundGlobalSplitTaskSubmitter()
+    {
+        return new Runnable()
+        {
+            public void run()
+            {
+                for (Keyspace keyspace : Keyspace.all()){
+                    for (ColumnFamilyStore cfs : keyspace.getColumnFamilyStores()){
+                        if(cfs.name.equals("globalReplicaTable") && !StorageService.instance.doingGlobalSplit){
+                            logger.debug("in getBackgroundGlobalSplitTaskSubmitter, cfs.name:{}",cfs.name);
+                            CompactionManager.instance.submitBackgroundSplit(cfs);
+                        }
+                    }
+                }
+            }
+        };
+    }
+//////////////////
 
     public void setCompactionParametersJson(String options)
     {
@@ -886,9 +920,13 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean
     {
         synchronized (data)
         {
-            if (data.getView().getCurrentMemtable() == memtable)
+            //if (data.getView().getCurrentMemtable() == memtable && memtable.getLiveDataSize() > 20971520){
+            if (data.getView().getCurrentMemtable() == memtable){
+                //logger.debug("-----switchMemtableIfCurrent memtable, size: {}, return", memtable.getLiveDataSize());
                 return switchMemtable();
+            }
         }
+
         return waitForFlushes();
     }
 
@@ -953,6 +991,10 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean
         synchronized (data)
         {
             Memtable current = data.getView().getCurrentMemtable();
+            /*if(current.getLiveDataSize() < 10485760){//////
+                logger.debug("in forceFlush memtable return, size: {}", current.getLiveDataSize());
+                return null;
+            }//////*/
             for (ColumnFamilyStore cfs : concatWithIndexes())
                 if (!cfs.data.getView().getCurrentMemtable().isClean())
                     return switchMemtableIfCurrent(current);
@@ -972,6 +1014,10 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean
         // we don't loop through the remaining memtables since here we only care about commit log dirtiness
         // and this does not vary between a table and its table-backed indexes
         Memtable current = data.getView().getCurrentMemtable();
+        /*if(current.getLiveDataSize() < 10485760){//////
+            logger.debug("in forceFlush2 memtable return, size: {}", current.getLiveDataSize());
+            return null;
+        }//////*/
         if (current.mayContainDataBefore(flushIfDirtyBefore))
             return switchMemtableIfCurrent(current);
         return waitForFlushes();
@@ -986,6 +1032,11 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean
         // we grab the current memtable; once any preceding memtables have flushed, we know its
         // commitLogLowerBound has been set (as this it is set with the upper bound of the preceding memtable)
         final Memtable current = data.getView().getCurrentMemtable();
+        /*if(current.getLiveDataSize() < 10485760){//////
+            logger.debug("in waitForFlushes memtable return, size: {}", current.getLiveDataSize());
+            return null;
+        }//////*/
+
         ListenableFutureTask<CommitLogPosition> task = ListenableFutureTask.create(() -> {
             logger.debug("forceFlush requested but everything is clean in {}", name);
             return current.getCommitLogLowerBound();
@@ -1082,6 +1133,13 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean
             AtomicReference<CommitLogPosition> commitLogUpperBound = new AtomicReference<>();
             for (ColumnFamilyStore cfs : concatWithIndexes())
             {
+                //////////////////////
+                /*if(StorageService.instance.largestCFS!=null && !cfs.name.equals(StorageService.instance.largestCFS.name)){
+                    logger.debug("-----ignore small cfs: {}, return", cfs.name);
+                    continue;
+                }*/
+                /////////////////////
+
                 // switch all memtables, regardless of their dirty status, setting the barrier
                 // so that we can reach a coordinated decision about cleanliness once they
                 // are no longer possible to be modified
@@ -1236,11 +1294,13 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean
                          FBUtilities.prettyPrintMemory(totalBytesOnDisk),
                          FBUtilities.prettyPrintMemory(maxBytesOnDisk),
                          FBUtilities.prettyPrintMemory(minBytesOnDisk));
+            memtable.cfs.getCompactionStrategyManager().getScanners(sstables);//////
             return sstables;
         }
 
         private void reclaim(final Memtable memtable)
         {
+            //logger.debug("######in  reclaim, memtable:{}", memtable); 
             // issue a read barrier for reclaiming the memory, and offload the wait to another thread
             final OpOrder.Barrier readBarrier = readOrdering.newBarrier();
             readBarrier.issue();
@@ -1252,6 +1312,7 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean
                     memtable.setDiscarded();
                 }
             }, reclaimExecutor);
+            
         }
     }
 
@@ -1290,6 +1351,13 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean
                 // swap if the memtables we are measuring here haven't already been swapped by the time we try to swap them
                 Memtable current = cfs.getTracker().getView().getCurrentMemtable();
 
+                /////////////////////
+                //if(cfs.name.equals("usertable") && current.getLiveDataSize() < 20971520){
+                /*if(current.getLiveDataSize() < 20971520){
+                    logger.debug("-----ignore FlushLargestColumnFamily memtable, size: {}, cfs.name:{}", current.getLiveDataSize(), cfs.name);
+                    continue;
+                }*/
+                //logger.debug("-----FlushLargestColumnFamily current memtable, size: {}", current.getLiveDataSize());
                 // find the total ownership ratio for the memtable and all SecondaryIndexes owned by this CF,
                 // both on- and off-heap, and select the largest of the two ratios to weight this CF
                 float onHeap = 0f, offHeap = 0f;
@@ -1316,6 +1384,12 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean
 
             if (largest != null)
             {
+                StorageService.instance.largestCFS = largest.cfs;
+                //logger.debug("-----FlushLargestColumnFamily largest memtable, size: {}", largest.getLiveDataSize());
+                /*if(largest.getLiveDataSize() < 20971520){
+                    logger.debug("-----FlushLargestColumnFamily memtable, size: {}, return", largest.getLiveDataSize());
+                    //continue;
+                }else{////*/
                 float usedOnHeap = Memtable.MEMORY_POOL.onHeap.usedRatio();
                 float usedOffHeap = Memtable.MEMORY_POOL.offHeap.usedRatio();
                 float flushingOnHeap = Memtable.MEMORY_POOL.onHeap.reclaimingRatio();
@@ -1326,6 +1400,14 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean
                             largest.cfs, ratio(usedOnHeap, usedOffHeap), ratio(liveOnHeap, liveOffHeap),
                             ratio(flushingOnHeap, flushingOffHeap), ratio(thisOnHeap, thisOffHeap));
                 largest.cfs.switchMemtableIfCurrent(largest);
+                //}////
+                /*try{
+                    Thread.currentThread().sleep(10000);//10s
+                } catch (Exception e)
+                {
+                    logger.debug("sleep error!", e);
+                }*/
+
             }
         }
     }
@@ -2121,6 +2203,11 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean
             stores.add(keyspace.getColumnFamilyStores());
         }
         return Iterables.concat(stores);
+    }
+    
+    //////
+    public List<String> getUserKeyspaceName(){
+        return Schema.instance.getUserKeyspaces();
     }
 
     public Iterable<DecoratedKey> keySamples(Range<Token> range)

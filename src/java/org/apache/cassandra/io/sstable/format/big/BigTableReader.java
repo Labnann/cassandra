@@ -41,6 +41,7 @@ import org.apache.cassandra.tracing.Tracing;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.apache.cassandra.service.StorageService;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -61,7 +62,9 @@ public class BigTableReader extends SSTableReader
 
     public UnfilteredRowIterator iterator(DecoratedKey key, Slices slices, ColumnFilter selectedColumns, boolean reversed, boolean isForThrift, SSTableReadsListener listener)
     {
+        long startIndex = System.currentTimeMillis();
         RowIndexEntry rie = getPosition(key, SSTableReader.Operator.EQ, listener);
+        StorageService.instance.readIndexBlock += System.currentTimeMillis() - startIndex;
         return iterator(null, key, rie, slices, selectedColumns, reversed, isForThrift);
     }
 
@@ -149,6 +152,7 @@ public class BigTableReader extends SSTableReader
         // next, the key cache (only make sense for valid row key)
         if ((op == Operator.EQ || op == Operator.GE) && (key instanceof DecoratedKey))
         {
+            long startCache = System.currentTimeMillis();
             DecoratedKey decoratedKey = (DecoratedKey)key;
             KeyCacheKey cacheKey = new KeyCacheKey(metadata.ksAndCFName, descriptor, decoratedKey.getKey());
             RowIndexEntry cachedPosition = getCachedPosition(cacheKey, updateCacheAndStats);
@@ -156,6 +160,7 @@ public class BigTableReader extends SSTableReader
             {
                 listener.onSSTableSelected(this, cachedPosition, SelectionReason.KEY_CACHE_HIT);
                 Tracing.trace("Key cache hit for sstable {}", descriptor.generation);
+                StorageService.instance.readKeyCache += System.currentTimeMillis() - startCache;
                 return cachedPosition;
             }
         }
@@ -222,6 +227,7 @@ public class BigTableReader extends SSTableReader
                 i++;
 
                 ByteBuffer indexKey = ByteBufferUtil.readWithShortLength(in);
+                StorageService.instance.totalReadBytes+=indexKey.limit();////
 
                 boolean opSatisfied; // did we find an appropriate position for the op requested
                 boolean exactMatch; // is the current position an exact match for the key, suitable for caching

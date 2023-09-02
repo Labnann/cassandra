@@ -52,6 +52,7 @@ import org.apache.cassandra.io.sstable.metadata.MetadataCollector;
 import org.apache.cassandra.notifications.*;
 import org.apache.cassandra.schema.CompactionParams;
 import org.apache.cassandra.service.ActiveRepairService;
+import org.apache.cassandra.service.StorageService;
 
 /**
  * Manages the compaction strategies.
@@ -396,7 +397,7 @@ public class CompactionStrategyManager implements INotificationConsumer
     public void replaceFlushed(Memtable memtable, Collection<SSTableReader> sstables)
     {
         cfs.getTracker().replaceFlushed(memtable, sstables);
-        if (sstables != null && !sstables.isEmpty())
+        if (sstables != null && !sstables.isEmpty() && StorageService.instance.FlushTriggeredCompaction && !cfs.name.equals("globalReplicaTable")) //////
             CompactionManager.instance.submitBackground(cfs);
     }
 
