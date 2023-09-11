@@ -20,6 +20,7 @@ package org.apache.cassandra.db;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.util.*;
 import java.util.ArrayList;
 import java.util.NavigableSet;
 import java.util.SortedSet;
@@ -526,7 +527,7 @@ public abstract class ReadCommand extends MonitorableImpl implements ReadQuery
         {
             iterator = withStateTracking(iterator);
             iterator = RTBoundValidator.validate(withoutPurgeableTombstones(iterator, cfs), Stage.PURGED, false);
-            iterator = withMetricsRecording(withoutPurgeableTombstones(resultIterator, cfs), cfs.metric, startTimeNanos, iterator, cfs);
+            iterator = withMetricsRecording(withoutPurgeableTombstones(iterator, cfs), cfs.metric, startTimeNanos, iterator, cfs);
 
             // If we've used a 2ndary index, we know the result already satisfy the primary expression used, so
             // no point in checking it again.
