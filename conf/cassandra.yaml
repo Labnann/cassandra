@@ -637,7 +637,7 @@ listen_address: 127.0.0.1
 # Leaving this blank will set it to the same value as listen_address
 # For single-node deployment, comment this option out.
 # For EC2 cluster deployment, set broadcast_address to public ip address of EC2 instance.
-broadcast_address: 18.220.232.203
+broadcast_address:
 
 # When using multiple physical network interfaces, set this
 # to true to listen on broadcast_address in addition to
