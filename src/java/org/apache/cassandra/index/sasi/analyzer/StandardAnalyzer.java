@@ -37,7 +37,7 @@ import org.apache.cassandra.utils.ByteBufferUtil;
 import com.google.common.annotations.VisibleForTesting;
 
 import com.carrotsearch.hppc.IntObjectMap;
-import com.carrotsearch.hppc.IntObjectOpenHashMap;
+import com.carrotsearch.hppc.IntObjectHashMap;
 
 public class StandardAnalyzer extends AbstractAnalyzer
 {
@@ -61,7 +61,7 @@ public class StandardAnalyzer extends AbstractAnalyzer
         KATAKANA(12),
         HANGUL(13);
 
-        private static final IntObjectMap<TokenType> TOKENS = new IntObjectOpenHashMap<>();
+        private static final IntObjectMap<TokenType> TOKENS = new IntObjectHashMap<>();
 
         static
         {
@@ -87,7 +87,7 @@ public class StandardAnalyzer extends AbstractAnalyzer
         }
     }
 
-    private AbstractType validator;
+    private AbstractType<?> validator;
 
     private StandardTokenizerInterface scanner;
     private StandardTokenizerOptions options;
@@ -148,7 +148,7 @@ public class StandardAnalyzer extends AbstractAnalyzer
         return builder.build();
     }
 
-    public void init(Map<String, String> options, AbstractType validator)
+    public void init(Map<String, String> options, AbstractType<?> validator)
     {
         init(StandardTokenizerOptions.buildFromMap(options), validator);
     }
@@ -159,7 +159,7 @@ public class StandardAnalyzer extends AbstractAnalyzer
         init(options, UTF8Type.instance);
     }
 
-    public void init(StandardTokenizerOptions tokenizerOptions, AbstractType validator)
+    public void init(StandardTokenizerOptions tokenizerOptions, AbstractType<?> validator)
     {
         this.validator = validator;
         this.options = tokenizerOptions;
@@ -206,6 +206,7 @@ public class StandardAnalyzer extends AbstractAnalyzer
         this.inputReader = reader;
     }
 
+    @Override
     public boolean isTokenizing()
     {
         return true;

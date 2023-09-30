@@ -15,66 +15,87 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 package org.apache.cassandra.repair;
 
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 
-import com.google.common.util.concurrent.AbstractFuture;
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Preconditions;
+
+import org.apache.cassandra.utils.concurrent.AsyncFuture;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.repair.messages.RepairMessage;
+import org.apache.cassandra.repair.messages.SyncRequest;
+import org.apache.cassandra.streaming.PreviewKind;
 import org.apache.cassandra.tracing.Tracing;
 import org.apache.cassandra.utils.MerkleTrees;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.FBUtilities;
 import java.net.InetAddress;
 
-/**
- * SyncTask will calculate the difference of MerkleTree between two nodes
- * and perform necessary operation to repair replica.
- */
-public abstract class SyncTask extends AbstractFuture<SyncStat> implements Runnable
+import static org.apache.cassandra.utils.Clock.Global.currentTimeMillis;
+import static org.apache.cassandra.net.Verb.SYNC_REQ;
+
+public abstract class SyncTask extends AsyncFuture<SyncStat> implements Runnable
 {
-    private static Logger logger = LoggerFactory.getLogger(SyncTask.class);
+    private static final Logger logger = LoggerFactory.getLogger(SyncTask.class);
 
     protected final RepairJobDesc desc;
-    protected final TreeResponse r1;
-    protected final TreeResponse r2;
+    @VisibleForTesting
+    public final List<Range<Token>> rangesToSync;
+    protected final PreviewKind previewKind;
+    protected final SyncNodePair nodePair;
 
-    protected volatile SyncStat stat;
+    protected volatile long startTime = Long.MIN_VALUE;
+    protected final SyncStat stat;
 
-    public SyncTask(RepairJobDesc desc, TreeResponse r1, TreeResponse r2)
+    protected SyncTask(RepairJobDesc desc, InetAddressAndPort primaryEndpoint, InetAddressAndPort peer, List<Range<Token>> rangesToSync, PreviewKind previewKind)
     {
+        Preconditions.checkArgument(!peer.equals(primaryEndpoint), "Sending and receiving node are the same: %s", peer);
         this.desc = desc;
-        this.r1 = r1;
-        this.r2 = r2;
+        this.rangesToSync = rangesToSync;
+        this.nodePair = new SyncNodePair(primaryEndpoint, peer);
+        this.previewKind = previewKind;
+        this.stat = new SyncStat(nodePair, rangesToSync);
+    }
+
+    protected abstract void startSync();
+
+    public SyncNodePair nodePair()
+    {
+        return nodePair;
     }
 
     /**
      * Compares trees, and triggers repairs for any ranges that mismatch.
      */
-    public void run()
+    public final void run()
     {
         long beginTime = System.currentTimeMillis();//////
         InetAddress LOCAL = FBUtilities.getBroadcastAddress();
 
         //if (!r1.endpoint.equals(LOCAL) && !r2.endpoint.equals(LOCAL)) return;////////////////////////////////////
         // compare trees, and collect differences
-        List<Range<Token>> differences = MerkleTrees.difference(r1.trees, r2.trees);
+        startTime = currentTimeMillis();
 
-        stat = new SyncStat(new NodePair(r1.endpoint, r2.endpoint), differences.size());
 
         // choose a repair method based on the significance of the difference
-        String format = String.format("[repair #%s] Endpoints %s and %s %%s for %s", desc.sessionId, r1.endpoint, r2.endpoint, desc.columnFamily);
-        //if (differences.isEmpty())
-        if (differences.isEmpty() || (!r1.endpoint.equals(LOCAL) && !r2.endpoint.equals(LOCAL)))//////////////////////////////////////////////////////////////////////
+
+        String format = String.format("%s Endpoints %s and %s %%s for %s", previewKind.logPrefix(desc.sessionId), nodePair.coordinator, nodePair.peer, desc.columnFamily);
+        if (rangesToSync.isEmpty() || !nodePair.coordinator.equals(LOCAL) && !nodePair.peer.equals(LOCAL) )
         {
             logger.info(String.format(format, "are consistent"));
             logger.debug(String.format(format, "are consistent"));
-            Tracing.traceRepair("Endpoint {} is consistent with {} for {}", r1.endpoint, r2.endpoint, desc.columnFamily);
-            set(stat);
+            Tracing.traceRepair("Endpoint {} is consistent with {} for {}", nodePair.coordinator, nodePair.peer, desc.columnFamily);
+            trySuccess(stat);
             return;
         }
         /////////////////////////////////////
@@ -82,20 +103,35 @@ public abstract class SyncTask extends AbstractFuture<SyncStat> implements Runna
         //if (r2.endpoint.equals(LOCAL)) StorageService.instance.repairNodeIP = r1.endpoint;
         ///////////////////////////////////////
         // non-0 difference: perform streaming repair
-        logger.info(String.format(format, "have " + differences.size() + " range(s) out of sync"));
-        logger.debug(String.format(format, "have " + differences.size() + " range(s) out of sync"));
-        Tracing.traceRepair("Endpoint {} has {} range(s) out of sync with {} for {}", r1.endpoint, differences.size(), r2.endpoint, desc.columnFamily);
-        
+        logger.info(String.format(format, "have " + rangesToSync.size() + " range(s) out of sync"));
+        logger.debug(String.format(format, "have " + rangesToSync.size() + " range(s) out of sync"));
+        Tracing.traceRepair("Endpoint {} has {} range(s) out of sync with {} for {}", nodePair.coordinator, rangesToSync.size(), nodePair.peer, desc.columnFamily);
+
         long endTime = System.currentTimeMillis();
         StorageService.instance.compareMTrees+= endTime-beginTime;
 
-        startSync(differences);
+
+        startSync();
     }
 
-    public SyncStat getCurrentStat()
+    public boolean isLocal()
     {
-        return stat;
+        return false;
     }
 
-    protected abstract void startSync(List<Range<Token>> differences);
+    protected void finished()
+    {
+        if (startTime != Long.MIN_VALUE)
+            Keyspace.open(desc.keyspace).getColumnFamilyStore(desc.columnFamily).metric.repairSyncTime.update(currentTimeMillis() - startTime, TimeUnit.MILLISECONDS);
+    }
+
+    public void abort() {}
+
+    void sendRequest(SyncRequest request, InetAddressAndPort to)
+    {
+        RepairMessage.sendMessageWithFailureCB(request,
+                                               SYNC_REQ,
+                                               to,
+                                               this::tryFailure);
+    }
 }

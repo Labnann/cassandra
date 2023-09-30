@@ -22,7 +22,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 
-import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.index.sasi.analyzer.AbstractAnalyzer;
 import org.apache.cassandra.index.sasi.analyzer.NoOpAnalyzer;
 import org.apache.cassandra.index.sasi.analyzer.NonTokenizingAnalyzer;
@@ -56,19 +56,20 @@ public class IndexMode
     private static final String INDEX_IS_LITERAL_OPTION = "is_literal";
     private static final String INDEX_MAX_FLUSH_MEMORY_OPTION = "max_compaction_flush_memory_in_mb";
     private static final double INDEX_MAX_FLUSH_DEFAULT_MULTIPLIER = 0.15;
+    private static final long DEFAULT_MAX_MEM_BYTES = (long) (1073741824 * INDEX_MAX_FLUSH_DEFAULT_MULTIPLIER); // 1G default for memtable
 
     public final Mode mode;
     public final boolean isAnalyzed, isLiteral;
     public final Class analyzerClass;
-    public final long maxCompactionFlushMemoryInMb;
+    public final long maxCompactionFlushMemoryInBytes;
 
-    private IndexMode(Mode mode, boolean isLiteral, boolean isAnalyzed, Class analyzerClass, long maxFlushMemMb)
+    private IndexMode(Mode mode, boolean isLiteral, boolean isAnalyzed, Class analyzerClass, long maxMemBytes)
     {
         this.mode = mode;
         this.isLiteral = isLiteral;
         this.isAnalyzed = isAnalyzed;
         this.analyzerClass = analyzerClass;
-        this.maxCompactionFlushMemoryInMb = maxFlushMemMb;
+        this.maxCompactionFlushMemoryInBytes = maxMemBytes;
     }
 
     public AbstractAnalyzer getAnalyzer(AbstractType<?> validator)
@@ -93,7 +94,7 @@ public class IndexMode
         return analyzer;
     }
 
-    public static void validateAnalyzer(Map<String, String> indexOptions, ColumnDefinition cd) throws ConfigurationException
+    public static void validateAnalyzer(Map<String, String> indexOptions, ColumnMetadata cd) throws ConfigurationException
     {
         // validate that a valid analyzer class was provided if specified
         if (indexOptions.containsKey(INDEX_ANALYZER_CLASS_OPTION))
@@ -113,10 +114,7 @@ public class IndexMode
             try
             {
                 analyzer = (AbstractAnalyzer) analyzerClass.newInstance();
-                if (!analyzer.isCompatibleWith(cd.type))
-                    throw new ConfigurationException(String.format("%s does not support type %s",
-                                                                   analyzerClass.getSimpleName(),
-                                                                   cd.type.asCQL3Type()));
+                analyzer.validate(indexOptions, cd);
             }
             catch (InstantiationException | IllegalAccessException e)
             {
@@ -126,12 +124,12 @@ public class IndexMode
         }
     }
 
-    public static IndexMode getMode(ColumnDefinition column, Optional<IndexMetadata> config) throws ConfigurationException
+    public static IndexMode getMode(ColumnMetadata column, Optional<IndexMetadata> config) throws ConfigurationException
     {
         return getMode(column, config.isPresent() ? config.get().options : null);
     }
 
-    public static IndexMode getMode(ColumnDefinition column, Map<String, String> indexOptions) throws ConfigurationException
+    public static IndexMode getMode(ColumnMetadata column, Map<String, String> indexOptions) throws ConfigurationException
     {
         if (indexOptions == null || indexOptions.isEmpty())
             return IndexMode.NOT_INDEXED;
@@ -186,11 +184,16 @@ public class IndexMode
             logger.error("failed to parse {} option, defaulting to 'false'.", INDEX_IS_LITERAL_OPTION);
         }
 
-        Long maxMemMb = indexOptions.get(INDEX_MAX_FLUSH_MEMORY_OPTION) == null
-                ? (long) (1073741824 * INDEX_MAX_FLUSH_DEFAULT_MULTIPLIER) // 1G default for memtable
-                : Long.parseLong(indexOptions.get(INDEX_MAX_FLUSH_MEMORY_OPTION));
+        long maxMemBytes = indexOptions.get(INDEX_MAX_FLUSH_MEMORY_OPTION) == null
+                ? DEFAULT_MAX_MEM_BYTES
+                : 1048576L * Long.parseLong(indexOptions.get(INDEX_MAX_FLUSH_MEMORY_OPTION));
 
-        return new IndexMode(mode, isLiteral, isAnalyzed, analyzerClass, maxMemMb);
+        if (maxMemBytes > 100L * 1073741824)
+        {
+            logger.error("{} configured as {} is above 100GiB, reverting to default 1GB", INDEX_MAX_FLUSH_MEMORY_OPTION, maxMemBytes);
+            maxMemBytes = DEFAULT_MAX_MEM_BYTES;
+        }
+        return new IndexMode(mode, isLiteral, isAnalyzed, analyzerClass, maxMemBytes);
     }
 
     public boolean supports(Op operator)

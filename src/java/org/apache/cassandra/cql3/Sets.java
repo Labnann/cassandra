@@ -20,15 +20,31 @@ package org.apache.cassandra.cql3;
 import static org.apache.cassandra.cql3.Constants.UNSET_VALUE;
 
 import java.nio.ByteBuffer;
-import java.util.*;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+import java.util.SortedSet;
+import java.util.TreeSet;
 import java.util.stream.Collectors;
+import java.util.stream.StreamSupport;
 
-import org.apache.cassandra.config.ColumnDefinition;
 import org.apache.cassandra.cql3.functions.Function;
 import org.apache.cassandra.db.DecoratedKey;
-import org.apache.cassandra.db.rows.*;
-import org.apache.cassandra.db.marshal.*;
+import org.apache.cassandra.db.guardrails.Guardrails;
+import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.db.marshal.ByteBufferAccessor;
+import org.apache.cassandra.db.marshal.MapType;
+import org.apache.cassandra.db.marshal.ReversedType;
+import org.apache.cassandra.db.marshal.SetType;
+import org.apache.cassandra.db.rows.Cell;
+import org.apache.cassandra.db.rows.CellPath;
 import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.serializers.CollectionSerializer;
 import org.apache.cassandra.serializers.MarshalException;
 import org.apache.cassandra.transport.ProtocolVersion;
@@ -43,7 +59,91 @@ public abstract class Sets
 
     public static ColumnSpecification valueSpecOf(ColumnSpecification column)
     {
-        return new ColumnSpecification(column.ksName, column.cfName, new ColumnIdentifier("value(" + column.name + ")", true), ((SetType)column.type).getElementsType());
+        return new ColumnSpecification(column.ksName, column.cfName, new ColumnIdentifier("value(" + column.name + ")", true), elementsType(column.type));
+    }
+
+    private static AbstractType<?> unwrap(AbstractType<?> type)
+    {
+        return type.isReversed() ? unwrap(((ReversedType<?>) type).baseType) : type;
+    }
+
+    private static AbstractType<?> elementsType(AbstractType<?> type)
+    {
+        return ((SetType<?>) unwrap(type)).getElementsType();
+    }
+
+    /**
+     * Tests that the set with the specified elements can be assigned to the specified column.
+     *
+     * @param receiver the receiving column
+     * @param elements the set elements
+     */
+    public static AssignmentTestable.TestResult testSetAssignment(ColumnSpecification receiver,
+                                                                  List<? extends AssignmentTestable> elements)
+    {
+        if (!(receiver.type instanceof SetType))
+        {
+            // We've parsed empty maps as a set literal to break the ambiguity so handle that case now
+            if (receiver.type instanceof MapType && elements.isEmpty())
+                return AssignmentTestable.TestResult.WEAKLY_ASSIGNABLE;
+
+            return AssignmentTestable.TestResult.NOT_ASSIGNABLE;
+        }
+
+        // If there is no elements, we can't say it's an exact match (an empty set if fundamentally polymorphic).
+        if (elements.isEmpty())
+            return AssignmentTestable.TestResult.WEAKLY_ASSIGNABLE;
+
+        ColumnSpecification valueSpec = valueSpecOf(receiver);
+        return AssignmentTestable.TestResult.testAll(receiver.ksName, valueSpec, elements);
+    }
+
+    /**
+     * Create a <code>String</code> representation of the set containing the specified elements.
+     *
+     * @param elements the set elements
+     * @return a <code>String</code> representation of the set
+     */
+    public static String setToString(List<?> elements)
+    {
+        return setToString(elements, Object::toString);
+    }
+
+    /**
+     * Create a <code>String</code> representation of the set from the specified items associated to
+     * the set elements.
+     *
+     * @param items items associated to the set elements
+     * @param mapper the mapper used to map the items to the <code>String</code> representation of the set elements
+     * @return a <code>String</code> representation of the set
+     */
+    public static <T> String setToString(Iterable<T> items, java.util.function.Function<T, String> mapper)
+    {
+        return StreamSupport.stream(items.spliterator(), false)
+                            .map(mapper)
+                            .collect(Collectors.joining(", ", "{", "}"));
+    }
+
+    /**
+     * Returns the exact SetType from the items if it can be known.
+     *
+     * @param items the items mapped to the set elements
+     * @param mapper the mapper used to retrieve the element types from the items
+     * @return the exact SetType from the items if it can be known or <code>null</code>
+     */
+    public static <T> SetType<?> getExactSetTypeIfKnown(List<T> items,
+                                                        java.util.function.Function<T, AbstractType<?>> mapper)
+    {
+        Optional<AbstractType<?>> type = items.stream().map(mapper).filter(Objects::nonNull).findFirst();
+        return type.isPresent() ? SetType.getInstance(type.get(), false) : null;
+    }
+
+    public static <T> SetType<?> getPreferredCompatibleType(List<T> items,
+                                                            java.util.function.Function<T, AbstractType<?>> mapper)
+    {
+        Set<AbstractType<?>> types = items.stream().map(mapper).filter(Objects::nonNull).collect(Collectors.toSet());
+        AbstractType<?> type = AssignmentTestable.getCompatibleTypeIfKnown(types);
+        return type == null ? null : SetType.getInstance(type, false);
     }
 
     public static class Literal extends Term.Raw
@@ -62,7 +162,7 @@ public abstract class Sets
             // We've parsed empty maps as a set literal to break the ambiguity so
             // handle that case now
             if (receiver.type instanceof MapType && elements.isEmpty())
-                return new Maps.Value(Collections.<ByteBuffer, ByteBuffer>emptyMap());
+                return new Maps.Value(Collections.emptySortedMap());
 
             ColumnSpecification valueSpec = Sets.valueSpecOf(receiver);
             Set<Term> values = new HashSet<>(elements.size());
@@ -79,17 +179,19 @@ public abstract class Sets
 
                 values.add(t);
             }
-            DelayedValue value = new DelayedValue(((SetType)receiver.type).getElementsType(), values);
+            DelayedValue value = new DelayedValue(elementsType(receiver.type), values);
             return allTerminal ? value.bind(QueryOptions.DEFAULT) : value;
         }
 
         private void validateAssignableTo(String keyspace, ColumnSpecification receiver) throws InvalidRequestException
         {
-            if (!(receiver.type instanceof SetType))
+            AbstractType<?> type = unwrap(receiver.type);
+
+            if (!(type instanceof SetType))
             {
                 // We've parsed empty maps as a set literal to break the ambiguity so
                 // handle that case now
-                if ((receiver.type instanceof MapType) && elements.isEmpty())
+                if ((type instanceof MapType) && elements.isEmpty())
                     return;
 
                 throw new InvalidRequestException(String.format("Invalid set literal for %s of type %s", receiver.name, receiver.type.asCQL3Type()));
@@ -105,38 +207,24 @@ public abstract class Sets
 
         public AssignmentTestable.TestResult testAssignment(String keyspace, ColumnSpecification receiver)
         {
-            if (!(receiver.type instanceof SetType))
-            {
-                // We've parsed empty maps as a set literal to break the ambiguity so handle that case now
-                if (receiver.type instanceof MapType && elements.isEmpty())
-                    return AssignmentTestable.TestResult.WEAKLY_ASSIGNABLE;
-
-                return AssignmentTestable.TestResult.NOT_ASSIGNABLE;
-            }
-
-            // If there is no elements, we can't say it's an exact match (an empty set if fundamentally polymorphic).
-            if (elements.isEmpty())
-                return AssignmentTestable.TestResult.WEAKLY_ASSIGNABLE;
-
-            ColumnSpecification valueSpec = Sets.valueSpecOf(receiver);
-            return AssignmentTestable.TestResult.testAll(keyspace, valueSpec, elements);
+            return testSetAssignment(receiver, elements);
         }
 
         @Override
         public AbstractType<?> getExactTypeIfKnown(String keyspace)
         {
-            for (Term.Raw term : elements)
-            {
-                AbstractType<?> type = term.getExactTypeIfKnown(keyspace);
-                if (type != null)
-                    return SetType.getInstance(type, false);
-            }
-            return null;
+            return getExactSetTypeIfKnown(elements, p -> p.getExactTypeIfKnown(keyspace));
+        }
+
+        @Override
+        public AbstractType<?> getCompatibleTypeIfKnown(String keyspace)
+        {
+            return Sets.getPreferredCompatibleType(elements, p -> p.getCompatibleTypeIfKnown(keyspace));
         }
 
         public String getText()
         {
-            return elements.stream().map(Term.Raw::getText).collect(Collectors.joining(", ", "{", "}"));
+            return setToString(elements, Term.Raw::getText);
         }
     }
 
@@ -149,16 +237,16 @@ public abstract class Sets
             this.elements = elements;
         }
 
-        public static Value fromSerialized(ByteBuffer value, SetType type, ProtocolVersion version) throws InvalidRequestException
+        public static <T> Value fromSerialized(ByteBuffer value, SetType<T> type) throws InvalidRequestException
         {
             try
             {
                 // Collections have this small hack that validate cannot be called on a serialized object,
                 // but compose does the validation (so we're fine).
-                Set<?> s = type.getSerializer().deserializeForNativeProtocol(value, version);
+                Set<T> s = type.getSerializer().deserialize(value, ByteBufferAccessor.instance);
                 SortedSet<ByteBuffer> elements = new TreeSet<>(type.getElementsType());
-                for (Object element : s)
-                    elements.add(type.getElementsType().decompose(element));
+                for (T element : s)
+                    elements.add(type.getElementsType().decomposeUntyped(element));
                 return new Value(elements);
             }
             catch (MarshalException e)
@@ -167,19 +255,19 @@ public abstract class Sets
             }
         }
 
-        public ByteBuffer get(ProtocolVersion protocolVersion)
+        public ByteBuffer get(ProtocolVersion version)
         {
-            return CollectionSerializer.pack(elements, elements.size(), protocolVersion);
+            return CollectionSerializer.pack(elements, elements.size());
         }
 
-        public boolean equals(SetType st, Value v)
+        public boolean equals(SetType<?> st, Value v)
         {
             if (elements.size() != v.elements.size())
                 return false;
 
             Iterator<ByteBuffer> thisIter = elements.iterator();
             Iterator<ByteBuffer> thatIter = v.elements.iterator();
-            AbstractType elementsType = st.getElementsType();
+            AbstractType<?> elementsType = st.getElementsType();
             while (thisIter.hasNext())
                 if (elementsType.compare(thisIter.next(), thatIter.next()) != 0)
                     return false;
@@ -248,13 +336,13 @@ public abstract class Sets
                 return null;
             if (value == ByteBufferUtil.UNSET_BYTE_BUFFER)
                 return UNSET_VALUE;
-            return Value.fromSerialized(value, (SetType)receiver.type, options.getProtocolVersion());
+            return Value.fromSerialized(value, (SetType<?>) receiver.type);
         }
     }
 
     public static class Setter extends Operation
     {
-        public Setter(ColumnDefinition column, Term t)
+        public Setter(ColumnMetadata column, Term t)
         {
             super(column, t);
         }
@@ -274,7 +362,7 @@ public abstract class Sets
 
     public static class Adder extends Operation
     {
-        public Adder(ColumnDefinition column, Term t)
+        public Adder(ColumnMetadata column, Term t)
         {
             super(column, t);
         }
@@ -287,28 +375,45 @@ public abstract class Sets
                 doAdd(value, column, params);
         }
 
-        static void doAdd(Term.Terminal value, ColumnDefinition column, UpdateParameters params) throws InvalidRequestException
+        static void doAdd(Term.Terminal value, ColumnMetadata column, UpdateParameters params) throws InvalidRequestException
         {
+            if (value == null)
+            {
+                // for frozen sets, we're overwriting the whole cell
+                if (!column.type.isMultiCell())
+                    params.addTombstone(column);
+
+                return;
+            }
+
+            SortedSet<ByteBuffer> elements = ((Value) value).elements;
+
             if (column.type.isMultiCell())
             {
-                if (value == null)
+                if (elements.size() == 0)
                     return;
 
-                for (ByteBuffer bb : ((Value) value).elements)
+                // Guardrails about collection size are only checked for the added elements without considering
+                // already existent elements. This is done so to avoid read-before-write, having additional checks
+                // during SSTable write.
+                Guardrails.itemsPerCollection.guard(elements.size(), column.name.toString(), false, params.clientState);
+
+                int dataSize = 0;
+                for (ByteBuffer bb : elements)
                 {
                     if (bb == ByteBufferUtil.UNSET_BYTE_BUFFER)
                         continue;
 
-                    params.addCell(column, CellPath.create(bb), ByteBufferUtil.EMPTY_BYTE_BUFFER);
+                    Cell<?> cell = params.addCell(column, CellPath.create(bb), ByteBufferUtil.EMPTY_BYTE_BUFFER);
+                    dataSize += cell.dataSize();
                 }
+                Guardrails.collectionSize.guard(dataSize, column.name.toString(), false, params.clientState);
             }
             else
             {
-                // for frozen sets, we're overwriting the whole cell
-                if (value == null)
-                    params.addTombstone(column);
-                else
-                    params.addCell(column, value.get(ProtocolVersion.CURRENT));
+                Guardrails.itemsPerCollection.guard(elements.size(), column.name.toString(), false, params.clientState);
+                Cell<?> cell = params.addCell(column, value.get(ProtocolVersion.CURRENT));
+                Guardrails.collectionSize.guard(cell.dataSize(), column.name.toString(), false, params.clientState);
             }
         }
     }
@@ -316,7 +421,7 @@ public abstract class Sets
     // Note that this is reused for Map subtraction too (we subtract a set from a map)
     public static class Discarder extends Operation
     {
-        public Discarder(ColumnDefinition column, Term t)
+        public Discarder(ColumnMetadata column, Term t)
         {
             super(column, t);
         }
@@ -341,7 +446,7 @@ public abstract class Sets
 
     public static class ElementDiscarder extends Operation
     {
-        public ElementDiscarder(ColumnDefinition column, Term k)
+        public ElementDiscarder(ColumnMetadata column, Term k)
         {
             super(column, k);
         }

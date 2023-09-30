@@ -22,21 +22,22 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 
+import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
 
-import junit.framework.Assert;
-import org.apache.cassandra.config.SchemaConstants;
-import org.apache.cassandra.cql3.statements.ParsedStatement;
 import org.apache.cassandra.db.SystemKeyspace;
 import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.db.marshal.UTF8Type;
-import org.apache.cassandra.schema.SchemaKeyspace;
+import org.apache.cassandra.schema.SchemaConstants;
+import org.apache.cassandra.schema.SchemaKeyspaceTables;
 import org.apache.cassandra.service.ClientState;
-import org.apache.cassandra.service.QueryState;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.MD5Digest;
 
+import static java.util.Collections.emptyMap;
+import static org.apache.cassandra.service.QueryState.forInternalCalls;
+import static org.apache.cassandra.utils.Clock.Global.nanoTime;
 import static org.junit.Assert.*;
 
 public class PstmtPersistenceTest extends CQLTester
@@ -63,34 +64,34 @@ public class PstmtPersistenceTest extends CQLTester
         createTable("CREATE TABLE %s (pk int PRIMARY KEY, val text)");
 
         List<MD5Digest> stmtIds = new ArrayList<>();
-        // #0
-        stmtIds.add(prepareStatement("SELECT * FROM %s WHERE keyspace_name = ?", SchemaConstants.SCHEMA_KEYSPACE_NAME, SchemaKeyspace.TABLES, clientState));
-        // #1
-        stmtIds.add(prepareStatement("SELECT * FROM %s WHERE pk = ?", clientState));
-        // #2
-        stmtIds.add(prepareStatement("SELECT * FROM %s WHERE key = ?", "foo", "bar", clientState));
+        String statement0 = "SELECT * FROM %s WHERE keyspace_name = ?";
+        String statement1 = "SELECT * FROM %s WHERE pk = ?";
+        String statement2 = "SELECT * FROM %s WHERE key = ?";
+        String statement3 = "SELECT * FROM %S WHERE key = ?";
+        stmtIds.add(prepareStatement(statement0, SchemaConstants.SCHEMA_KEYSPACE_NAME, SchemaKeyspaceTables.TABLES, clientState));
+        stmtIds.add(prepareStatement(statement1, clientState));
+        stmtIds.add(prepareStatement(statement2, "foo", "bar", clientState));
         clientState.setKeyspace("foo");
-        // #3
-        stmtIds.add(prepareStatement("SELECT * FROM %s WHERE pk = ?", clientState));
-        // #4
-        stmtIds.add(prepareStatement("SELECT * FROM %S WHERE key = ?", "foo", "bar", clientState));
+
+        stmtIds.add(prepareStatement(statement1, clientState));
+        stmtIds.add(prepareStatement(statement3, "foo", "bar", clientState));
 
         assertEquals(5, stmtIds.size());
-        assertEquals(5, QueryProcessor.preparedStatementsCount());
-
-        Assert.assertEquals(5, numberOfStatementsOnDisk());
+        // statement1 will have two statements prepared because of `setKeyspace` usage
+        assertEquals(6, QueryProcessor.preparedStatementsCount());
+        assertEquals(6, numberOfStatementsOnDisk());
 
         QueryHandler handler = ClientState.getCQLQueryHandler();
         validatePstmts(stmtIds, handler);
 
         // clear prepared statements cache
         QueryProcessor.clearPreparedStatements(true);
-        Assert.assertEquals(0, QueryProcessor.preparedStatementsCount());
+        assertEquals(0, QueryProcessor.preparedStatementsCount());
         for (MD5Digest stmtId : stmtIds)
             Assert.assertNull(handler.getPrepared(stmtId));
 
         // load prepared statements and validate that these still execute fine
-        QueryProcessor.preloadPreparedStatement();
+        QueryProcessor.instance.preloadPreparedStatements();
         validatePstmts(stmtIds, handler);
 
 
@@ -99,14 +100,16 @@ public class PstmtPersistenceTest extends CQLTester
         for (UntypedResultSet.Row row : QueryProcessor.executeOnceInternal(queryAll))
         {
             MD5Digest digest = MD5Digest.wrap(ByteBufferUtil.getArray(row.getBytes("prepared_id")));
-            ParsedStatement.Prepared prepared = QueryProcessor.instance.getPrepared(digest);
+            QueryProcessor.Prepared prepared = QueryProcessor.instance.getPrepared(digest);
             Assert.assertNotNull(prepared);
         }
 
         // add anther prepared statement and sync it to table
-        prepareStatement("SELECT * FROM %s WHERE key = ?", "foo", "bar", clientState);
-        assertEquals(6, numberOfStatementsInMemory());
-        assertEquals(6, numberOfStatementsOnDisk());
+        prepareStatement(statement2, "foo", "bar", clientState);
+
+        // statement1 will have two statements prepared because of `setKeyspace` usage
+        assertEquals(7, numberOfStatementsInMemory());
+        assertEquals(7, numberOfStatementsOnDisk());
 
         // drop a keyspace (prepared statements are removed - syncPreparedStatements() remove should the rows, too)
         execute("DROP KEYSPACE foo");
@@ -116,7 +119,6 @@ public class PstmtPersistenceTest extends CQLTester
 
     private void validatePstmts(List<MD5Digest> stmtIds, QueryHandler handler)
     {
-        assertEquals(5, QueryProcessor.preparedStatementsCount());
         QueryOptions optionsStr = QueryOptions.forInternalCalls(Collections.singletonList(UTF8Type.instance.fromString("foobar")));
         QueryOptions optionsInt = QueryOptions.forInternalCalls(Collections.singletonList(Int32Type.instance.decompose(42)));
         validatePstmt(handler, stmtIds.get(0), optionsStr);
@@ -128,9 +130,9 @@ public class PstmtPersistenceTest extends CQLTester
 
     private static void validatePstmt(QueryHandler handler, MD5Digest stmtId, QueryOptions options)
     {
-        ParsedStatement.Prepared prepared = handler.getPrepared(stmtId);
-        assertNotNull(prepared);
-        handler.processPrepared(prepared.statement, QueryState.forInternalCalls(), options, Collections.emptyMap(), System.nanoTime());
+        QueryProcessor.Prepared prepared = handler.getPrepared(stmtId);
+        Assert.assertNotNull(prepared);
+        handler.processPrepared(prepared.statement, forInternalCalls(), options, emptyMap(), nanoTime());
     }
 
     @Test
@@ -186,6 +188,7 @@ public class PstmtPersistenceTest extends CQLTester
 
     private MD5Digest prepareStatement(String stmt, String keyspace, String table, ClientState clientState)
     {
-        return QueryProcessor.prepare(String.format(stmt, keyspace + "." + table), clientState, false).statementId;
+        System.out.println(stmt + String.format(stmt, keyspace + "." + table));
+        return QueryProcessor.instance.prepare(String.format(stmt, keyspace + "." + table), clientState).statementId;
     }
 }

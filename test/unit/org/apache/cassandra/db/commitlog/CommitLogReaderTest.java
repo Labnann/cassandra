@@ -17,18 +17,19 @@
  */
 package org.apache.cassandra.db.commitlog;
 
-import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 
+import org.apache.cassandra.io.util.File;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
-import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.schema.ColumnMetadata;
+import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.config.Config;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.CQLTester;
@@ -158,19 +159,19 @@ public class CommitLogReaderTest extends CQLTester
     }
 
     /**
-     * Since we have both cfm and non mixed into the CL, we ignore updates that aren't for the cfm the test handler
+     * Since we have both table and non mixed into the CL, we ignore updates that aren't for the table the test handler
      * is configured to check.
      * @param handler
      * @param offset integer offset of count we expect to see in record
      */
     private void confirmReadOrder(TestCLRHandler handler, int offset)
     {
-        ColumnDefinition cd = currentTableMetadata().getColumnDefinition(new ColumnIdentifier("data", false));
+        ColumnMetadata cd = currentTableMetadata().getColumn(new ColumnIdentifier("data", false));
         int i = 0;
         int j = 0;
         while (i + j < handler.seenMutationCount())
         {
-            PartitionUpdate pu = handler.seenMutations.get(i + j).get(currentTableMetadata());
+            PartitionUpdate pu = handler.seenMutations.get(i + j).getPartitionUpdate(currentTableMetadata());
             if (pu == null)
             {
                 j++;
@@ -180,7 +181,7 @@ public class CommitLogReaderTest extends CQLTester
             for (Row r : pu)
             {
                 String expected = Integer.toString(i + offset);
-                String seen = new String(r.getCell(cd).value().array());
+                String seen = new String(r.getCell(cd).buffer().array());
                 if (!expected.equals(seen))
                     Assert.fail("Mismatch at index: " + i + ". Offset: " + offset + " Expected: " + expected + " Seen: " + seen);
             }
@@ -191,7 +192,7 @@ public class CommitLogReaderTest extends CQLTester
     static ArrayList<File> getCommitLogs()
     {
         File dir = new File(DatabaseDescriptor.getCommitLogLocation());
-        File[] files = dir.listFiles();
+        File[] files = dir.tryList();
         ArrayList<File> results = new ArrayList<>();
         for (File f : files)
         {
@@ -208,17 +209,17 @@ public class CommitLogReaderTest extends CQLTester
         public List<Mutation> seenMutations = new ArrayList<Mutation>();
         public boolean sawStopOnErrorCheck = false;
 
-        private final CFMetaData cfm;
+        private final TableMetadata metadata;
 
         // Accept all
         public TestCLRHandler()
         {
-            this.cfm = null;
+            this.metadata = null;
         }
 
-        public TestCLRHandler(CFMetaData cfm)
+        public TestCLRHandler(TableMetadata metadata)
         {
-            this.cfm = cfm;
+            this.metadata = metadata;
         }
 
         public boolean shouldSkipSegmentOnError(CommitLogReadException exception) throws IOException
@@ -234,7 +235,7 @@ public class CommitLogReaderTest extends CQLTester
 
         public void handleMutation(Mutation m, int size, int entryLocation, CommitLogDescriptor desc)
         {
-            if ((cfm == null) || (cfm != null && m.get(cfm) != null)) {
+            if ((metadata == null) || (metadata != null && m.getPartitionUpdate(metadata) != null)) {
                 seenMutations.add(m);
             }
         }
@@ -261,7 +262,9 @@ public class CommitLogReaderTest extends CQLTester
         for (int i = midpoint; i < entryCount; i++)
             execute("INSERT INTO %s (idx, data) VALUES (?, ?)", i, Integer.toString(i));
 
-        Keyspace.open(keyspace()).getColumnFamilyStore(currentTable()).forceBlockingFlush();
+        Keyspace.open(keyspace())
+                .getColumnFamilyStore(currentTable())
+                .forceBlockingFlush(ColumnFamilyStore.FlushReason.UNIT_TESTS);
         return result;
     }
 }

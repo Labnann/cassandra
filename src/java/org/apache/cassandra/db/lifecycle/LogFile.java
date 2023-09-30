@@ -20,27 +20,39 @@
  */
 package org.apache.cassandra.db.lifecycle;
 
-import java.io.File;
 import java.nio.file.Path;
-import java.util.*;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.NavigableSet;
+import java.util.Optional;
+import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.Iterables;
-
 import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.compaction.OperationType;
 import org.apache.cassandra.db.lifecycle.LogRecord.Type;
 import org.apache.cassandra.io.sstable.SSTable;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.sstable.format.Version;
 import org.apache.cassandra.io.sstable.format.big.BigFormat;
+import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.utils.Throwables;
+import org.apache.cassandra.utils.TimeUUID;
 
+import static org.apache.cassandra.utils.Clock.Global.currentTimeMillis;
 import static org.apache.cassandra.utils.Throwables.merge;
 
 /**
@@ -59,24 +71,29 @@ final class LogFile implements AutoCloseable
 
     static String EXT = ".log";
     static char SEP = '_';
-    // cc_txn_opname_id.log (where cc is one of the sstable versions defined in BigVersion)
-    static Pattern FILE_REGEX = Pattern.compile(String.format("^(.{2})_txn_(.*)_(.*)%s$", EXT));
+    // Log file name format:
+    // legacy for BIG format: cc_txn_opname_id.log (where cc is one of the sstable versions defined in BigVersion)
+    // other formats: fmt-cc_txn_opname_id.log (where fmt is the format and name and cc is one of its versions)
+    static Pattern FILE_REGEX = Pattern.compile(String.format("^((?:[a-z]+-)?.{2}_)?txn_(.*)_(.*)%s$", EXT));
 
     // A set of physical files on disk, each file is an identical replica
     private final LogReplicaSet replicas = new LogReplicaSet();
 
     // The transaction records, this set must be ORDER PRESERVING
-    private final LinkedHashSet<LogRecord> records = new LinkedHashSet<>();
+    private final Set<LogRecord> records = Collections.synchronizedSet(new LinkedHashSet<>()); // TODO: Hack until we fix CASSANDRA-14554
+    private final Set<LogRecord> onDiskRecords = Collections.synchronizedSet(new LinkedHashSet<>());
 
     // The type of the transaction
     private final OperationType type;
 
     // The unique id of the transaction
-    private final UUID id;
+    private final TimeUUID id;
+
+    private final Version version = DatabaseDescriptor.getSelectedSSTableFormat().getLatestVersion();
 
     static LogFile make(File logReplica)
     {
-        return make(logReplica.getName(), Collections.singletonList(logReplica));
+        return make(logReplica.name(), Collections.singletonList(logReplica));
     }
 
     static LogFile make(String fileName, List<File> logReplicas)
@@ -90,7 +107,7 @@ final class LogFile implements AutoCloseable
         //String version = matcher.group(1);
 
         OperationType operationType = OperationType.fromFileName(matcher.group(2));
-        UUID id = UUID.fromString(matcher.group(3));
+        TimeUUID id = TimeUUID.fromString(matcher.group(3));
 
         return new LogFile(operationType, id, logReplicas);
     }
@@ -105,7 +122,7 @@ final class LogFile implements AutoCloseable
         return type;
     }
 
-    UUID id()
+    TimeUUID id()
     {
         return id;
     }
@@ -138,16 +155,16 @@ final class LogFile implements AutoCloseable
 
     static boolean isLogFile(File file)
     {
-        return LogFile.FILE_REGEX.matcher(file.getName()).matches();
+        return LogFile.FILE_REGEX.matcher(file.name()).matches();
     }
 
-    LogFile(OperationType type, UUID id, List<File> replicas)
+    LogFile(OperationType type, TimeUUID id, List<File> replicas)
     {
         this(type, id);
         this.replicas.addReplicas(replicas);
     }
 
-    LogFile(OperationType type, UUID id)
+    LogFile(OperationType type, TimeUUID id)
     {
         this.type = type;
         this.id = id;
@@ -162,7 +179,21 @@ final class LogFile implements AutoCloseable
             return false;
         }
 
-        records.forEach(LogFile::verifyRecord);
+        Set<String> absolutePaths = new HashSet<>();
+        for (LogRecord record : records)
+            record.absolutePath.ifPresent(absolutePaths::add);
+
+        Map<String, List<File>> recordFiles = LogRecord.getExistingFiles(absolutePaths);
+        for (LogRecord record : records)
+        {
+            List<File> existingFiles = Collections.emptyList();
+            if (record.absolutePath.isPresent())
+            {
+                String key = record.absolutePath.get();
+                existingFiles = recordFiles.getOrDefault(key, Collections.emptyList());
+            }
+            LogFile.verifyRecord(record, existingFiles);
+        }
 
         Optional<LogRecord> firstInvalid = records.stream().filter(LogRecord::isInvalidOrPartial).findFirst();
         if (!firstInvalid.isPresent())
@@ -200,7 +231,7 @@ final class LogFile implements AutoCloseable
         return record;
     }
 
-    static void verifyRecord(LogRecord record)
+    static void verifyRecord(LogRecord record, List<File> existingFiles)
     {
         if (record.checksum != record.computeChecksum())
         {
@@ -220,17 +251,30 @@ final class LogFile implements AutoCloseable
         // file that obsoleted the very same files. So we check the latest update time and make sure
         // it matches. Because we delete files from oldest to newest, the latest update time should
         // always match.
-        record.status.onDiskRecord = record.withExistingFiles();
-        if (record.updateTime != record.status.onDiskRecord.updateTime && record.status.onDiskRecord.updateTime > 0)
+        record.status.onDiskRecord = record.withExistingFiles(existingFiles);
+        // we can have transaction files with mismatching updateTime resolutions due to switching between jdk8 and jdk11, truncate both to be consistent:
+        if (truncateMillis(record.updateTime) != truncateMillis(record.status.onDiskRecord.updateTime) && record.status.onDiskRecord.updateTime > 0)
         {
             record.setError(String.format("Unexpected files detected for sstable [%s]: " +
-                                          "last update time [%tT] should have been [%tT]",
+                                          "last update time [%tc] (%d) should have been [%tc] (%d)",
                                           record.fileName(),
                                           record.status.onDiskRecord.updateTime,
+                                          record.status.onDiskRecord.updateTime,
+                                          record.updateTime,
                                           record.updateTime));
 
         }
     }
+
+    /**
+     * due to difference in timestamp resolution between jdk8 and 11 we need to return second resolution here (number
+     * should end in 000): https://bugs.openjdk.java.net/browse/JDK-8177809
+     */
+    static long truncateMillis(long lastModified)
+    {
+        return lastModified - (lastModified % 1000);
+    }
+
 
     static void verifyRecordWithCorruptedLastRecord(LogRecord record)
     {
@@ -247,12 +291,12 @@ final class LogFile implements AutoCloseable
 
     void commit()
     {
-        addRecord(LogRecord.makeCommit(System.currentTimeMillis()));
+        addRecord(LogRecord.makeCommit(currentTimeMillis()));
     }
 
     void abort()
     {
-        addRecord(LogRecord.makeAbort(System.currentTimeMillis()));
+        addRecord(LogRecord.makeAbort(currentTimeMillis()));
     }
 
     private boolean isLastRecordValidWithType(Type type)
@@ -278,9 +322,9 @@ final class LogFile implements AutoCloseable
         return committed() || aborted();
     }
 
-    void add(Type type, SSTable table)
+    void add(SSTable table)
     {
-        addRecord(makeRecord(type, table));
+        addRecord(makeAddRecord(table));
     }
 
     public void addAll(Type type, Iterable<SSTableReader> toBulkAdd)
@@ -294,22 +338,14 @@ final class LogFile implements AutoCloseable
         assert type == Type.ADD || type == Type.REMOVE;
 
         for (SSTableReader sstable : tables)
-        {
-            File directory = sstable.descriptor.directory;
-            String fileName = StringUtils.join(directory, File.separator, getFileName());
-            replicas.maybeCreateReplica(directory, fileName, records);
-        }
+            maybeCreateReplica(sstable);
         return LogRecord.make(type, tables);
     }
 
-    private LogRecord makeRecord(Type type, SSTable table)
+    private LogRecord makeAddRecord(SSTable table)
     {
-        assert type == Type.ADD || type == Type.REMOVE;
-
-        File directory = table.descriptor.directory;
-        String fileName = StringUtils.join(directory, File.separator, getFileName());
-        replicas.maybeCreateReplica(directory, fileName, records);
-        return LogRecord.make(type, table);
+        maybeCreateReplica(table);
+        return LogRecord.make(Type.ADD, table);
     }
 
     /**
@@ -320,11 +356,15 @@ final class LogFile implements AutoCloseable
     private LogRecord makeRecord(Type type, SSTable table, LogRecord record)
     {
         assert type == Type.ADD || type == Type.REMOVE;
-
-        File directory = table.descriptor.directory;
-        String fileName = StringUtils.join(directory, File.separator, getFileName());
-        replicas.maybeCreateReplica(directory, fileName, records);
+        maybeCreateReplica(table);
         return record.asType(type);
+    }
+
+    private void maybeCreateReplica(SSTable sstable)
+    {
+        File directory = sstable.descriptor.directory;
+        String fileName = StringUtils.join(directory, File.pathSeparator(), getFileName());
+        replicas.maybeCreateReplica(directory, fileName, onDiskRecords);
     }
 
     void addRecord(LogRecord record)
@@ -338,20 +378,16 @@ final class LogFile implements AutoCloseable
         replicas.append(record);
         if (!records.add(record))
             throw new IllegalStateException("Failed to add record");
+        onDiskRecords.add(record);
     }
 
-    void remove(Type type, SSTable table)
+    void remove(SSTable table)
     {
-        LogRecord record = makeRecord(type, table);
+        LogRecord record = makeAddRecord(table);
         assert records.contains(record) : String.format("[%s] is not tracked by %s", record, id);
-
-        deleteRecordFiles(record);
+        assert record.absolutePath.isPresent();
+        deleteRecordFiles(LogRecord.getExistingFiles(record.absolutePath.get()));
         records.remove(record);
-    }
-
-    boolean contains(Type type, SSTable table)
-    {
-        return contains(makeRecord(type, table));
     }
 
     boolean contains(Type type, SSTable sstable, LogRecord record)
@@ -366,21 +402,31 @@ final class LogFile implements AutoCloseable
 
     void deleteFilesForRecordsOfType(Type type)
     {
-        records.stream()
-               .filter(type::matches)
-               .forEach(LogFile::deleteRecordFiles);
+        assert type == Type.REMOVE || type == Type.ADD;
+        Set<String> absolutePaths = new HashSet<>();
+        for (LogRecord record : records)
+        {
+            if (type.matches(record))
+            {
+                assert record.absolutePath.isPresent() : "type is either REMOVE or ADD, record should always have an absolutePath: " + record;
+                absolutePaths.add(record.absolutePath.get());
+            }
+        }
+
+        Map<String, List<File>> existingFiles = LogRecord.getExistingFiles(absolutePaths);
+
+        for (List<File> toDelete : existingFiles.values())
+            LogFile.deleteRecordFiles(toDelete);
+
         records.clear();
     }
 
-    private static void deleteRecordFiles(LogRecord record)
+    private static void deleteRecordFiles(List<File> existingFiles)
     {
-        List<File> files = record.getExistingFiles();
-
         // we sort the files in ascending update time order so that the last update time
         // stays the same even if we only partially delete files, see comment in isInvalid()
-        files.sort((f1, f2) -> Long.compare(f1.lastModified(), f2.lastModified()));
-
-        files.forEach(LogTransaction::delete);
+        existingFiles.sort(Comparator.comparingLong(File::lastModified));
+        existingFiles.forEach(LogTransaction::delete);
     }
 
     /**
@@ -413,7 +459,7 @@ final class LogFile implements AutoCloseable
     private static Set<File> getRecordFiles(NavigableSet<File> files, LogRecord record)
     {
         String fileName = record.fileName();
-        return files.stream().filter(f -> f.getName().startsWith(fileName)).collect(Collectors.toSet());
+        return files.stream().filter(f -> f.name().startsWith(fileName)).collect(Collectors.toSet());
     }
 
     boolean exists()
@@ -464,14 +510,13 @@ final class LogFile implements AutoCloseable
 
     private String getFileName()
     {
-        return StringUtils.join(BigFormat.latestVersion,
-                                LogFile.SEP,
-                                "txn",
-                                LogFile.SEP,
-                                type.fileName,
-                                LogFile.SEP,
-                                id.toString(),
-                                LogFile.EXT);
+        // For pre-5.0 versions, only BigFormat is supported, and the file name includes only the version string.
+        // To retain the ability to downgrade to 4.x, we keep the old file naming scheme for BigFormat sstables
+        // and add format names for other formats as they are supported only in 5.0 and above.
+        return StringUtils.join(BigFormat.is(version.format) ? version.toString() : version.toFormatAndVersionString(), LogFile.SEP, // remove version and separator when downgrading to 4.x is becomes unsupported
+                                "txn", LogFile.SEP,
+                                type.fileName, LogFile.SEP,
+                                id.toString(), LogFile.EXT);
     }
 
     public boolean isEmpty()

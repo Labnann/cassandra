@@ -17,9 +17,7 @@
  */
 package org.apache.cassandra.cql3;
 
-import java.net.InetAddress;
 import java.util.Iterator;
-import java.util.List;
 
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
@@ -31,17 +29,17 @@ import com.datastax.driver.core.Row;
 import com.datastax.driver.core.Session;
 import com.datastax.driver.core.SimpleStatement;
 import com.datastax.driver.core.Statement;
+import org.apache.cassandra.ServerTestUtils;
 import org.apache.cassandra.config.DatabaseDescriptor;
 
-import org.apache.cassandra.dht.Murmur3Partitioner;
 import org.apache.cassandra.dht.Murmur3Partitioner.LongToken;
-import org.apache.cassandra.locator.AbstractEndpointSnitch;
-import org.apache.cassandra.locator.IEndpointSnitch;
+import org.apache.cassandra.locator.*;
 import org.apache.cassandra.service.EmbeddedCassandraService;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.FBUtilities;
 
-import static junit.framework.Assert.assertFalse;
+import static org.apache.cassandra.config.CassandraRelevantProperties.CASSANDRA_CONFIG;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertEquals;
 
 
@@ -55,13 +53,14 @@ public class PagingTest
                                                     " WITH REPLICATION = { 'class' : 'SimpleStrategy', 'replication_factor' : 2 };";
 
     private static final String dropKsStatement = "DROP KEYSPACE IF EXISTS " + KEYSPACE;
+    private static EmbeddedCassandraService cassandra;
 
     @BeforeClass
     public static void setup() throws Exception
     {
-        System.setProperty("cassandra.config", "cassandra-murmur.yaml");
-        EmbeddedCassandraService cassandra = new EmbeddedCassandraService();
-        cassandra.start();
+        CASSANDRA_CONFIG.setString("cassandra-murmur.yaml");
+
+        cassandra = ServerTestUtils.startEmbeddedCassandraService();
 
         // Currently the native server start method return before the server is fully binded to the socket, so we need
         // to wait slightly before trying to connect to it. We should fix this but in the meantime using a sleep.
@@ -79,7 +78,10 @@ public class PagingTest
     @AfterClass
     public static void tearDown()
     {
-        cluster.close();
+        if (cluster != null)
+            cluster.close();
+        if (cassandra != null)
+            cassandra.stop();
     }
 
     /**
@@ -104,30 +106,30 @@ public class PagingTest
         IEndpointSnitch snitch = new AbstractEndpointSnitch()
         {
             private IEndpointSnitch oldSnitch = DatabaseDescriptor.getEndpointSnitch();
-            public int compareEndpoints(InetAddress target, InetAddress a1, InetAddress a2)
+            public int compareEndpoints(InetAddressAndPort target, Replica a1, Replica a2)
             {
                 return oldSnitch.compareEndpoints(target, a1, a2);
             }
 
-            public String getRack(InetAddress endpoint)
+            public String getRack(InetAddressAndPort endpoint)
             {
                 return oldSnitch.getRack(endpoint);
             }
 
-            public String getDatacenter(InetAddress endpoint)
+            public String getDatacenter(InetAddressAndPort endpoint)
             {
                 return oldSnitch.getDatacenter(endpoint);
             }
 
             @Override
-            public boolean isWorthMergingForRangeQuery(List<InetAddress> merged, List<InetAddress> l1, List<InetAddress> l2)
+            public boolean isWorthMergingForRangeQuery(ReplicaCollection merged, ReplicaCollection l1, ReplicaCollection l2)
             {
                 return false;
             }
         };
         DatabaseDescriptor.setEndpointSnitch(snitch);
         StorageService.instance.getTokenMetadata().clearUnsafe();
-        StorageService.instance.getTokenMetadata().updateNormalToken(new LongToken(5097162189738624638L), FBUtilities.getBroadcastAddress());
+        StorageService.instance.getTokenMetadata().updateNormalToken(new LongToken(5097162189738624638L), FBUtilities.getBroadcastAddressAndPort());
         session.execute(createTableStatement);
 
         for (int i = 0; i < 110; i++)

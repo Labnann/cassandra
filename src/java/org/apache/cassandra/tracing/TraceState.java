@@ -17,10 +17,8 @@
  */
 package org.apache.cassandra.tracing;
 
-import java.net.InetAddress;
 import java.nio.ByteBuffer;
 import java.util.List;
-import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -28,7 +26,9 @@ import java.util.concurrent.atomic.AtomicInteger;
 import com.google.common.base.Stopwatch;
 import org.slf4j.helpers.MessageFormatter;
 
-import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.utils.TimeUUID;
+import org.apache.cassandra.utils.concurrent.UncheckedInterruptedException;
 import org.apache.cassandra.utils.progress.ProgressEvent;
 import org.apache.cassandra.utils.progress.ProgressEventNotifier;
 import org.apache.cassandra.utils.progress.ProgressListener;
@@ -39,8 +39,8 @@ import org.apache.cassandra.utils.progress.ProgressListener;
  */
 public abstract class TraceState implements ProgressEventNotifier
 {
-    public final UUID sessionId;
-    public final InetAddress coordinator;
+    public final TimeUUID sessionId;
+    public final InetAddressAndPort coordinator;
     public final Stopwatch watch;
     public final ByteBuffer sessionIdBytes;
     public final Tracing.TraceType traceType;
@@ -63,14 +63,14 @@ public abstract class TraceState implements ProgressEventNotifier
     // See CASSANDRA-7626 for more details.
     private final AtomicInteger references = new AtomicInteger(1);
 
-    protected TraceState(InetAddress coordinator, UUID sessionId, Tracing.TraceType traceType)
+    protected TraceState(InetAddressAndPort coordinator, TimeUUID sessionId, Tracing.TraceType traceType)
     {
         assert coordinator != null;
         assert sessionId != null;
 
         this.coordinator = coordinator;
         this.sessionId = sessionId;
-        sessionIdBytes = ByteBufferUtil.bytes(sessionId);
+        sessionIdBytes = sessionId.toBytes();
         this.traceType = traceType;
         this.ttl = traceType.getTTL();
         watch = Stopwatch.createStarted();
@@ -134,7 +134,7 @@ public abstract class TraceState implements ProgressEventNotifier
             }
             catch (InterruptedException e)
             {
-                throw new RuntimeException();
+                throw new UncheckedInterruptedException(e);
             }
         }
         if (status == Status.ACTIVE)
@@ -161,7 +161,7 @@ public abstract class TraceState implements ProgressEventNotifier
         trace(MessageFormatter.format(format, arg1, arg2).getMessage());
     }
 
-    public void trace(String format, Object[] args)
+    public void trace(String format, Object... args)
     {
         trace(MessageFormatter.arrayFormat(format, args).getMessage());
     }

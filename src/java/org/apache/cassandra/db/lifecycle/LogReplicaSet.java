@@ -15,11 +15,10 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package org.apache.cassandra.db.lifecycle;
 
-import java.io.File;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -29,9 +28,12 @@ import java.util.function.Function;
 import java.util.stream.Collectors;
 
 import com.google.common.annotations.VisibleForTesting;
+import org.apache.cassandra.io.util.File;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.cassandra.io.FSError;
+import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.utils.Throwables;
 
 /**
@@ -45,7 +47,7 @@ public class LogReplicaSet implements AutoCloseable
 {
     private static final Logger logger = LoggerFactory.getLogger(LogReplicaSet.class);
 
-    private final Map<File, LogReplica> replicasByFile = new LinkedHashMap<>();
+    private final Map<File, LogReplica> replicasByFile = Collections.synchronizedMap(new LinkedHashMap<>()); // TODO: Hack until we fix CASSANDRA-14554
 
     private Collection<LogReplica> replicas()
     {
@@ -59,12 +61,19 @@ public class LogReplicaSet implements AutoCloseable
 
     void addReplica(File file)
     {
-        File directory = file.getParentFile();
+        File directory = file.parent();
         assert !replicasByFile.containsKey(directory);
-        replicasByFile.put(directory, LogReplica.open(file));
+        try
+        {
+            replicasByFile.put(directory, LogReplica.open(file));
+        }
+        catch(FSError e)
+        {
+            logger.error("Failed to open log replica {}", file, e);
+            FileUtils.handleFSErrorAndPropagate(e);
+        }
 
-        if (logger.isTraceEnabled())
-            logger.trace("Added log file replica {} ", file);
+        logger.trace("Added log file replica {} ", file);
     }
 
     void maybeCreateReplica(File directory, String fileName, Set<LogRecord> records)
@@ -72,14 +81,20 @@ public class LogReplicaSet implements AutoCloseable
         if (replicasByFile.containsKey(directory))
             return;
 
-        @SuppressWarnings("resource")  // LogReplicas are closed in LogReplicaSet::close
-        final LogReplica replica = LogReplica.create(directory, fileName);
+        try
+        {
+            @SuppressWarnings("resource")  // LogReplicas are closed in LogReplicaSet::close
+            final LogReplica replica = LogReplica.create(directory, fileName);
+            records.forEach(replica::append);
+            replicasByFile.put(directory, replica);
 
-        records.forEach(replica::append);
-        replicasByFile.put(directory, replica);
-
-        if (logger.isTraceEnabled())
             logger.trace("Created new file replica {}", replica);
+        }
+        catch(FSError e)
+        {
+            logger.error("Failed to create log replica {}/{}", directory,  fileName, e);
+            FileUtils.handleFSErrorAndPropagate(e);
+        }
     }
 
     Throwable syncDirectory(Throwable accumulate)
@@ -253,6 +268,6 @@ public class LogReplicaSet implements AutoCloseable
     @VisibleForTesting
     List<String> getFilePaths()
     {
-        return replicas().stream().map(LogReplica::file).map(File::getPath).collect(Collectors.toList());
+        return replicas().stream().map(LogReplica::file).map(File::path).collect(Collectors.toList());
     }
 }

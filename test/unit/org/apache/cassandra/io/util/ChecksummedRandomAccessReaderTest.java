@@ -18,9 +18,9 @@
 
 package org.apache.cassandra.io.util;
 
-import java.io.File;
 import java.io.IOException;
-import java.io.RandomAccessFile;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.util.Arrays;
 import java.util.concurrent.ThreadLocalRandom;
 
@@ -42,8 +42,8 @@ public class ChecksummedRandomAccessReaderTest
     @Test
     public void readFully() throws IOException
     {
-        final File data = File.createTempFile("testReadFully", "data");
-        final File crc = File.createTempFile("testReadFully", "crc");
+        final File data = FileUtils.createTempFile("testReadFully", "data");
+        final File crc = FileUtils.createTempFile("testReadFully", "crc");
 
         final byte[] expected = new byte[70 * 1024];   // bit more than crc chunk size, so we can test rebuffering.
         ThreadLocalRandom.current().nextBytes(expected);
@@ -70,8 +70,8 @@ public class ChecksummedRandomAccessReaderTest
     @Test
     public void seek() throws IOException
     {
-        final File data = File.createTempFile("testSeek", "data");
-        final File crc = File.createTempFile("testSeek", "crc");
+        final File data = FileUtils.createTempFile("testSeek", "data");
+        final File crc = FileUtils.createTempFile("testSeek", "crc");
 
         final byte[] dataBytes = new byte[70 * 1024];   // bit more than crc chunk size
         ThreadLocalRandom.current().nextBytes(dataBytes);
@@ -104,8 +104,8 @@ public class ChecksummedRandomAccessReaderTest
     @Test(expected = CorruptFileException.class)
     public void corruptionDetection() throws IOException
     {
-        final File data = File.createTempFile("corruptionDetection", "data");
-        final File crc = File.createTempFile("corruptionDetection", "crc");
+        final File data = FileUtils.createTempFile("corruptionDetection", "data");
+        final File crc = FileUtils.createTempFile("corruptionDetection", "crc");
 
         final byte[] expected = new byte[5 * 1024];
         Arrays.fill(expected, (byte) 0);
@@ -119,10 +119,10 @@ public class ChecksummedRandomAccessReaderTest
         assert data.exists();
 
         // simulate corruption of file
-        try (RandomAccessFile dataFile = new RandomAccessFile(data, "rw"))
+        try (FileChannel dataFile = data.newReadWriteChannel())
         {
-            dataFile.seek(1024);
-            dataFile.write((byte) 5);
+            dataFile.position(1024);
+            dataFile.write(ByteBuffer.wrap(new byte[] {5}));
         }
 
         try (RandomAccessReader reader = ChecksummedRandomAccessReader.open(data, crc))

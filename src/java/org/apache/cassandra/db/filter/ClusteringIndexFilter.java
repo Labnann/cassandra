@@ -19,14 +19,13 @@ package org.apache.cassandra.db.filter;
 
 import java.io.IOException;
 
-import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.db.*;
-import org.apache.cassandra.db.rows.*;
 import org.apache.cassandra.db.partitions.CachedPartition;
 import org.apache.cassandra.db.partitions.Partition;
-import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.db.rows.*;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.schema.TableMetadata;
 
 /**
  * A filter that selects a subset of the rows of a given partition by using the "clustering index".
@@ -37,7 +36,7 @@ import org.apache.cassandra.io.util.DataOutputPlus;
  */
 public interface ClusteringIndexFilter
 {
-    public static Serializer serializer = AbstractClusteringIndexFilter.serializer;
+    public static final Serializer serializer = AbstractClusteringIndexFilter.serializer;
 
     public enum Kind
     {
@@ -54,7 +53,7 @@ public interface ClusteringIndexFilter
 
     static interface InternalDeserializer
     {
-        public ClusteringIndexFilter deserialize(DataInputPlus in, int version, CFMetaData metadata, boolean reversed) throws IOException;
+        public ClusteringIndexFilter deserialize(DataInputPlus in, int version, TableMetadata metadata, boolean reversed) throws IOException;
     }
 
     /**
@@ -63,6 +62,8 @@ public interface ClusteringIndexFilter
      * @return whether the filter query rows in reversed clustering order or not.
      */
     public boolean isReversed();
+
+    public boolean isEmpty(ClusteringComparator comparator);
 
     /**
      * Returns a filter for continuing the paging of this filter given the last returned clustering prefix.
@@ -77,7 +78,7 @@ public interface ClusteringIndexFilter
      *
      * @return a new filter that selects results coming after {@code lastReturned}.
      */
-    public ClusteringIndexFilter forPaging(ClusteringComparator comparator, Clustering lastReturned, boolean inclusive);
+    public ClusteringIndexFilter forPaging(ClusteringComparator comparator, Clustering<?> lastReturned, boolean inclusive);
 
     /**
      * Returns whether we can guarantee that a given cached partition contains all the data selected by this filter.
@@ -109,15 +110,15 @@ public interface ClusteringIndexFilter
      *
      * @return whether the row with clustering {@code clustering} is selected by this filter.
      */
-    public boolean selects(Clustering clustering);
+    public boolean selects(Clustering<?> clustering);
 
     /**
      * Returns an iterator that only returns the rows of the provided iterator that this filter selects.
      * <p>
-     * This method is the "dumb" counterpart to {@link #getSlices(CFMetaData)} in that it has no way to quickly get
+     * This method is the "dumb" counterpart to {@link #getSlices(TableMetadata)} in that it has no way to quickly get
      * to what is actually selected, so it simply iterate over it all and filters out what shouldn't be returned. This should
      * be avoided in general.
-     * Another difference with {@link #getSlices(CFMetaData)} is that this method also filter the queried
+     * Another difference with {@link #getSlices(TableMetadata)} is that this method also filter the queried
      * columns in the returned result, while the former assumes that the provided iterator has already done it.
      *
      * @param columnFilter the columns to include in the rows of the result iterator.
@@ -127,7 +128,7 @@ public interface ClusteringIndexFilter
      */
     public UnfilteredRowIterator filterNotIndexed(ColumnFilter columnFilter, UnfilteredRowIterator iterator);
 
-    public Slices getSlices(CFMetaData metadata);
+    public Slices getSlices(TableMetadata metadata);
 
     /**
      * Given a partition, returns a row iterator for the rows of this partition that are selected by this filter.
@@ -140,23 +141,24 @@ public interface ClusteringIndexFilter
     public UnfilteredRowIterator getUnfilteredRowIterator(ColumnFilter columnFilter, Partition partition);
 
     /**
-     * Whether the provided sstable may contain data that is selected by this filter (based on the sstable metadata).
+     * Whether the data selected by this filter intersects with the provided slice.
      *
-     * @param sstable the sstable for which we want to test the need for inclusion.
+     * @param comparator the comparator of the table this if a filter on.
+     * @param slice the slice to check intersection with,
      *
-     * @return whether {@code sstable} should be included to answer this filter.
+     * @return whether the data selected by this filter intersects with {@code slice}.
      */
-    public boolean shouldInclude(SSTableReader sstable);
+    public boolean intersects(ClusteringComparator comparator, Slice slice);
 
     public Kind kind();
 
-    public String toString(CFMetaData metadata);
-    public String toCQLString(CFMetaData metadata);
+    public String toString(TableMetadata metadata);
+    public String toCQLString(TableMetadata metadata, RowFilter rowFilter);
 
     public interface Serializer
     {
         public void serialize(ClusteringIndexFilter filter, DataOutputPlus out, int version) throws IOException;
-        public ClusteringIndexFilter deserialize(DataInputPlus in, int version, CFMetaData metadata) throws IOException;
+        public ClusteringIndexFilter deserialize(DataInputPlus in, int version, TableMetadata metadata) throws IOException;
         public long serializedSize(ClusteringIndexFilter filter, int version);
     }
 }

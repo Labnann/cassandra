@@ -17,6 +17,7 @@
  */
 package org.apache.cassandra.service;
 
+import java.io.IOException;
 import java.lang.management.GarbageCollectorMXBean;
 import java.lang.management.ManagementFactory;
 import java.lang.management.MemoryUsage;
@@ -28,6 +29,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
 import javax.management.MBeanServer;
+import javax.management.MalformedObjectNameException;
 import javax.management.Notification;
 import javax.management.NotificationListener;
 import javax.management.ObjectName;
@@ -42,15 +44,15 @@ import org.slf4j.LoggerFactory;
 import org.apache.cassandra.config.DatabaseDescriptor;
 
 import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
+import org.apache.cassandra.utils.MBeanWrapper;
 import org.apache.cassandra.utils.StatusLogger;
+
+import static org.apache.cassandra.utils.Clock.Global.nanoTime;
 
 public class GCInspector implements NotificationListener, GCInspectorMXBean
 {
     public static final String MBEAN_NAME = "org.apache.cassandra.service:type=GCInspector";
     private static final Logger logger = LoggerFactory.getLogger(GCInspector.class);
-    final static long MIN_LOG_DURATION = DatabaseDescriptor.getGCLogThreshold();
-    final static long GC_WARN_THRESHOLD_IN_MS = DatabaseDescriptor.getGCWarnThreshold();
-    final static long STAT_THRESHOLD = GC_WARN_THRESHOLD_IN_MS != 0 ? GC_WARN_THRESHOLD_IN_MS : MIN_LOG_DURATION;
 
     /*
      * The field from java.nio.Bits that tracks the total number of allocated
@@ -58,13 +60,23 @@ public class GCInspector implements NotificationListener, GCInspectorMXBean
      */
     final static Field BITS_TOTAL_CAPACITY;
 
+    
     static
     {
         Field temp = null;
         try
         {
             Class<?> bitsClass = Class.forName("java.nio.Bits");
-            Field f = bitsClass.getDeclaredField("totalCapacity");
+            Field f;
+            try
+            {
+                f = bitsClass.getDeclaredField("totalCapacity");
+            }
+            catch (NoSuchFieldException ex)
+            {
+                // in Java11 it changed name to "TOTAL_CAPACITY"
+                f = bitsClass.getDeclaredField("TOTAL_CAPACITY");
+            }
             f.setAccessible(true);
             temp = f;
         }
@@ -98,7 +110,7 @@ public class GCInspector implements NotificationListener, GCInspectorMXBean
         State()
         {
             count = maxRealTimeElapsed = sumSquaresRealTimeElapsed = totalRealTimeElapsed = totalBytesReclaimed = 0;
-            startNanos = System.nanoTime();
+            startNanos = nanoTime();
         }
     }
 
@@ -136,20 +148,19 @@ public class GCInspector implements NotificationListener, GCInspectorMXBean
 
     public GCInspector()
     {
-        MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
-
         try
         {
             ObjectName gcName = new ObjectName(ManagementFactory.GARBAGE_COLLECTOR_MXBEAN_DOMAIN_TYPE + ",*");
-            for (ObjectName name : mbs.queryNames(gcName, null))
+            for (ObjectName name : MBeanWrapper.instance.queryNames(gcName, null))
             {
-                GarbageCollectorMXBean gc = ManagementFactory.newPlatformMXBeanProxy(mbs, name.getCanonicalName(), GarbageCollectorMXBean.class);
+                GarbageCollectorMXBean gc = ManagementFactory.newPlatformMXBeanProxy(MBeanWrapper.instance.getMBeanServer(), name.getCanonicalName(), GarbageCollectorMXBean.class);
                 gcStates.put(gc.getName(), new GCState(gc, assumeGCIsPartiallyConcurrent(gc), assumeGCIsOldGen(gc)));
             }
-
-            mbs.registerMBean(this, new ObjectName(MBEAN_NAME));
+            ObjectName me = new ObjectName(MBEAN_NAME);
+            if (!MBeanWrapper.instance.isRegistered(me))
+                MBeanWrapper.instance.registerMBean(this, new ObjectName(MBEAN_NAME));
         }
-        catch (Exception e)
+        catch (MalformedObjectNameException | IOException e)
         {
             throw new RuntimeException(e);
         }
@@ -276,16 +287,15 @@ public class GCInspector implements NotificationListener, GCInspectorMXBean
                 if (state.compareAndSet(prev, new State(duration, bytes, prev)))
                     break;
             }
-
-            String st = sb.toString();
-            if (GC_WARN_THRESHOLD_IN_MS != 0 && duration > GC_WARN_THRESHOLD_IN_MS)
-                logger.warn(st);
-            else if (duration > MIN_LOG_DURATION)
-                logger.info(st);
+            
+            if (getGcWarnThresholdInMs() != 0 && duration > getGcWarnThresholdInMs())
+                logger.warn(sb.toString());
+            else if (duration > getGcLogThresholdInMs())
+                logger.info(sb.toString());
             else if (logger.isTraceEnabled())
-                logger.trace(st);
+                logger.trace(sb.toString());
 
-            if (duration > STAT_THRESHOLD)
+            if (duration > this.getStatusThresholdInMs())
                 StatusLogger.log();
 
             // if we just finished an old gen collection and we're still using a lot of memory, try to reduce the pressure
@@ -303,7 +313,7 @@ public class GCInspector implements NotificationListener, GCInspectorMXBean
     {
         State state = getTotalSinceLastCheck();
         double[] r = new double[7];
-        r[0] = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - state.startNanos);
+        r[0] = TimeUnit.NANOSECONDS.toMillis(nanoTime() - state.startNanos);
         r[1] = state.maxRealTimeElapsed;
         r[2] = state.totalRealTimeElapsed;
         r[3] = state.sumSquaresRealTimeElapsed;
@@ -328,4 +338,46 @@ public class GCInspector implements NotificationListener, GCInspectorMXBean
             return -1;
         }
     }
+
+    public void setGcWarnThresholdInMs(long threshold)
+    {
+        long gcLogThresholdInMs = getGcLogThresholdInMs();
+        if (threshold < 0)
+            throw new IllegalArgumentException("Threshold must be greater than or equal to 0");
+        if (threshold != 0 && threshold <= gcLogThresholdInMs)
+            throw new IllegalArgumentException("Threshold must be greater than gcLogThresholdInMs which is currently "
+                    + gcLogThresholdInMs);
+        if (threshold > Integer.MAX_VALUE)
+            throw new IllegalArgumentException("Threshold must be less than Integer.MAX_VALUE");
+        DatabaseDescriptor.setGCWarnThreshold((int)threshold);
+    }
+
+    public long getGcWarnThresholdInMs()
+    {
+        return DatabaseDescriptor.getGCWarnThreshold();
+    }
+
+    public void setGcLogThresholdInMs(long threshold)
+    {
+        if (threshold <= 0)
+            throw new IllegalArgumentException("Threshold must be greater than 0");
+
+        long gcWarnThresholdInMs = getGcWarnThresholdInMs();
+        if (gcWarnThresholdInMs != 0 && threshold > gcWarnThresholdInMs)
+            throw new IllegalArgumentException("Threshold must be less than gcWarnThresholdInMs which is currently "
+                                               + gcWarnThresholdInMs);
+
+        DatabaseDescriptor.setGCLogThreshold((int) threshold);
+    }
+
+    public long getGcLogThresholdInMs()
+    {
+        return DatabaseDescriptor.getGCLogThreshold();
+    }
+
+    public long getStatusThresholdInMs()
+    {
+        return getGcWarnThresholdInMs() != 0 ? getGcWarnThresholdInMs() : getGcLogThresholdInMs();
+    }
+
 }

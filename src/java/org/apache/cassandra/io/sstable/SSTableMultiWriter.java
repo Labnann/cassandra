@@ -19,10 +19,10 @@
 package org.apache.cassandra.io.sstable;
 
 import java.util.Collection;
-import java.util.UUID;
 
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.schema.TableId;
 import org.apache.cassandra.utils.Throwables;
 import org.apache.cassandra.utils.concurrent.Transactional;
 
@@ -34,17 +34,17 @@ public interface SSTableMultiWriter extends Transactional
      * @param partition the partition to append
      * @return true if the partition was written, false otherwise
      */
-    boolean append(UnfilteredRowIterator partition);
+    void append(UnfilteredRowIterator partition);
 
-    Collection<SSTableReader> finish(long repairedAt, long maxDataAge, boolean openResult);
     Collection<SSTableReader> finish(boolean openResult);
     Collection<SSTableReader> finished();
 
     SSTableMultiWriter setOpenResult(boolean openResult);
 
     String getFilename();
-    long getFilePointer();
-    UUID getCfId();
+    long getBytesWritten();
+    long getOnDiskBytesWritten();
+    TableId getTableId();
 
     static void abortOrDie(SSTableMultiWriter writer)
     {

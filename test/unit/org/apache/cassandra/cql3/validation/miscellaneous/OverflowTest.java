@@ -21,14 +21,14 @@ import java.math.BigInteger;
 
 import org.junit.Test;
 
-import static junit.framework.Assert.assertNull;
-import static org.junit.Assert.assertArrayEquals;
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertTrue;
-
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.exceptions.SyntaxException;
 import org.apache.cassandra.utils.ByteBufferUtil;
+
+import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertArrayEquals;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
 
 /**
  * Any tests that do not fit in any other category,
@@ -107,8 +107,6 @@ public class OverflowTest extends CQLTester
     {
         createTable("CREATE TABLE %s ( k int PRIMARY KEY, c int ) WITH "
                     + "comment = 'My comment' "
-                    + "AND read_repair_chance = 0.5 "
-                    + "AND dclocal_read_repair_chance = 0.5 "
                     + "AND gc_grace_seconds = 4 "
                     + "AND bloom_filter_fp_chance = 0.01 "
                     + "AND compaction = { 'class' : 'LeveledCompactionStrategy', 'sstable_size_in_mb' : 10, 'fanout_size' : 5 } "
@@ -117,8 +115,6 @@ public class OverflowTest extends CQLTester
 
         execute("ALTER TABLE %s WITH "
                 + "comment = 'other comment' "
-                + "AND read_repair_chance = 0.3 "
-                + "AND dclocal_read_repair_chance = 0.3 "
                 + "AND gc_grace_seconds = 100 "
                 + "AND bloom_filter_fp_chance = 0.1 "
                 + "AND compaction = { 'class': 'SizeTieredCompactionStrategy', 'min_sstable_size' : 42 } "
@@ -167,20 +163,6 @@ public class OverflowTest extends CQLTester
     }
 
     /**
-     * Test regression from #5189,
-     * migrated from cql_tests.py:TestCQL.compact_metadata_test()
-     */
-    @Test
-    public void testCompactMetadata() throws Throwable
-    {
-        createTable("CREATE TABLE %s (id int primary key, i int ) WITH COMPACT STORAGE");
-
-        execute("INSERT INTO %s (id, i) VALUES (1, 2)");
-        assertRows(execute("SELECT * FROM %s"),
-                   row(1, 2));
-    }
-
-    /**
      * Migrated from cql_tests.py:TestCQL.conversion_functions_test()
      */
     @Test
@@ -188,8 +170,8 @@ public class OverflowTest extends CQLTester
     {
         createTable("CREATE TABLE %s (k int PRIMARY KEY, i varint, b blob)");
 
-        execute("INSERT INTO %s (k, i, b) VALUES (0, blobAsVarint(bigintAsBlob(3)), textAsBlob('foobar'))");
-        assertRows(execute("SELECT i, blobAsText(b) FROM %s WHERE k = 0"),
+        execute("INSERT INTO %s (k, i, b) VALUES (0, blob_as_varint(bigint_as_blob(3)), text_as_blob('foobar'))");
+        assertRows(execute("SELECT i, blob_as_text(b) FROM %s WHERE k = 0"),
                    row(BigInteger.valueOf(3), "foobar"));
     }
 
@@ -237,22 +219,6 @@ public class OverflowTest extends CQLTester
         // Test empty IN() in UPDATE
         execute("UPDATE %s SET v = 3 WHERE k1 IN () AND k2 = 2");
         assertArrayEquals(rows, getRows(execute("SELECT * FROM %s")));
-
-        // Same test, but for compact
-        createTable("CREATE TABLE %s (k1 int, k2 int, v int, PRIMARY KEY (k1, k2)) WITH COMPACT STORAGE");
-
-        rows = fill();
-
-        assertEmpty(execute("SELECT v FROM %s WHERE k1 IN ()"));
-        assertEmpty(execute("SELECT v FROM %s WHERE k1 = 0 AND k2 IN ()"));
-
-        // Test empty IN() in DELETE
-        execute("DELETE FROM %s WHERE k1 IN ()");
-        assertArrayEquals(rows, getRows(execute("SELECT * FROM %s")));
-
-        // Test empty IN() in UPDATE
-        execute("UPDATE %s SET v = 3 WHERE k1 IN () AND k2 = 2");
-        assertArrayEquals(rows, getRows(execute("SELECT * FROM %s")));
     }
 
     /**
@@ -264,7 +230,7 @@ public class OverflowTest extends CQLTester
         createTable("CREATE TABLE %s (k int PRIMARY KEY, t timeuuid,)");
 
         execute("INSERT INTO %s (k) VALUES (0)");
-        Object[][] rows = getRows(execute("SELECT dateOf(t) FROM %s WHERE k=0"));
+        Object[][] rows = getRows(execute("SELECT to_timestamp(t) FROM %s WHERE k=0"));
         assertNull(rows[0][0]);
     }
 
@@ -322,9 +288,9 @@ public class OverflowTest extends CQLTester
         createTable("CREATE TABLE %s (k int PRIMARY KEY, v int)");
 
         //  A blob that is not 4 bytes should be rejected
-        assertInvalid("INSERT INTO %s (k, v) VALUES (0, blobAsInt(0x01))");
+        assertInvalid("INSERT INTO %s (k, v) VALUES (0, blob_as_int(0x01))");
 
-        execute("INSERT INTO %s (k, v) VALUES (0, blobAsInt(0x00000001))");
+        execute("INSERT INTO %s (k, v) VALUES (0, blob_as_int(0x00000001))");
         assertRows(execute("select v from %s where k=0"), row(1));
     }
 }

@@ -19,8 +19,7 @@ package org.apache.cassandra.hints;
 
 import java.io.DataInput;
 import java.io.IOException;
-import java.io.RandomAccessFile;
-import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.Map;
@@ -30,9 +29,15 @@ import java.util.regex.Pattern;
 import java.util.zip.CRC32;
 import javax.crypto.Cipher;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.MoreObjects;
 import com.google.common.base.Objects;
 import com.google.common.collect.ImmutableMap;
+
+import org.apache.cassandra.io.util.File;
+import org.apache.cassandra.io.util.FileInputStreamPlus;
+import com.google.common.io.ByteStreams;
+import com.google.common.io.CountingOutputStream;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -45,8 +50,9 @@ import org.apache.cassandra.io.util.DataOutputPlus;
 import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.schema.CompressionParams;
 import org.apache.cassandra.security.EncryptionContext;
+import org.apache.cassandra.serializers.MarshalException;
 import org.apache.cassandra.utils.Hex;
-import org.json.simple.JSONValue;
+import org.apache.cassandra.utils.JsonUtils;
 
 import static org.apache.cassandra.utils.FBUtilities.updateChecksumInt;
 
@@ -60,8 +66,9 @@ final class HintsDescriptor
 {
     private static final Logger logger = LoggerFactory.getLogger(HintsDescriptor.class);
 
-    static final int VERSION_30 = 1;
-    static final int CURRENT_VERSION = VERSION_30;
+    static final int VERSION_40 = 2;
+    static final int VERSION_50 = 3;
+    static final int CURRENT_VERSION = DatabaseDescriptor.getStorageCompatibilityMode().isBefore(5) ? VERSION_40 : VERSION_50;
 
     static final String COMPRESSION = "compression";
     static final String ENCRYPTION = "encryption";
@@ -204,6 +211,16 @@ final class HintsDescriptor
         return String.format("%s-%s-%s.crc32", hostId, timestamp, version);
     }
 
+    File file(File hintsDirectory)
+    {
+        return new File(hintsDirectory, fileName());
+    }
+
+    File checksumFile(File hintsDirectory)
+    {
+        return new File(hintsDirectory, checksumFileName());
+    }
+
     int messagingVersion()
     {
         return messagingVersion(version);
@@ -213,8 +230,10 @@ final class HintsDescriptor
     {
         switch (hintsVersion)
         {
-            case VERSION_30:
-                return MessagingService.FORCE_3_0_PROTOCOL_VERSION ? MessagingService.VERSION_30 : MessagingService.VERSION_3014;
+            case VERSION_40:
+                return MessagingService.VERSION_40;
+            case VERSION_50:
+                return MessagingService.VERSION_50;
             default:
                 throw new AssertionError();
         }
@@ -227,30 +246,54 @@ final class HintsDescriptor
 
     static Optional<HintsDescriptor> readFromFileQuietly(Path path)
     {
-        try (RandomAccessFile raf = new RandomAccessFile(path.toFile(), "r"))
+        try (FileInputStreamPlus raf = new FileInputStreamPlus(path))
         {
             return Optional.of(deserialize(raf));
         }
         catch (ChecksumMismatchException e)
         {
-            throw new FSReadError(e, path.toFile());
+            throw new FSReadError(e, path);
         }
         catch (IOException e)
         {
-            logger.error("Failed to deserialize hints descriptor {}", path.toString(), e);
+            handleDescriptorIOE(e, path);
             return Optional.empty();
         }
     }
 
-    static HintsDescriptor readFromFile(Path path)
+    @VisibleForTesting
+    static void handleDescriptorIOE(IOException e, Path path)
     {
-        try (RandomAccessFile raf = new RandomAccessFile(path.toFile(), "r"))
+        try
+        {
+            if (Files.size(path) > 0)
+            {
+                String newFileName = path.getFileName().toString().replace(".hints", ".corrupt.hints");
+                Path target = path.getParent().resolve(newFileName);
+                logger.error("Failed to deserialize hints descriptor {} - saving file as {}", path.toString(), target, e);
+                Files.move(path, target);
+            }
+            else
+            {
+                logger.warn("Found empty hints file {} on startup, removing", path.toString());
+                Files.delete(path);
+            }
+        }
+        catch (IOException ex)
+        {
+            logger.error("Error handling corrupt hints file {}", path.toString(), ex);
+        }
+    }
+
+    static HintsDescriptor readFromFile(File path)
+    {
+        try (FileInputStreamPlus raf = new FileInputStreamPlus(path))
         {
             return deserialize(raf);
         }
         catch (IOException e)
         {
-            throw new FSReadError(e, path.toFile());
+            throw new FSReadError(e, path);
         }
     }
 
@@ -327,7 +370,7 @@ final class HintsDescriptor
         out.writeLong(hostId.getLeastSignificantBits());
         updateChecksumLong(crc, hostId.getLeastSignificantBits());
 
-        byte[] paramsBytes = JSONValue.toJSONString(parameters).getBytes(StandardCharsets.UTF_8);
+        byte[] paramsBytes = JsonUtils.writeAsJsonBytes(parameters);
         out.writeInt(paramsBytes.length);
         updateChecksumInt(crc, paramsBytes.length);
         out.writeInt((int) crc.getValue());
@@ -346,10 +389,20 @@ final class HintsDescriptor
         size += TypeSizes.sizeof(hostId.getMostSignificantBits());
         size += TypeSizes.sizeof(hostId.getLeastSignificantBits());
 
-        byte[] paramsBytes = JSONValue.toJSONString(parameters).getBytes(StandardCharsets.UTF_8);
-        size += TypeSizes.sizeof(paramsBytes.length);
+        // Let's avoid allocation of serialized output, use counting output stream
+        int serializedParamsLength;
+        try (CountingOutputStream out = new CountingOutputStream(ByteStreams.nullOutputStream()))
+        {
+            JsonUtils.JSON_OBJECT_MAPPER.writeValue(out, parameters);
+            serializedParamsLength = (int) out.getCount();
+        }
+        catch (IOException e)
+        {
+            throw new RuntimeException(e); // should never happen
+        }
+        size += TypeSizes.sizeof(serializedParamsLength);
         size += 4; // size checksum
-        size += paramsBytes.length;
+        size += serializedParamsLength;
         size += 4; // total checksum
 
         return size;
@@ -387,7 +440,18 @@ final class HintsDescriptor
     @SuppressWarnings("unchecked")
     private static ImmutableMap<String, Object> decodeJSONBytes(byte[] bytes)
     {
-        return ImmutableMap.copyOf((Map<String, Object>) JSONValue.parse(new String(bytes, StandardCharsets.UTF_8)));
+        // note: There is a Jackson module (datatype-guava) for directly reading into ImmutableMap,
+        // but would require adding dependency to that
+        try
+        {
+            return ImmutableMap.copyOf(JsonUtils.fromJsonMap(bytes));
+        }
+        catch (MarshalException e)
+        {
+            // Couple of options here: up to 4.0 simply returned null and caller failed with NPE.
+            // Seems cleaner to throw an exception
+            throw new MarshalException("Corrupt HintsDescriptor serialization, problem: " + e.getMessage(), e);
+        }
     }
 
     private static void updateChecksumLong(CRC32 crc, long value)

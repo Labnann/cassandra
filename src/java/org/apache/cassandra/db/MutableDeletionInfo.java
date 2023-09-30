@@ -22,10 +22,10 @@ import java.util.Iterator;
 
 import com.google.common.base.Objects;
 
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.rows.*;
-import org.apache.cassandra.db.rows.EncodingStats;
 import org.apache.cassandra.utils.ObjectSizes;
-import org.apache.cassandra.utils.memory.AbstractAllocator;
+import org.apache.cassandra.utils.memory.ByteBufferCloner;
 
 /**
  * A mutable implementation of {@code DeletionInfo}.
@@ -52,11 +52,11 @@ public class MutableDeletionInfo implements DeletionInfo
      * @param localDeletionTime what time the deletion write was applied locally (for purposes of
      *                          purging the tombstone after gc_grace_seconds).
      */
-    public MutableDeletionInfo(long markedForDeleteAt, int localDeletionTime)
+    public MutableDeletionInfo(long markedForDeleteAt, long localDeletionTime)
     {
         // Pre-1.1 node may return MIN_VALUE for non-deleted container, but the new default is MAX_VALUE
         // (see CASSANDRA-3872)
-        this(new DeletionTime(markedForDeleteAt, localDeletionTime == Integer.MIN_VALUE ? Integer.MAX_VALUE : localDeletionTime));
+        this(DeletionTime.build(markedForDeleteAt, localDeletionTime == Integer.MIN_VALUE ? Long.MAX_VALUE : localDeletionTime));
     }
 
     public MutableDeletionInfo(DeletionTime partitionDeletion)
@@ -83,11 +83,12 @@ public class MutableDeletionInfo implements DeletionInfo
         return new MutableDeletionInfo(partitionDeletion, ranges == null ? null : ranges.copy());
     }
 
-    public MutableDeletionInfo copy(AbstractAllocator allocator)
+    @Override
+    public MutableDeletionInfo clone(ByteBufferCloner cloner)
     {
         RangeTombstoneList rangesCopy = null;
         if (ranges != null)
-             rangesCopy = ranges.copy(allocator);
+             rangesCopy = ranges.clone(cloner);
 
         return new MutableDeletionInfo(partitionDeletion, rangesCopy);
     }
@@ -113,8 +114,8 @@ public class MutableDeletionInfo implements DeletionInfo
 
     public void add(RangeTombstone tombstone, ClusteringComparator comparator)
     {
-        if (ranges == null)
-            ranges = new RangeTombstoneList(comparator, 1);
+        if (ranges == null) // Introduce getInitialRangeTombstoneAllocationSize
+            ranges = new RangeTombstoneList(comparator, DatabaseDescriptor.getInitialRangeTombstoneListAllocationSize());
 
         ranges.add(tombstone);
     }
@@ -159,7 +160,7 @@ public class MutableDeletionInfo implements DeletionInfo
         return ranges == null ? Collections.emptyIterator() : ranges.iterator(slice, reversed);
     }
 
-    public RangeTombstone rangeCovering(Clustering name)
+    public RangeTombstone rangeCovering(Clustering<?> name)
     {
         return ranges == null ? null : ranges.search(name);
     }
@@ -222,7 +223,7 @@ public class MutableDeletionInfo implements DeletionInfo
     public DeletionInfo updateAllTimestamp(long timestamp)
     {
         if (partitionDeletion.markedForDeleteAt() != Long.MIN_VALUE)
-            partitionDeletion = new DeletionTime(timestamp, partitionDeletion.localDeletionTime());
+            partitionDeletion = DeletionTime.build(timestamp, partitionDeletion.localDeletionTime());
 
         if (ranges != null)
             ranges.updateAllTimestamp(timestamp);
@@ -247,6 +248,9 @@ public class MutableDeletionInfo implements DeletionInfo
     @Override
     public long unsharedHeapSize()
     {
+        if (this == LIVE)
+            return 0;
+
         return EMPTY_SIZE + partitionDeletion.unsharedHeapSize() + (ranges == null ? 0 : ranges.unsharedHeapSize());
     }
 
@@ -290,8 +294,8 @@ public class MutableDeletionInfo implements DeletionInfo
                 DeletionTime openDeletion = openMarker.openDeletionTime(reversed);
                 assert marker.closeDeletionTime(reversed).equals(openDeletion);
 
-                ClusteringBound open = openMarker.openBound(reversed);
-                ClusteringBound close = marker.closeBound(reversed);
+                ClusteringBound<?> open = openMarker.openBound(reversed);
+                ClusteringBound<?> close = marker.closeBound(reversed);
 
                 Slice slice = reversed ? Slice.make(close, open) : Slice.make(open, close);
                 deletion.add(new RangeTombstone(slice, openDeletion), comparator);

@@ -18,63 +18,111 @@
  */
 package org.apache.cassandra.utils.memory;
 
-import org.apache.cassandra.concurrent.InfiniteLoopExecutor;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import com.google.common.annotations.VisibleForTesting;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.concurrent.TimeUnit;
+
+import org.apache.cassandra.concurrent.Interruptible;
 import org.apache.cassandra.utils.concurrent.WaitQueue;
+
+import static org.apache.cassandra.concurrent.InfiniteLoopExecutor.SimulatorSafe.SAFE;
+import static org.apache.cassandra.utils.concurrent.WaitQueue.newWaitQueue;
+import static org.apache.cassandra.concurrent.ExecutorFactory.Global.executorFactory;
 
 /**
  * A thread that reclaims memory from a MemtablePool on demand.  The actual reclaiming work is delegated to the
  * cleaner Runnable, e.g., FlushLargestColumnFamily
  */
-public class MemtableCleanerThread<P extends MemtablePool> extends InfiniteLoopExecutor
+public class MemtableCleanerThread<P extends MemtablePool> implements Interruptible
 {
-    private static class Clean<P extends MemtablePool> implements InterruptibleRunnable
+    private static final Logger logger = LoggerFactory.getLogger(MemtableCleanerThread.class);
+
+    private static class Clean<P extends MemtablePool> implements Interruptible.SimpleTask
     {
+        /** This is incremented when a cleaner is invoked and decremented when a cleaner has completed */
+        final AtomicInteger numPendingTasks = new AtomicInteger(0);
+
         /** The pool we're cleaning */
         final P pool;
 
         /** should ensure that at least some memory has been marked reclaiming after completion */
-        final Runnable cleaner;
+        final MemtableCleaner cleaner;
 
         /** signalled whenever needsCleaning() may return true */
-        final WaitQueue wait = new WaitQueue();
+        final WaitQueue wait = newWaitQueue();
 
-        private Clean(P pool, Runnable cleaner)
+        private Clean(P pool, MemtableCleaner cleaner)
         {
             this.pool = pool;
             this.cleaner = cleaner;
         }
 
-        boolean needsCleaning()
+        /** Return the number of pending tasks */
+        public int numPendingTasks()
         {
-            return pool.onHeap.needsCleaning() || pool.offHeap.needsCleaning();
+            return numPendingTasks.get();
         }
 
         @Override
         public void run() throws InterruptedException
         {
-            if (needsCleaning())
-            {
-                cleaner.run();
-            }
-            else
+            if (!pool.needsCleaning())
             {
                 final WaitQueue.Signal signal = wait.register();
-                if (!needsCleaning())
+                if (!pool.needsCleaning())
                     signal.await();
                 else
                     signal.cancel();
             }
+            else
+            {
+                int numPendingTasks = this.numPendingTasks.incrementAndGet();
+
+                if (logger.isTraceEnabled())
+                    logger.trace("Invoking cleaner with {} tasks pending", numPendingTasks);
+
+                cleaner.clean().addCallback(this::apply);
+            }
+        }
+
+        private Boolean apply(Boolean res, Throwable err)
+        {
+            final int tasks = numPendingTasks.decrementAndGet();
+
+            // if the cleaning job was scheduled (res == true) or had an error, trigger again after decrementing the tasks
+            if ((res || err != null) && pool.needsCleaning())
+                wait.signal();
+
+            if (err != null)
+                logger.error("Memtable cleaning tasks failed with an exception and {} pending tasks ", tasks, err);
+            else if (logger.isTraceEnabled())
+                logger.trace("Memtable cleaning task completed ({}), currently pending: {}", res, tasks);
+
+            return res;
+        }
+
+        public String toString()
+        {
+            return pool.toString() + ' ' + cleaner.toString();
         }
     }
 
+    private final Interruptible executor;
     private final Runnable trigger;
+    private final Clean<P> clean;
+
     private MemtableCleanerThread(Clean<P> clean)
     {
-        super(clean.pool.getClass().getSimpleName() + "Cleaner", clean);
+        this.executor = executorFactory().infiniteLoop(clean.pool.getClass().getSimpleName() + "Cleaner", clean, SAFE);
         this.trigger = clean.wait::signal;
+        this.clean = clean;
     }
 
-    MemtableCleanerThread(P pool, Runnable cleaner)
+    public MemtableCleanerThread(P pool, MemtableCleaner cleaner)
     {
         this(new Clean<>(pool, cleaner));
     }
@@ -83,5 +131,42 @@ public class MemtableCleanerThread<P extends MemtablePool> extends InfiniteLoopE
     public void trigger()
     {
         trigger.run();
+    }
+
+    /** Return the number of pending tasks */
+    @VisibleForTesting
+    public int numPendingTasks()
+    {
+        return clean.numPendingTasks();
+    }
+
+    @Override
+    public void interrupt()
+    {
+        executor.interrupt();
+    }
+
+    @Override
+    public boolean isTerminated()
+    {
+        return executor.isTerminated();
+    }
+
+    @Override
+    public void shutdown()
+    {
+        executor.shutdown();
+    }
+
+    @Override
+    public Object shutdownNow()
+    {
+        return executor.shutdownNow();
+    }
+
+    @Override
+    public boolean awaitTermination(long timeout, TimeUnit units) throws InterruptedException
+    {
+        return executor.awaitTermination(timeout, units);
     }
 }

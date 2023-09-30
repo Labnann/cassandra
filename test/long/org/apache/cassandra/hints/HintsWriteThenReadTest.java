@@ -17,7 +17,6 @@
  */
 package org.apache.cassandra.hints;
 
-import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.ByteBuffer;
@@ -28,25 +27,28 @@ import java.util.concurrent.TimeUnit;
 import java.util.zip.CRC32;
 
 import com.google.common.collect.Iterables;
+
+import org.apache.cassandra.io.util.File;
 import org.junit.Test;
 
 import org.apache.cassandra.SchemaLoader;
-import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.config.Schema;
 import org.apache.cassandra.db.Mutation;
 import org.apache.cassandra.db.RowUpdateBuilder;
 import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.schema.KeyspaceParams;
+import org.apache.cassandra.schema.Schema;
+import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.utils.FBUtilities;
-
-import static junit.framework.Assert.assertEquals;
-import static junit.framework.Assert.assertNotNull;
-import static junit.framework.Assert.assertTrue;
 
 import static org.apache.cassandra.Util.dk;
 import static org.apache.cassandra.utils.ByteBufferUtil.bytes;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertTrue;
+
+import static org.apache.cassandra.utils.Clock.Global.currentTimeMillis;
 
 public class HintsWriteThenReadTest
 {
@@ -61,9 +63,9 @@ public class HintsWriteThenReadTest
         SchemaLoader.prepareServer();
         SchemaLoader.createKeyspace(KEYSPACE, KeyspaceParams.simple(1), SchemaLoader.standardCFMD(KEYSPACE, TABLE));
 
-        HintsDescriptor descriptor = new HintsDescriptor(UUID.randomUUID(), System.currentTimeMillis());
+        HintsDescriptor descriptor = new HintsDescriptor(UUID.randomUUID(), currentTimeMillis());
 
-        File directory = Files.createTempDirectory(null).toFile();
+        File directory = new File(Files.createTempDirectory(null));
         try
         {
             testWriteReadCycle(directory, descriptor);
@@ -96,8 +98,8 @@ public class HintsWriteThenReadTest
 
     private static void verifyChecksum(File directory, HintsDescriptor descriptor) throws IOException
     {
-        File hintsFile = new File(directory, descriptor.fileName());
-        File checksumFile = new File(directory, descriptor.checksumFileName());
+        File hintsFile = descriptor.file(directory);
+        File checksumFile = descriptor.checksumFile(directory);
 
         assertTrue(checksumFile.exists());
 
@@ -112,7 +114,7 @@ public class HintsWriteThenReadTest
         long baseTimestamp = descriptor.timestamp;
         int index = 0;
 
-        try (HintsReader reader = HintsReader.open(new File(directory, descriptor.fileName())))
+        try (HintsReader reader = HintsReader.open(descriptor.file(directory)))
         {
             for (HintsReader.Page page : reader)
             {
@@ -129,10 +131,10 @@ public class HintsWriteThenReadTest
 
                     Row row = mutation.getPartitionUpdates().iterator().next().iterator().next();
                     assertEquals(1, Iterables.size(row.cells()));
-                    assertEquals(bytes(index), row.clustering().get(0));
-                    Cell cell = row.cells().iterator().next();
+                    assertEquals(bytes(index), toByteBuffer(row.clustering().get(0)));
+                    Cell<?> cell = row.cells().iterator().next();
                     assertNotNull(cell);
-                    assertEquals(bytes(index), cell.value());
+                    assertEquals(bytes(index), toByteBuffer(cell.value()));
                     assertEquals(timestamp * 1000, cell.timestamp());
 
                     index++;
@@ -167,7 +169,7 @@ public class HintsWriteThenReadTest
 
     private static Mutation createMutation(int index, long timestamp)
     {
-        CFMetaData table = Schema.instance.getCFMetaData(KEYSPACE, TABLE);
+        TableMetadata table = Schema.instance.getTableMetadata(KEYSPACE, TABLE);
         return new RowUpdateBuilder(table, timestamp, bytes(index))
                .clustering(bytes(index))
                .add("val", bytes(index))
@@ -187,5 +189,13 @@ public class HintsWriteThenReadTest
         }
 
         return (int) crc.getValue();
+    }
+
+    private ByteBuffer toByteBuffer(Object obj)
+    {
+        if (obj instanceof ByteBuffer)
+           return (ByteBuffer) obj;
+
+        return ByteBuffer.wrap((byte[]) obj);
     }
 }

@@ -15,22 +15,23 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package org.apache.cassandra.io.sstable;
 
 import java.util.Collection;
 import java.util.Collections;
-import java.util.UUID;
 
-import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.db.RowIndexEntry;
 import org.apache.cassandra.db.SerializationHeader;
+import org.apache.cassandra.db.commitlog.CommitLogPosition;
+import org.apache.cassandra.db.commitlog.IntervalSet;
 import org.apache.cassandra.db.lifecycle.LifecycleNewTracker;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.index.Index;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.sstable.format.SSTableWriter;
 import org.apache.cassandra.io.sstable.metadata.MetadataCollector;
+import org.apache.cassandra.schema.TableId;
+import org.apache.cassandra.schema.TableMetadataRef;
+import org.apache.cassandra.utils.TimeUUID;
 
 public class SimpleSSTableMultiWriter implements SSTableMultiWriter
 {
@@ -43,15 +44,9 @@ public class SimpleSSTableMultiWriter implements SSTableMultiWriter
         this.writer = writer;
     }
 
-    public boolean append(UnfilteredRowIterator partition)
+    public void append(UnfilteredRowIterator partition)
     {
-        RowIndexEntry<?> indexEntry = writer.append(partition);
-        return indexEntry != null;
-    }
-
-    public Collection<SSTableReader> finish(long repairedAt, long maxDataAge, boolean openResult)
-    {
-        return Collections.singleton(writer.finish(repairedAt, maxDataAge, openResult));
+        writer.append(partition);
     }
 
     public Collection<SSTableReader> finish(boolean openResult)
@@ -75,14 +70,19 @@ public class SimpleSSTableMultiWriter implements SSTableMultiWriter
         return writer.getFilename();
     }
 
-    public long getFilePointer()
+    public long getBytesWritten()
     {
         return writer.getFilePointer();
     }
 
-    public UUID getCfId()
+    public long getOnDiskBytesWritten()
     {
-        return writer.metadata.cfId;
+        return writer.getEstimatedOnDiskBytesWritten();
+    }
+
+    public TableId getTableId()
+    {
+        return writer.metadata().id;
     }
 
     public Throwable commit(Throwable accumulate)
@@ -106,17 +106,34 @@ public class SimpleSSTableMultiWriter implements SSTableMultiWriter
         writer.close();
     }
 
-    @SuppressWarnings("resource") // SimpleSSTableMultiWriter closes writer
+    @SuppressWarnings({"resource", "RedundantSuppression"}) // SimpleSSTableMultiWriter closes writer
     public static SSTableMultiWriter create(Descriptor descriptor,
                                             long keyCount,
                                             long repairedAt,
-                                            CFMetaData cfm,
-                                            MetadataCollector metadataCollector,
+                                            TimeUUID pendingRepair,
+                                            boolean isTransient,
+                                            TableMetadataRef metadata,
+                                            IntervalSet<CommitLogPosition> commitLogPositions,
+                                            int sstableLevel,
                                             SerializationHeader header,
-                                            Collection<Index> indexes,
-                                            LifecycleNewTracker lifecycleNewTracker)
+                                            Collection<Index.Group> indexGroups,
+                                            LifecycleNewTracker lifecycleNewTracker,
+                                            SSTable.Owner owner)
     {
-        SSTableWriter writer = SSTableWriter.create(descriptor, keyCount, repairedAt, cfm, metadataCollector, header, indexes, lifecycleNewTracker);
+        MetadataCollector metadataCollector = new MetadataCollector(metadata.get().comparator)
+                                              .commitLogIntervals(commitLogPositions != null ? commitLogPositions : IntervalSet.empty())
+                                              .sstableLevel(sstableLevel);
+        SSTableWriter writer = descriptor.getFormat().getWriterFactory().builder(descriptor)
+                                            .setKeyCount(keyCount)
+                                            .setRepairedAt(repairedAt)
+                                            .setPendingRepair(pendingRepair)
+                                            .setTransientSSTable(isTransient)
+                                            .setTableMetadataRef(metadata)
+                                            .setMetadataCollector(metadataCollector)
+                                            .setSerializationHeader(header)
+                                            .addDefaultComponents(indexGroups)
+                                            .addFlushObserversForSecondaryIndexes(indexGroups, lifecycleNewTracker, metadata.get())
+                                            .build(lifecycleNewTracker, owner);
         return new SimpleSSTableMultiWriter(writer, lifecycleNewTracker);
     }
 }

@@ -26,25 +26,35 @@ import java.util.zip.CRC32;
 import com.google.common.collect.Iterables;
 import org.junit.BeforeClass;
 import org.junit.Test;
+import org.junit.runner.RunWith;
 
 import org.apache.cassandra.SchemaLoader;
 import org.apache.cassandra.concurrent.NamedThreadFactory;
-import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.config.Schema;
 import org.apache.cassandra.db.Mutation;
 import org.apache.cassandra.db.RowUpdateBuilder;
+import org.apache.cassandra.db.marshal.ValueAccessors;
 import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.io.util.DataInputBuffer;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.schema.KeyspaceParams;
+import org.apache.cassandra.schema.Schema;
+import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.utils.Clock;
+import org.jboss.byteman.contrib.bmunit.BMRule;
+import org.jboss.byteman.contrib.bmunit.BMUnitRunner;
 
-import static junit.framework.Assert.*;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 import static org.apache.cassandra.utils.ByteBufferUtil.bytes;
 import static org.apache.cassandra.utils.FBUtilities.updateChecksum;
 
+@RunWith(BMUnitRunner.class)
 public class HintsBufferTest
 {
     private static final String KEYSPACE = "hints_buffer_test";
@@ -115,7 +125,7 @@ public class HintsBufferTest
         // create HINT_THREADS_COUNT, start them, and wait for them to finish
         List<Thread> threads = new ArrayList<>(HINT_THREADS_COUNT);
         for (int i = 0; i < HINT_THREADS_COUNT; i ++)
-            threads.add(NamedThreadFactory.createThread(new Writer(buffer, load, hintSize, i, baseTimestamp)));
+            threads.add(NamedThreadFactory.createAnonymousThread(new Writer(buffer, load, hintSize, i, baseTimestamp)));
         threads.forEach(java.lang.Thread::start);
         for (Thread thread : threads)
             thread.join();
@@ -156,6 +166,48 @@ public class HintsBufferTest
         buffer.free();
     }
 
+    static volatile long timestampForHint = 0;
+    // BM rule to get the timestamp that was used to store the hint so that we avoid any flakiness in timestamps between
+    // when we send the hint and when it actually got written.
+    @Test
+    @BMRule(name = "GetHintTS",
+            targetClass="HintsBuffer$Allocation",
+            targetMethod="write(Iterable, Hint)",
+            targetLocation="AFTER INVOKE putIfAbsent",
+            action="org.apache.cassandra.hints.HintsBufferTest.timestampForHint = $ts")
+    public void testEarliestHintTime()
+    {
+        int hintSize = (int) Hint.serializer.serializedSize(createHint(0, Clock.Global.currentTimeMillis()), MessagingService.current_version);
+        int entrySize = hintSize + HintsBuffer.ENTRY_OVERHEAD_SIZE;
+        // allocate a slab to fit 10 hints
+        int slabSize = entrySize * 10;
+
+        // use a fixed timestamp base for all mutation timestamps
+        long baseTimestamp = Clock.Global.currentTimeMillis();
+
+        HintsBuffer buffer = HintsBuffer.create(slabSize);
+        UUID uuid = UUID.randomUUID();
+        // Track the first hints time
+        try (HintsBuffer.Allocation allocation = buffer.allocate(hintSize))
+        {
+            Hint hint = createHint(100, baseTimestamp);
+            allocation.write(Collections.singleton(uuid), hint);
+        }
+        long oldestHintTime = timestampForHint;
+
+        // Write some more hints to ensure we actually test getting the earliest
+        for (int i = 0; i < 9; i++)
+        {
+            try (HintsBuffer.Allocation allocation = buffer.allocate(hintSize))
+            {
+                Hint hint = createHint(i, baseTimestamp);
+                allocation.write(Collections.singleton(uuid), hint);
+            }
+        }
+        long earliest = buffer.getEarliestHintTime(uuid);
+        assertEquals(oldestHintTime, earliest);
+    }
+
     private static int validateEntry(UUID hostId, ByteBuffer buffer, long baseTimestamp, UUID[] load) throws IOException
     {
         CRC32 crc = new CRC32();
@@ -181,10 +233,10 @@ public class HintsBufferTest
         Row row = hint.mutation.getPartitionUpdates().iterator().next().iterator().next();
         assertEquals(1, Iterables.size(row.cells()));
 
-        assertEquals(bytes(idx), row.clustering().get(0));
-        Cell cell = row.cells().iterator().next();
+        ValueAccessors.assertDataEquals(bytes(idx), row.clustering().get(0));
+        Cell<?> cell = row.cells().iterator().next();
         assertEquals(TimeUnit.MILLISECONDS.toMicros(baseTimestamp + idx), cell.timestamp());
-        assertEquals(bytes(idx), cell.value());
+        ValueAccessors.assertDataEquals(bytes(idx), cell.buffer());
 
         return idx;
     }
@@ -197,7 +249,7 @@ public class HintsBufferTest
 
     private static Mutation createMutation(int index, long timestamp)
     {
-        CFMetaData table = Schema.instance.getCFMetaData(KEYSPACE, TABLE);
+        TableMetadata table = Schema.instance.getTableMetadata(KEYSPACE, TABLE);
         return new RowUpdateBuilder(table, timestamp, bytes(index))
                    .clustering(bytes(index))
                    .add("val", bytes(index))

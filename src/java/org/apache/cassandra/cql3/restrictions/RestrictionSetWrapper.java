@@ -17,14 +17,19 @@
  */
 package org.apache.cassandra.cql3.restrictions;
 
+import java.util.Collection;
 import java.util.List;
 import java.util.Set;
 
-import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.commons.lang3.builder.ToStringBuilder;
+import org.apache.commons.lang3.builder.ToStringStyle;
+
+import org.apache.cassandra.index.Index;
+import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.cql3.QueryOptions;
 import org.apache.cassandra.cql3.functions.Function;
 import org.apache.cassandra.db.filter.RowFilter;
-import org.apache.cassandra.index.SecondaryIndexManager;
+import org.apache.cassandra.index.IndexRegistry;
 
 /**
  * A <code>RestrictionSet</code> wrapper that can be extended to allow to modify the <code>RestrictionSet</code>
@@ -42,16 +47,27 @@ class RestrictionSetWrapper implements Restrictions
         this.restrictions = restrictions;
     }
 
-    public void addRowFilterTo(RowFilter filter,
-                               SecondaryIndexManager indexManager,
+    public void addToRowFilter(RowFilter filter,
+                               IndexRegistry indexRegistry,
                                QueryOptions options)
     {
-        restrictions.addRowFilterTo(filter, indexManager, options);
+        restrictions.addToRowFilter(filter, indexRegistry, options);
     }
 
-    public List<ColumnDefinition> getColumnDefs()
+    public List<ColumnMetadata> getColumnDefs()
     {
         return restrictions.getColumnDefs();
+    }
+
+    @Override
+    public Collection<ColumnMetadata> getColumnDefinitions()
+    {
+        return restrictions.getColumnDefinitions();
+    }
+
+    public RestrictionSet getRestrictionSet()
+    {
+        return restrictions;
     }
 
     public void addFunctionsTo(List<Function> functions)
@@ -69,17 +85,23 @@ class RestrictionSetWrapper implements Restrictions
         return restrictions.size();
     }
 
-    public boolean hasSupportingIndex(SecondaryIndexManager indexManager)
+    public boolean hasSupportingIndex(IndexRegistry indexRegistry)
     {
-        return restrictions.hasSupportingIndex(indexManager);
+        return restrictions.hasSupportingIndex(indexRegistry);
     }
 
-    public ColumnDefinition getFirstColumn()
+    @Override
+    public boolean needsFiltering(Index.Group indexGroup)
+    {
+        return restrictions.needsFiltering(indexGroup);
+    }
+
+    public ColumnMetadata getFirstColumn()
     {
         return restrictions.getFirstColumn();
     }
 
-    public ColumnDefinition getLastColumn()
+    public ColumnMetadata getLastColumn()
     {
         return restrictions.getLastColumn();
     }
@@ -104,8 +126,14 @@ class RestrictionSetWrapper implements Restrictions
         return restrictions.hasOnlyEqualityRestrictions();
     }
 
-    public Set<Restriction> getRestrictions(ColumnDefinition columnDef)
+    public Set<Restriction> getRestrictions(ColumnMetadata columnDef)
     {
         return restrictions.getRestrictions(columnDef);
+    }
+    
+    @Override
+    public String toString()
+    {
+        return ToStringBuilder.reflectionToString(this, ToStringStyle.SHORT_PREFIX_STYLE);
     }
 }

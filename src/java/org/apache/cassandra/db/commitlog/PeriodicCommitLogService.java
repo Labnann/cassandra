@@ -17,11 +17,15 @@
  */
 package org.apache.cassandra.db.commitlog;
 
+import java.util.concurrent.TimeUnit;
+
 import org.apache.cassandra.config.DatabaseDescriptor;
+
+import static org.apache.cassandra.utils.Clock.Global.nanoTime;
 
 class PeriodicCommitLogService extends AbstractCommitLogService
 {
-    private static final long blockWhenSyncLagsNanos = (long) (DatabaseDescriptor.getCommitLogSyncPeriod() * 1.5e6);
+    private static final long blockWhenSyncLagsNanos = TimeUnit.MILLISECONDS.toNanos(DatabaseDescriptor.getPeriodicCommitLogSyncBlock());
 
     public PeriodicCommitLogService(final CommitLog commitLog)
     {
@@ -31,7 +35,7 @@ class PeriodicCommitLogService extends AbstractCommitLogService
 
     protected void maybeWaitForSync(CommitLogSegment.Allocation alloc)
     {
-        long expectedSyncTime = System.nanoTime() - blockWhenSyncLagsNanos;
+        long expectedSyncTime = nanoTime() - blockWhenSyncLagsNanos;
         if (lastSyncedAt < expectedSyncTime)
         {
             pending.incrementAndGet();

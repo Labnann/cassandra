@@ -23,7 +23,6 @@ import java.util.concurrent.ConcurrentMap;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.MapMaker;
 
 import org.apache.cassandra.cache.IMeasurableMemory;
@@ -31,7 +30,7 @@ import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.ObjectSizes;
-import org.apache.cassandra.utils.memory.AbstractAllocator;
+import org.apache.cassandra.utils.memory.ByteBufferCloner;
 
 /**
  * Represents an identifer for a CQL column definition.
@@ -41,7 +40,7 @@ public class ColumnIdentifier implements IMeasurableMemory, Comparable<ColumnIde
 {
     private static final Pattern PATTERN_DOUBLE_QUOTE = Pattern.compile("\"", Pattern.LITERAL);
     private static final String ESCAPED_DOUBLE_QUOTE = Matcher.quoteReplacement("\"\"");
-    
+
     public final ByteBuffer bytes;
     private final String text;
     /**
@@ -206,13 +205,13 @@ public class ColumnIdentifier implements IMeasurableMemory, Comparable<ColumnIde
     public long unsharedHeapSizeExcludingData()
     {
         return EMPTY_SIZE
-             + ObjectSizes.sizeOnHeapExcludingData(bytes)
+             + ObjectSizes.sizeOnHeapExcludingDataOf(bytes)
              + ObjectSizes.sizeOf(text);
     }
 
-    public ColumnIdentifier clone(AbstractAllocator allocator)
+    public ColumnIdentifier clone(ByteBufferCloner cloner)
     {
-        return interned ? this : new ColumnIdentifier(allocator.clone(bytes), text, false);
+        return interned ? this : new ColumnIdentifier(cloner.clone(bytes), text, false);
     }
 
     public int compareTo(ColumnIdentifier that)
@@ -225,7 +224,6 @@ public class ColumnIdentifier implements IMeasurableMemory, Comparable<ColumnIde
         return ByteBufferUtil.compareUnsigned(this.bytes, that.bytes);
     }
 
-    @VisibleForTesting
     public static String maybeQuote(String text)
     {
         if (UNQUOTED_IDENTIFIER.matcher(text).matches() && !ReservedKeywords.isReserved(text))

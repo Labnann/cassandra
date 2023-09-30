@@ -25,14 +25,13 @@ import java.util.Arrays;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
-import static junit.framework.Assert.assertNull;
-import static org.junit.Assert.assertEquals;
-
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.CQLTester;
-import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.cql3.restrictions.StatementRestrictions;
 import org.apache.cassandra.dht.ByteOrderedPartitioner;
+
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNull;
 
 /**
  * SELECT statement tests that require a ByteOrderedPartitioner
@@ -369,7 +368,7 @@ public class SelectOrderedPartitionerTest extends CQLTester
 
         Object[][] rows = getRows(execute("SELECT v2 FROM %s"));
         assertEquals(0, rows[0][0]);
-        assertEquals(null, rows[1][0]);
+        assertNull(rows[1][0]);
         assertEquals(2, rows[2][0]);
 
         rows = getRows(execute("SELECT v2 FROM %s WHERE k = 1"));
@@ -385,19 +384,6 @@ public class SelectOrderedPartitionerTest extends CQLTester
     public void testPrimaryKeyOnly() throws Throwable
     {
         createTable("CREATE TABLE %s (k int, c int, PRIMARY KEY (k, c))");
-
-        for (int k = 0; k < 2; k++)
-            for (int c = 0; c < 2; c++)
-                execute("INSERT INTO %s (k, c) VALUES (?, ?)", k, c);
-
-        assertRows(execute("SELECT * FROM %s"),
-                   row(0, 0),
-                   row(0, 1),
-                   row(1, 0),
-                   row(1, 1));
-
-        // Check for dense tables too
-        createTable(" CREATE TABLE %s (k int, c int, PRIMARY KEY (k, c)) WITH COMPACT STORAGE");
 
         for (int k = 0; k < 2; k++)
             for (int c = 0; c < 2; c++)

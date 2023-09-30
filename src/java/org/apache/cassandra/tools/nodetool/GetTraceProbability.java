@@ -17,7 +17,7 @@
  */
 package org.apache.cassandra.tools.nodetool;
 
-import io.airlift.command.Command;
+import io.airlift.airline.Command;
 
 import org.apache.cassandra.tools.NodeProbe;
 import org.apache.cassandra.tools.NodeTool.NodeToolCmd;
@@ -28,6 +28,6 @@ public class GetTraceProbability extends NodeToolCmd
     @Override
     public void execute(NodeProbe probe)
     {
-        System.out.println("Current trace probability: " + probe.getTraceProbability());
+        probe.output().out.println("Current trace probability: " + probe.getTraceProbability());
     }
 }

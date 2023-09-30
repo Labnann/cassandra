@@ -17,31 +17,19 @@
  */
 package org.apache.cassandra.tools;
 
-import java.io.*;
+
+import java.io.IOException;
+import java.io.PrintStream;
 import java.nio.charset.Charset;
 import java.nio.file.Files;
-import java.nio.file.Paths;
 import java.nio.file.attribute.FileTime;
 import java.util.Arrays;
 import java.util.List;
 
-import org.apache.cassandra.config.Config;
-import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.io.sstable.Component;
 import org.apache.cassandra.io.sstable.Descriptor;
-import org.apache.cassandra.service.ActiveRepairService;
+import org.apache.cassandra.io.sstable.format.SSTableFormat.Components;
+import org.apache.cassandra.io.util.File;
 
-/**
- * Set repairedAt status on a given set of sstables.
- *
- * If you pass --is-repaired, it will set the repairedAt time to the last modified time.
- *
- * If you know you ran repair 2 weeks ago, you can do something like
- *
- * {@code
- * sstablerepairset --is-repaired -f <(find /var/lib/cassandra/data/.../ -iname "*Data.db*" -mtime +14)
- * }
- */
 public class SSTableRepairedAtSetter
 {
     /**
@@ -72,7 +60,7 @@ public class SSTableRepairedAtSetter
         List<String> fileNames;
         if (args[2].equals("-f"))
         {
-            fileNames = Files.readAllLines(Paths.get(args[3]), Charset.defaultCharset());
+            fileNames = Files.readAllLines(File.getPath(args[3]), Charset.defaultCharset());
         }
         else
         {
@@ -81,22 +69,21 @@ public class SSTableRepairedAtSetter
 
         for (String fname: fileNames)
         {
-            Descriptor descriptor = Descriptor.fromFilename(fname);
-            if (descriptor.version.hasRepairedAt())
+            Descriptor descriptor = Descriptor.fromFileWithComponent(new File(fname), false).left;
+            if (!descriptor.version.isCompatible())
             {
-                if (setIsRepaired)
-                {
-                    FileTime f = Files.getLastModifiedTime(new File(descriptor.filenameFor(Component.DATA)).toPath());
-                    descriptor.getMetadataSerializer().mutateRepairedAt(descriptor, f.toMillis());
-                }
-                else
-                {
-                    descriptor.getMetadataSerializer().mutateRepairedAt(descriptor, ActiveRepairService.UNREPAIRED_SSTABLE);
-                }
+                System.err.println("SSTable " + fname + " is in a old and unsupported format");
+                continue;
+            }
+
+            if (setIsRepaired)
+            {
+                FileTime f = Files.getLastModifiedTime(descriptor.fileFor(Components.DATA).toPath());
+                descriptor.getMetadataSerializer().mutateRepairMetadata(descriptor, f.toMillis(), null, false);
             }
             else
             {
-                System.err.println("SSTable " + fname + " does not have repaired property, run upgradesstables");
+                descriptor.getMetadataSerializer().mutateRepairMetadata(descriptor, 0, null, false);
             }
         }
     }

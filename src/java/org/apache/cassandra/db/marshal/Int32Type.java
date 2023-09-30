@@ -18,19 +18,28 @@
 package org.apache.cassandra.db.marshal;
 
 import java.nio.ByteBuffer;
+import java.util.Objects;
+
+import org.apache.commons.lang3.mutable.MutableInt;
 
 import org.apache.cassandra.cql3.CQL3Type;
 import org.apache.cassandra.cql3.Constants;
 import org.apache.cassandra.cql3.Term;
-import org.apache.cassandra.serializers.TypeSerializer;
+import org.apache.cassandra.cql3.functions.ArgumentDeserializer;
 import org.apache.cassandra.serializers.Int32Serializer;
 import org.apache.cassandra.serializers.MarshalException;
 import org.apache.cassandra.transport.ProtocolVersion;
+import org.apache.cassandra.serializers.TypeSerializer;
 import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.bytecomparable.ByteComparable;
+import org.apache.cassandra.utils.bytecomparable.ByteSource;
+import org.apache.cassandra.utils.bytecomparable.ByteSourceInverse;
 
-public class Int32Type extends AbstractType<Integer>
+public class Int32Type extends NumberType<Integer>
 {
     public static final Int32Type instance = new Int32Type();
+
+    private static final ByteBuffer MASKED_VALUE = instance.decompose(0);
 
     Int32Type()
     {
@@ -42,16 +51,28 @@ public class Int32Type extends AbstractType<Integer>
         return true;
     }
 
-    public int compareCustom(ByteBuffer o1, ByteBuffer o2)
+    public <VL, VR> int compareCustom(VL left, ValueAccessor<VL> accessorL, VR right, ValueAccessor<VR> accessorR)
     {
-        if (!o1.hasRemaining() || !o2.hasRemaining())
-            return o1.hasRemaining() ? 1 : o2.hasRemaining() ? -1 : 0;
+        if (accessorL.isEmpty(left) || accessorR.isEmpty(right))
+            return Boolean.compare(accessorR.isEmpty(right), accessorL.isEmpty(left));
 
-        int diff = o1.get(o1.position()) - o2.get(o2.position());
+        int diff = accessorL.getByte(left, 0) - accessorR.getByte(right, 0);
         if (diff != 0)
             return diff;
 
-        return ByteBufferUtil.compareUnsigned(o1, o2);
+        return ValueAccessor.compare(left, accessorL, right, accessorR);
+    }
+
+    @Override
+    public <V> ByteSource asComparableBytes(ValueAccessor<V> accessor, V data, ByteComparable.Version version)
+    {
+        return ByteSource.optionalSignedFixedLengthNumber(accessor, data);
+    }
+
+    @Override
+    public <V> V fromComparableBytes(ValueAccessor<V> accessor, ByteSource.Peekable comparableBytes, ByteComparable.Version version)
+    {
+        return ByteSourceInverse.getOptionalSignedFixedLength(accessor, comparableBytes, 4);
     }
 
     public ByteBuffer fromString(String source) throws MarshalException
@@ -98,7 +119,7 @@ public class Int32Type extends AbstractType<Integer>
     @Override
     public String toJSONString(ByteBuffer buffer, ProtocolVersion protocolVersion)
     {
-        return getSerializer().deserialize(buffer).toString();
+        return Objects.toString(getSerializer().deserialize(buffer), "\"\"");
     }
 
     public CQL3Type asCQL3Type()
@@ -112,8 +133,93 @@ public class Int32Type extends AbstractType<Integer>
     }
 
     @Override
-    protected int valueLengthIfFixed()
+    public ArgumentDeserializer getArgumentDeserializer()
+    {
+        return new NumberArgumentDeserializer<MutableInt>(new MutableInt())
+        {
+            @Override
+            protected void setMutableValue(MutableInt mutable, ByteBuffer buffer)
+            {
+                mutable.setValue(ByteBufferUtil.toInt(buffer));
+            }
+        };
+    }
+
+    @Override
+    public int valueLengthIfFixed()
     {
         return 4;
+    }
+
+    @Override
+    public ByteBuffer add(Number left, Number right)
+    {
+        return ByteBufferUtil.bytes(left.intValue() + right.intValue());
+    }
+
+    @Override
+    public ByteBuffer substract(Number left, Number right)
+    {
+        return ByteBufferUtil.bytes(left.intValue() - right.intValue());
+    }
+
+    @Override
+    public ByteBuffer multiply(Number left, Number right)
+    {
+        return ByteBufferUtil.bytes(left.intValue() * right.intValue());
+    }
+
+    @Override
+    public ByteBuffer divide(Number left, Number right)
+    {
+        return ByteBufferUtil.bytes(left.intValue() / right.intValue());
+    }
+
+    @Override
+    public ByteBuffer mod(Number left, Number right)
+    {
+        return ByteBufferUtil.bytes(left.intValue() % right.intValue());
+    }
+
+    @Override
+    public ByteBuffer negate(Number input)
+    {
+        return ByteBufferUtil.bytes(-input.intValue());
+    }
+
+    @Override
+    public ByteBuffer abs(Number input)
+    {
+        return ByteBufferUtil.bytes(Math.abs(input.intValue()));
+    }
+
+    @Override
+    public ByteBuffer exp(Number input)
+    {
+        return ByteBufferUtil.bytes((int) Math.exp(input.intValue()));
+    }
+
+    @Override
+    public ByteBuffer log(Number input)
+    {
+        return ByteBufferUtil.bytes((int) Math.log(input.intValue()));
+    }
+
+    @Override
+    public ByteBuffer log10(Number input)
+    {
+        return ByteBufferUtil.bytes((int) Math.log10(input.intValue()));
+    }
+
+    @Override
+    public ByteBuffer round(Number input)
+    {
+        return ByteBufferUtil.bytes(input.intValue());
+    }
+
+    @Override
+    public ByteBuffer getMaskedValue()
+    {
+        return MASKED_VALUE;
     }
 }

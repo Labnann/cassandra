@@ -18,10 +18,13 @@
 package org.apache.cassandra.cql3.functions;
 
 import java.nio.ByteBuffer;
+import java.util.Arrays;
 import java.util.List;
 
-import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.cql3.AssignmentTestable;
+import org.apache.cassandra.schema.ColumnMetadata;
+import org.apache.cassandra.schema.Schema;
+import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.db.CBuilder;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.exceptions.InvalidRequestException;
@@ -29,33 +32,74 @@ import org.apache.cassandra.transport.ProtocolVersion;
 
 public class TokenFct extends NativeScalarFunction
 {
-    private final CFMetaData cfm;
+    private final TableMetadata metadata;
 
-    public TokenFct(CFMetaData cfm)
+    public TokenFct(TableMetadata metadata)
     {
-        super("token", cfm.partitioner.getTokenValidator(), getKeyTypes(cfm));
-        this.cfm = cfm;
+        super("token", metadata.partitioner.getTokenValidator(), getKeyTypes(metadata));
+        this.metadata = metadata;
     }
 
-    private static AbstractType[] getKeyTypes(CFMetaData cfm)
+    @Override
+    public Arguments newArguments(ProtocolVersion version)
     {
-        AbstractType[] types = new AbstractType[cfm.partitionKeyColumns().size()];
+        ArgumentDeserializer[] deserializers = new ArgumentDeserializer[argTypes.size()];
+        Arrays.fill(deserializers, ArgumentDeserializer.NOOP_DESERIALIZER);
+        return new FunctionArguments(version, deserializers);
+    }
+
+    private static AbstractType<?>[] getKeyTypes(TableMetadata metadata)
+    {
+        AbstractType<?>[] types = new AbstractType[metadata.partitionKeyColumns().size()];
         int i = 0;
-        for (ColumnDefinition def : cfm.partitionKeyColumns())
+        for (ColumnMetadata def : metadata.partitionKeyColumns())
             types[i++] = def.type;
         return types;
     }
 
-    public ByteBuffer execute(ProtocolVersion protocolVersion, List<ByteBuffer> parameters) throws InvalidRequestException
+    public ByteBuffer execute(Arguments arguments) throws InvalidRequestException
     {
-        CBuilder builder = CBuilder.create(cfm.getKeyValidatorAsClusteringComparator());
-        for (int i = 0; i < parameters.size(); i++)
+        CBuilder builder = CBuilder.create(metadata.partitionKeyAsClusteringComparator());
+        for (int i = 0; i < arguments.size(); i++)
         {
-            ByteBuffer bb = parameters.get(i);
+            ByteBuffer bb = arguments.get(i);
             if (bb == null)
                 return null;
             builder.add(bb);
         }
-        return cfm.partitioner.getTokenFactory().toByteArray(cfm.partitioner.getToken(CFMetaData.serializePartitionKey(builder.build())));
+        return metadata.partitioner.getTokenFactory().toByteArray(metadata.partitioner.getToken(builder.build().serializeAsPartitionKey()));
+    }
+
+    public static void addFunctionsTo(NativeFunctions functions)
+    {
+        functions.add(new FunctionFactory("token")
+        {
+            @Override
+            public NativeFunction getOrCreateFunction(List<? extends AssignmentTestable> args,
+                                                      AbstractType<?> receiverType,
+                                                      String receiverKeyspace,
+                                                      String receiverTable)
+            {
+                if (receiverKeyspace == null)
+                    throw new InvalidRequestException("No receiver keyspace has been specified for function " + name);
+
+                if (receiverTable == null)
+                    throw new InvalidRequestException("No receiver table has been specified for function " + name);
+
+                TableMetadata metadata = Schema.instance.getTableMetadata(receiverKeyspace, receiverTable);
+                if (metadata == null)
+                    throw new InvalidRequestException(String.format("The receiver table %s.%s specified by call to " +
+                                                                    "function %s hasn't been found",
+                                                                    receiverKeyspace, receiverTable, name));
+
+                return new TokenFct(metadata);
+            }
+
+            @Override
+            protected NativeFunction doGetOrCreateFunction(List<AbstractType<?>> argTypes, AbstractType<?> receiverType)
+            {
+                throw new AssertionError("Should be unreachable");
+            }
+        });
     }
 }

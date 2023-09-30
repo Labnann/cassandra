@@ -19,33 +19,89 @@
 package org.apache.cassandra.serializers;
 
 import java.nio.ByteBuffer;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
-public interface TypeSerializer<T>
+import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
+
+import org.apache.cassandra.db.marshal.ByteBufferAccessor;
+import org.apache.cassandra.db.marshal.ValueAccessor;
+
+public abstract class TypeSerializer<T>
 {
-    public ByteBuffer serialize(T value);
+    private static final Pattern PATTERN_SINGLE_QUOTE = Pattern.compile("'", Pattern.LITERAL);
+    private static final String ESCAPED_SINGLE_QUOTE = Matcher.quoteReplacement("\'");
+
+    public abstract ByteBuffer serialize(T value);
+
+    public abstract <V> T deserialize(V value, ValueAccessor<V> accessor);
 
     /*
      * Does not modify the position or limit of the buffer even temporarily.
      */
-    public T deserialize(ByteBuffer bytes);
+    public final T deserialize(ByteBuffer bytes)
+    {
+        return deserialize(bytes, ByteBufferAccessor.instance);
+    }
 
     /*
      * Validate that the byte array is a valid sequence for the type this represents.
      * This guarantees deserialize() can be called without errors.
-     *
-     * Does not modify the position or limit of the buffer even temporarily
      */
-    public void validate(ByteBuffer bytes) throws MarshalException;
+    public abstract <V> void validate(V value, ValueAccessor<V> accessor) throws MarshalException;
 
-    public String toString(T value);
-
-    public Class<T> getType();
-
-    public default String toCQLLiteral(ByteBuffer buffer)
+    /*
+     * Does not modify the position or limit of the buffer even temporarily.
+     */
+    public final void validate(ByteBuffer bytes) throws MarshalException
     {
-        return buffer == null || !buffer.hasRemaining()
-             ? "null"
-             : toString(deserialize(buffer));
+        validate(bytes, ByteBufferAccessor.instance);
+    }
+
+    public abstract String toString(T value);
+
+    public abstract Class<T> getType();
+
+    public final boolean isNull(@Nullable ByteBuffer buffer)
+    {
+        return isNull(buffer, ByteBufferAccessor.instance);
+    }
+
+    public <V> boolean isNull(@Nullable V buffer, ValueAccessor<V> accessor)
+    {
+        return buffer == null || accessor.isEmpty(buffer);
+    }
+
+    protected String toCQLLiteralNonNull(@Nonnull ByteBuffer buffer)
+    {
+        return toString(deserialize(buffer));
+    }
+
+    public final @Nonnull String toCQLLiteral(@Nullable ByteBuffer buffer)
+    {
+        return isNull(buffer)
+               ? "null"
+               :  maybeQuote(toCQLLiteralNonNull(buffer));
+    }
+
+    public final @Nonnull String toCQLLiteralNoQuote(@Nullable ByteBuffer buffer)
+    {
+        return isNull(buffer)
+               ? "null"
+               :  toCQLLiteralNonNull(buffer);
+    }
+
+    public boolean shouldQuoteCQLLiterals()
+    {
+        return false;
+    }
+
+    private String maybeQuote(String value)
+    {
+        if (shouldQuoteCQLLiterals())
+            return "'" + PATTERN_SINGLE_QUOTE.matcher(value).replaceAll(ESCAPED_SINGLE_QUOTE) + "'";
+        return value;
     }
 }
 

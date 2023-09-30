@@ -18,12 +18,13 @@
 
 package org.apache.cassandra.tools.nodetool;
 
+import java.io.PrintStream;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
-import io.airlift.command.Arguments;
-import io.airlift.command.Command;
+import io.airlift.airline.Arguments;
+import io.airlift.airline.Command;
 import org.apache.cassandra.tools.NodeProbe;
 import org.apache.cassandra.tools.NodeTool;
 import org.apache.cassandra.tools.nodetool.formatter.TableBuilder;
@@ -40,6 +41,7 @@ public class ViewBuildStatus extends NodeTool.NodeToolCmd
 
     protected void execute(NodeProbe probe)
     {
+        PrintStream out = probe.output().out;
         String keyspace = null, view = null;
         if (args.size() == 2)
         {
@@ -72,12 +74,12 @@ public class ViewBuildStatus extends NodeTool.NodeToolCmd
         }
 
         if (failed) {
-            System.out.println(String.format("%s.%s has not finished building; node status is below.", keyspace, view));
-            System.out.println();
-            builder.printTo(System.out);
+            out.println(String.format("%s.%s has not finished building; node status is below.", keyspace, view));
+            out.println();
+            builder.printTo(out);
             System.exit(1);
         } else {
-            System.out.println(String.format("%s.%s has finished building", keyspace, view));
+            out.println(String.format("%s.%s has finished building", keyspace, view));
             System.exit(0);
         }
     }

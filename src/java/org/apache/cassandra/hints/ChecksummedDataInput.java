@@ -17,7 +17,6 @@
  */
 package org.apache.cassandra.hints;
 
-import java.io.File;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.zip.CRC32;
@@ -26,8 +25,8 @@ import com.google.common.base.Preconditions;
 
 import org.apache.cassandra.io.compress.BufferType;
 import org.apache.cassandra.io.util.*;
+import org.apache.cassandra.utils.Throwables;
 import org.apache.cassandra.utils.NativeLibrary;
-import org.apache.cassandra.utils.memory.BufferPool;
 
 /**
  * A {@link RandomAccessReader} wrapper that calculates the CRC in place.
@@ -54,7 +53,7 @@ public class ChecksummedDataInput extends RebufferingInputStream
 
     ChecksummedDataInput(ChannelProxy channel, BufferType bufferType)
     {
-        super(BufferPool.get(RandomAccessReader.DEFAULT_BUFFER_SIZE, bufferType));
+        super(bufferType.allocate(RandomAccessReader.DEFAULT_BUFFER_SIZE));
 
         crc = new CRC32();
         crcPosition = 0;
@@ -74,7 +73,15 @@ public class ChecksummedDataInput extends RebufferingInputStream
     @SuppressWarnings("resource")
     public static ChecksummedDataInput open(File file)
     {
-        return new ChecksummedDataInput(new ChannelProxy(file));
+        ChannelProxy channel = new ChannelProxy(file);
+        try
+        {
+            return new ChecksummedDataInput(channel);
+        }
+        catch (Throwable t)
+        {
+            throw Throwables.cleaned(channel.close(t));
+        }
     }
 
     public boolean isEOF()
@@ -235,7 +242,7 @@ public class ChecksummedDataInput extends RebufferingInputStream
     @Override
     public void close()
     {
-        BufferPool.put(buffer);
+        FileUtils.clean(buffer);
         channel.close();
     }
 

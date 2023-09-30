@@ -19,54 +19,42 @@ package org.apache.cassandra.db;
 
 import java.nio.ByteBuffer;
 
-import org.apache.cassandra.utils.ObjectSizes;
+import org.apache.cassandra.db.marshal.ByteBufferAccessor;
+import org.apache.cassandra.db.marshal.ValueAccessor;
+import org.apache.cassandra.utils.ByteBufferUtil;
 
-public abstract class AbstractBufferClusteringPrefix extends AbstractClusteringPrefix
+public abstract class AbstractBufferClusteringPrefix extends AbstractOnHeapClusteringPrefix<ByteBuffer>
 {
     public static final ByteBuffer[] EMPTY_VALUES_ARRAY = new ByteBuffer[0];
-    private static final long EMPTY_SIZE = ObjectSizes.measure(Clustering.make(EMPTY_VALUES_ARRAY));
-
-    protected final Kind kind;
-    protected final ByteBuffer[] values;
 
     protected AbstractBufferClusteringPrefix(Kind kind, ByteBuffer[] values)
     {
-        this.kind = kind;
-        this.values = values;
+        super(kind, values);
     }
 
-    public Kind kind()
+    public ValueAccessor<ByteBuffer> accessor()
     {
-        return kind;
+        return ByteBufferAccessor.instance;
     }
 
-    public ClusteringPrefix clustering()
+    public ByteBuffer[] getBufferArray()
     {
-        return this;
+        return getRawValues();
     }
 
-    public int size()
+    @Override
+    public ClusteringPrefix<ByteBuffer> retainable()
     {
-        return values.length;
-    }
+        if (!ByteBufferUtil.canMinimize(values))
+            return this;
 
-    public ByteBuffer get(int i)
-    {
-        return values[i];
-    }
+        ByteBuffer[] minimizedValues = ByteBufferUtil.minimizeBuffers(this.values);
+        if (kind.isBoundary())
+            return accessor().factory().boundary(kind, minimizedValues);
+        if (kind.isBound())
+            return accessor().factory().bound(kind, minimizedValues);
 
-    public ByteBuffer[] getRawValues()
-    {
-        return values;
-    }
-
-    public long unsharedHeapSize()
-    {
-        return EMPTY_SIZE + ObjectSizes.sizeOnHeapOf(values);
-    }
-
-    public long unsharedHeapSizeExcludingData()
-    {
-        return EMPTY_SIZE + ObjectSizes.sizeOnHeapExcludingData(values);
+        assert kind() != Kind.STATIC_CLUSTERING;    // not minimizable
+        return accessor().factory().clustering(minimizedValues);
     }
 }

@@ -33,8 +33,8 @@ import java.util.Properties;
 import javax.xml.parsers.DocumentBuilder;
 import javax.xml.parsers.DocumentBuilderFactory;
 
-import junit.framework.AssertionFailedError;
-import junit.framework.Test;
+import junit.framework.AssertionFailedError;  // checkstyle: permit this import
+import junit.framework.Test;  // checkstyle: permit this import
 
 import org.apache.tools.ant.BuildException;
 import org.apache.tools.ant.taskdefs.optional.junit.IgnoredTestListener;
@@ -50,6 +50,10 @@ import org.w3c.dom.Document;
 import org.w3c.dom.Element;
 import org.w3c.dom.Text;
 
+import static org.apache.cassandra.config.CassandraRelevantProperties.TEST_CASSANDRA_SUITENAME;
+import static org.apache.cassandra.config.CassandraRelevantProperties.TEST_CASSANDRA_TESTTAG;
+import static org.apache.cassandra.config.CassandraRelevantProperties.SUN_JAVA_COMMAND;
+import static org.apache.cassandra.utils.Clock.Global.currentTimeMillis;
 
 /**
  * Prints XML output of the test to a specified Writer.
@@ -72,7 +76,7 @@ public class CassandraXMLJUnitResultFormatter implements JUnitResultFormatter, X
         }
     }
 
-    private static final String tag = System.getProperty("cassandra.testtag", "");
+    private static final String tag = TEST_CASSANDRA_TESTTAG.getString();
 
     /*
      * Set the property for the test suite name so that log configuration can pick it up
@@ -80,9 +84,9 @@ public class CassandraXMLJUnitResultFormatter implements JUnitResultFormatter, X
      */
     static
     {
-        String command = System.getProperty("sun.java.command");
+        String command = SUN_JAVA_COMMAND.getString();
         String args[] = command.split(" ");
-        System.setProperty("suitename", args[1]);
+        TEST_CASSANDRA_SUITENAME.setString(args[1]);
     }
 
     /**
@@ -154,8 +158,8 @@ public class CassandraXMLJUnitResultFormatter implements JUnitResultFormatter, X
         doc = getDocumentBuilder().newDocument();
         rootElement = doc.createElement(TESTSUITE);
         String n = suite.getName();
-//        if (n != null && !tag.isEmpty())
-//            n = n + "-" + tag;
+        if (n != null && !tag.isEmpty())
+            n = n + "-" + tag;
         rootElement.setAttribute(ATTR_NAME, n == null ? UNKNOWN : n);
 
         //add the timestamp
@@ -240,7 +244,7 @@ public class CassandraXMLJUnitResultFormatter implements JUnitResultFormatter, X
      * @param t the test.
      */
     public void startTest(final Test t) {
-        testStarts.put(createDescription(t), System.currentTimeMillis());
+        testStarts.put(createDescription(t), currentTimeMillis());
     }
 
     private static String createDescription(final Test test) throws BuildException {
@@ -284,7 +288,7 @@ public class CassandraXMLJUnitResultFormatter implements JUnitResultFormatter, X
 
         final Long l = testStarts.get(createDescription(test));
         currentTest.setAttribute(ATTR_TIME,
-            "" + ((System.currentTimeMillis() - l) / ONE_SECOND));
+            "" + ((currentTimeMillis() - l) / ONE_SECOND));
     }
 
     /**

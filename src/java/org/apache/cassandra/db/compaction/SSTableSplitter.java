@@ -18,7 +18,7 @@
 package org.apache.cassandra.db.compaction;
 
 import java.util.*;
-import java.util.function.Predicate;
+import java.util.function.LongPredicate;
 
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.compaction.writers.CompactionAwareWriter;
@@ -30,8 +30,6 @@ public class SSTableSplitter
 {
     private final SplittingCompactionTask task;
 
-    private CompactionInfo.Holder info;
-
     public SSTableSplitter(ColumnFamilyStore cfs, LifecycleTransaction transaction, int sstableSizeInMB)
     {
         this.task = new SplittingCompactionTask(cfs, transaction, sstableSizeInMB);
@@ -39,30 +37,17 @@ public class SSTableSplitter
 
     public void split()
     {
-        task.execute(new StatsCollector());
-    }
-
-    public class StatsCollector implements CompactionManager.CompactionExecutorStatsCollector
-    {
-        public void beginCompaction(CompactionInfo.Holder ci)
-        {
-            SSTableSplitter.this.info = ci;
-        }
-
-        public void finishCompaction(CompactionInfo.Holder ci)
-        {
-            // no-op
-        }
+        task.execute(ActiveCompactionsTracker.NOOP);
     }
 
     public static class SplittingCompactionTask extends CompactionTask
     {
-        private final int sstableSizeInMB;
+        private final int sstableSizeInMiB;
 
         public SplittingCompactionTask(ColumnFamilyStore cfs, LifecycleTransaction transaction, int sstableSizeInMB)
         {
             super(cfs, transaction, CompactionManager.NO_GC, false);
-            this.sstableSizeInMB = sstableSizeInMB;
+            this.sstableSizeInMiB = sstableSizeInMB;
 
             if (sstableSizeInMB <= 0)
                 throw new IllegalArgumentException("Invalid target size for SSTables, must be > 0 (got: " + sstableSizeInMB + ")");
@@ -80,7 +65,7 @@ public class SSTableSplitter
                                                               LifecycleTransaction txn,
                                                               Set<SSTableReader> nonExpiredSSTables)
         {
-            return new MaxSSTableSizeWriter(cfs, directories, txn, nonExpiredSSTables, sstableSizeInMB * 1024L * 1024L, 0, false);
+            return new MaxSSTableSizeWriter(cfs, directories, txn, nonExpiredSSTables, sstableSizeInMiB * 1024L * 1024L, 0, false);
         }
 
         @Override
@@ -98,7 +83,7 @@ public class SSTableSplitter
         }
 
         @Override
-        public Predicate<Long> getPurgeEvaluator(DecoratedKey key)
+        public LongPredicate getPurgeEvaluator(DecoratedKey key)
         {
             return time -> false;
         }

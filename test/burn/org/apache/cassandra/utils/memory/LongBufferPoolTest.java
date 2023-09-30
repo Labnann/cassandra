@@ -24,16 +24,22 @@ import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
 import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 
 import com.google.common.util.concurrent.Uninterruptibles;
+import org.junit.AfterClass;
+import org.junit.BeforeClass;
 import org.junit.Test;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.cassandra.concurrent.NamedThreadFactory;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.io.compress.BufferType;
 import org.apache.cassandra.utils.DynamicList;
 
+import static org.apache.cassandra.utils.Clock.Global.nanoTime;
 import static org.junit.Assert.*;
 
 /**
@@ -66,10 +72,92 @@ public class LongBufferPoolTest
     private static final int STDEV_BUFFER_SIZE = 10 << 10; // picked to ensure exceeding buffer size is rare, but occurs
     private static final DateFormat DATE_FORMAT = new SimpleDateFormat("yyyy/MM/dd HH:mm:ss");
 
-    @Test
-    public void testAllocate() throws InterruptedException, ExecutionException
+    static final class Debug implements BufferPool.Debug
     {
-        testAllocate(Runtime.getRuntime().availableProcessors() * 2, TimeUnit.MINUTES.toNanos(2L), 16 << 20);
+        static class DebugChunk
+        {
+            volatile long lastAcquired = 0; // the number of last round when the chunk was acquired from the global pool
+            volatile long lastRecycled = 0; // the number of last round when the chunk was recycled back to the global pool
+            static DebugChunk get(BufferPool.Chunk chunk)
+            {
+                if (chunk.debugAttachment == null)
+                    chunk.debugAttachment = new DebugChunk();
+                return (DebugChunk) chunk.debugAttachment;
+            }
+        }
+        AtomicLong recycleRound = new AtomicLong(1);
+        final List<BufferPool.Chunk> normalChunks = new ArrayList<>();
+
+        public synchronized void registerNormal(BufferPool.Chunk chunk)
+        {
+            chunk.debugAttachment = new DebugChunk();
+            normalChunks.add(chunk);
+        }
+
+        @Override
+        public void acquire(BufferPool.Chunk chunk)
+        {
+            DebugChunk.get(chunk).lastAcquired = recycleRound.get();
+        }
+
+        @Override
+        public void recycleNormal(BufferPool.Chunk oldVersion, BufferPool.Chunk newVersion)
+        {
+            newVersion.debugAttachment = oldVersion.debugAttachment;
+            DebugChunk.get(oldVersion).lastRecycled = recycleRound.get();
+        }
+
+        @Override
+        public void recyclePartial(BufferPool.Chunk chunk)
+        {
+            DebugChunk.get(chunk).lastRecycled = recycleRound.get();
+        }
+
+        public synchronized void check()
+        {
+            long lastRecycledMax = 0;
+            long currentRound = recycleRound.get();
+            for (BufferPool.Chunk chunk : normalChunks)
+            {
+                DebugChunk dc = DebugChunk.get(chunk);
+                assert dc.lastRecycled >= dc.lastAcquired: "Last recycled " + dc.lastRecycled + " < last acquired " + dc.lastAcquired;
+                lastRecycledMax = Math.max(lastRecycledMax, dc.lastRecycled);
+            }
+            assert lastRecycledMax == currentRound : "No chunk recycled in round " + currentRound + ". " +
+                                                     "Last chunk recycled in round " + lastRecycledMax + '.';
+            recycleRound.incrementAndGet();
+        }
+    }
+
+    @BeforeClass
+    public static void setup() throws Exception
+    {
+        DatabaseDescriptor.daemonInitialization();
+    }
+
+    @AfterClass
+    public static void teardown()
+    {
+        BufferPools.forChunkCache().unsafeReset();
+        BufferPools.forNetworking().unsafeReset();
+    }
+
+    @Test
+    public void testPoolAllocateWithRecyclePartially() throws InterruptedException, ExecutionException, BrokenBarrierException, TimeoutException
+    {
+        testPoolAllocate(true);
+    }
+
+    @Test
+    public void testPoolAllocateWithoutRecyclePartially() throws InterruptedException, ExecutionException, BrokenBarrierException, TimeoutException
+    {
+        testPoolAllocate(false);
+    }
+
+    private void testPoolAllocate(boolean recyclePartially) throws InterruptedException, ExecutionException, BrokenBarrierException, TimeoutException
+    {
+        BufferPool pool = new BufferPool("test_pool", 16 << 20, recyclePartially);
+        testAllocate(pool, Runtime.getRuntime().availableProcessors() * 2, TimeUnit.MINUTES.toNanos(2L));
     }
 
     private static final class BufferCheck
@@ -107,32 +195,37 @@ public class LongBufferPoolTest
         final long until;
         final CountDownLatch latch;
         final SPSCQueue<BufferCheck>[] sharedRecycle;
-        final AtomicBoolean[] makingProgress;
-        final AtomicBoolean burnFreed;
-        final AtomicBoolean[] freedAllMemory;
+
+        volatile boolean shouldFreeMemoryAndSuspend = false;
+
+        final CyclicBarrier stopAllocationsBarrier;
+        final CyclicBarrier freedAllMemoryBarrier;
+        final CyclicBarrier resumeAllocationsBarrier;
+
         final ExecutorService executorService;
         final List<Future<Boolean>> threadResultFuture;
         final int targetSizeQuanta;
 
-        TestEnvironment(int threadCount, long duration, int poolSize)
+        TestEnvironment(int threadCount, long duration, long poolSize)
         {
             this.threadCount = threadCount;
             this.duration = duration;
-            this.poolSize = poolSize;
-            until = System.nanoTime() + duration;
+            this.poolSize = Math.toIntExact(poolSize);
+            until = nanoTime() + duration;
             latch = new CountDownLatch(threadCount);
             sharedRecycle = new SPSCQueue[threadCount];
-            makingProgress = new AtomicBoolean[threadCount];
-            burnFreed = new AtomicBoolean(false);
-            freedAllMemory = new AtomicBoolean[threadCount];
-            executorService = Executors.newFixedThreadPool(threadCount + 2);
+
+            // N worker threads + burner thread + main thread:
+            stopAllocationsBarrier = new CyclicBarrier(threadCount + 2);
+            freedAllMemoryBarrier = new CyclicBarrier(threadCount + 2);
+            resumeAllocationsBarrier = new CyclicBarrier(threadCount + 2);
+
+            executorService = Executors.newFixedThreadPool(threadCount + 2, new NamedThreadFactory("test"));
             threadResultFuture = new ArrayList<>(threadCount);
 
             for (int i = 0; i < sharedRecycle.length; i++)
             {
                 sharedRecycle[i] = new SPSCQueue<>();
-                makingProgress[i] = new AtomicBoolean(false);
-                freedAllMemory[i] = new AtomicBoolean(false);
             }
 
             // Divide the poolSize across our threads, deliberately over-subscribing it.  Threads
@@ -141,8 +234,8 @@ public class LongBufferPoolTest
             // using their own algorithm the targetSize should be poolSize / targetSizeQuanta.
             //
             // This should divide double the poolSize across the working threads,
-            // plus CHUNK_SIZE for thread0 and 1/10 poolSize for the burn producer/consumer pair.
-            targetSizeQuanta = 2 * poolSize / sum1toN(threadCount - 1);
+            // plus NORMAL_CHUNK_SIZE for thread0 and 1/10 poolSize for the burn producer/consumer pair.
+            targetSizeQuanta = 2 * this.poolSize / sum1toN(threadCount - 1);
         }
 
         void addCheckedFuture(Future<Boolean> future)
@@ -150,17 +243,6 @@ public class LongBufferPoolTest
             threadResultFuture.add(future);
         }
 
-        int countStalledThreads()
-        {
-            int stalledThreads = 0;
-
-            for (AtomicBoolean progress : makingProgress)
-            {
-                if (!progress.getAndSet(false))
-                    stalledThreads++;
-            }
-            return stalledThreads;
-        }
 
         int countDoneThreads()
         {
@@ -190,41 +272,99 @@ public class LongBufferPoolTest
                 fail("Checked thread threw exception: " + ex.toString());
             }
         }
+
+        /**
+         * Implementers must assure all buffers were returned to the buffer pool on run exit.
+         */
+        interface MemoryFreeTask
+        {
+            void run();
+        }
+
+        /**
+         * If the main test loop requested stopping the threads by setting
+         * {@link TestEnvironment#shouldFreeMemoryAndSuspend},
+         * waits until all threads reach this call and then frees the memory by running the given memory free task.
+         * After the task finishes, it waits on the {@link TestEnvironment#freedAllMemoryBarrier} and
+         * {@link TestEnvironment#resumeAllocationsBarrier} to let the main test loop perform the post-free checks.
+         * The call exits after {@link TestEnvironment#resumeAllocationsBarrier} is reached by all threads.
+         *
+         * @param task the task that should return all buffers held by this thread to the buffer pool
+         */
+        void maybeSuspendAndFreeMemory(MemoryFreeTask task) throws InterruptedException, BrokenBarrierException
+        {
+            if (shouldFreeMemoryAndSuspend)
+            {
+                try
+                {
+                    // Wait until allocations stop in all threads; this guanrantees this thread won't
+                    // receive any new buffers from other threads while freeing memory.
+                    stopAllocationsBarrier.await();
+                    // Free our memory
+                    task.run();
+                    // Now wait for the other threads to free their memory
+                    freedAllMemoryBarrier.await();
+                    // Now all memory is freed, but let's not resume allocations until the main test thread
+                    // performs the required checks.
+                    // At this point, used memory indicated by the pool
+                    // should be == 0 and all buffers should be recycled.
+                    resumeAllocationsBarrier.await();
+                }
+                catch (BrokenBarrierException | InterruptedException e)
+                {
+                    // At the end of the test some threads may have already exited,
+                    // so they can't arrive at one of the barriers, and we may end up here.
+                    // This is fine if this happens after the test deadline, and we
+                    // just allow the test worker to exit cleanly.
+                    // It must not happen before the test deadline though, it would likely be a bug,
+                    // so we rethrow in that case.
+                    if (System.nanoTime() < until)
+                        throw e;
+                }
+            }
+        }
     }
 
-    public void testAllocate(int threadCount, long duration, int poolSize) throws InterruptedException, ExecutionException
+    public void testAllocate(BufferPool bufferPool, int threadCount, long duration) throws InterruptedException, ExecutionException, BrokenBarrierException, TimeoutException
     {
-        System.out.println(String.format("%s - testing %d threads for %dm",
-                                         DATE_FORMAT.format(new Date()),
-                                         threadCount,
-                                         TimeUnit.NANOSECONDS.toMinutes(duration)));
-        long prevPoolSize = BufferPool.MEMORY_USAGE_THRESHOLD;
-        logger.info("Overriding configured BufferPool.MEMORY_USAGE_THRESHOLD={} and enabling BufferPool.DEBUG", poolSize);
-        BufferPool.MEMORY_USAGE_THRESHOLD = poolSize;
-        BufferPool.DEBUG = true;
+        logger.info("{} - testing {} threads for {}m", DATE_FORMAT.format(new Date()), threadCount, TimeUnit.NANOSECONDS.toMinutes(duration));
+        logger.info("Testing BufferPool with memoryUsageThreshold={} and enabling BufferPool.DEBUG", bufferPool.memoryUsageThreshold());
+        Debug debug = new Debug();
+        bufferPool.debug(debug, null);
 
-        TestEnvironment testEnv = new TestEnvironment(threadCount, duration, poolSize);
+        TestEnvironment testEnv = new TestEnvironment(threadCount, duration, bufferPool.memoryUsageThreshold());
 
-        startBurnerThreads(testEnv);
+        startBurnerThreads(bufferPool, testEnv);
 
         for (int threadIdx = 0; threadIdx < threadCount; threadIdx++)
-            testEnv.addCheckedFuture(startWorkerThread(testEnv, threadIdx));
+            testEnv.addCheckedFuture(startWorkerThread(bufferPool, testEnv, threadIdx));
 
-        while (!testEnv.latch.await(10L, TimeUnit.SECONDS))
+        while (!testEnv.latch.await(1L, TimeUnit.SECONDS))
         {
-            int stalledThreads = testEnv.countStalledThreads();
-            int doneThreads = testEnv.countDoneThreads();
-
-            if (doneThreads == 0) // If any threads have completed, they will stop making progress/recycling buffers.
-            {                     // Assertions failures on the threads will be caught below.
-                assert stalledThreads == 0;
-                boolean allFreed = testEnv.burnFreed.getAndSet(false);
-                for (AtomicBoolean freedMemory : testEnv.freedAllMemory)
-                    allFreed = allFreed && freedMemory.getAndSet(false);
-                if (allFreed)
-                    BufferPool.assertAllRecycled();
-                else
-                    logger.info("All threads did not free all memory in this time slot - skipping buffer recycle check");
+            try
+            {
+                // request all threads to release all buffers to the bufferPool
+                testEnv.shouldFreeMemoryAndSuspend = true;
+                testEnv.stopAllocationsBarrier.await(10, TimeUnit.SECONDS);
+                // wait until all memory released
+                testEnv.freedAllMemoryBarrier.await(10, TimeUnit.SECONDS);
+                // now all buffers should be back in the pool, and no more allocations happening
+                assert bufferPool.usedSizeInBytes() == 0 : "Some buffers haven't been freed. Memory in use = "
+                                                           + bufferPool.usedSizeInBytes() + " (expected 0)";
+                debug.check();
+                // resume threads only after debug.cycleRound has been increased
+                testEnv.shouldFreeMemoryAndSuspend = false;
+                testEnv.resumeAllocationsBarrier.await(10, TimeUnit.SECONDS);
+            }
+            catch (TimeoutException e)
+            {
+                // a thread that is done will not reach the barriers, so timeout is unexpected only if
+                // all threads are still running
+                if (testEnv.countDoneThreads() == 0)
+                {
+                    logger.error("Some threads have stalled and didn't reach the barrier", e);
+                    return;
+                }
             }
         }
 
@@ -234,48 +374,50 @@ public class LongBufferPoolTest
             while ( null != (check = queue.poll()) )
             {
                 check.validate();
-                BufferPool.put(check.buffer);
+                bufferPool.put(check.buffer);
             }
         }
 
         assertEquals(0, testEnv.executorService.shutdownNow().size());
 
-        logger.info("Reverting BufferPool.MEMORY_USAGE_THRESHOLD={}", prevPoolSize);
-        BufferPool.MEMORY_USAGE_THRESHOLD = prevPoolSize;
-        BufferPool.DEBUG = false;
+        logger.info("Reverting BufferPool DEBUG config");
+        bufferPool.debug(BufferPool.Debug.NO_OP, null);
 
         testEnv.assertCheckedThreadsSucceeded();
 
-        System.out.println(String.format("%s - finished.",
-                                         DATE_FORMAT.format(new Date())));
+        logger.info("{} - finished.", DATE_FORMAT.format(new Date()));
     }
 
-    private Future<Boolean> startWorkerThread(TestEnvironment testEnv, final int threadIdx)
+    private Future<Boolean> startWorkerThread(BufferPool bufferPool, TestEnvironment testEnv, final int threadIdx)
     {
-        return testEnv.executorService.submit(new TestUntil(testEnv.until)
+        return testEnv.executorService.submit(new TestUntil(bufferPool, testEnv.until)
         {
-            final int targetSize = threadIdx == 0 ? BufferPool.CHUNK_SIZE : testEnv.targetSizeQuanta * threadIdx;
+            final int targetSize = threadIdx == 0 ? BufferPool.NORMAL_CHUNK_SIZE : testEnv.targetSizeQuanta * threadIdx;
             final SPSCQueue<BufferCheck> shareFrom = testEnv.sharedRecycle[threadIdx];
             final DynamicList<BufferCheck> checks = new DynamicList<>((int) Math.max(1, targetSize / (1 << 10)));
             final SPSCQueue<BufferCheck> shareTo = testEnv.sharedRecycle[(threadIdx + 1) % testEnv.threadCount];
+            final Future<Boolean> neighbourResultFuture = testEnv.threadResultFuture.get((threadIdx + 1) % testEnv.threadCount);
             final ThreadLocalRandom rand = ThreadLocalRandom.current();
             int totalSize = 0;
             int freeingSize = 0;
             int size = 0;
 
-            void checkpoint()
-            {
-                if (!testEnv.makingProgress[threadIdx].get())
-                    testEnv.makingProgress[threadIdx].set(true);
-            }
-
             void testOne() throws Exception
             {
+                testEnv.maybeSuspendAndFreeMemory(this::freeAll);
 
-                long currentTargetSize = (rand.nextInt(testEnv.poolSize / 1024) == 0 || !testEnv.freedAllMemory[threadIdx].get()) ? 0 : targetSize;
+                long currentTargetSize = rand.nextInt(testEnv.poolSize / 1024) == 0 ? 0 : targetSize;
                 int spinCount = 0;
                 while (totalSize > currentTargetSize - freeingSize)
                 {
+                    // Don't get stuck in this loop if other threads might be suspended:
+                    if (testEnv.shouldFreeMemoryAndSuspend)
+                        return;
+
+                    // Don't get stuck in this loop if the neighbour thread exited:
+                    if (neighbourResultFuture.isDone())
+                        return;
+
                     // free buffers until we're below our target size
                     if (checks.size() == 0)
                     {
@@ -288,7 +430,7 @@ public class LongBufferPoolTest
                         }
                         else if (!recycleFromNeighbour())
                         {
-                            if (++spinCount > 1000 && System.nanoTime() > until)
+                            if (++spinCount > 1000 && nanoTime() > until)
                                 return;
                             // otherwise, free one of our other neighbour's buffers if can; and otherwise yield
                             Thread.yield();
@@ -301,8 +443,8 @@ public class LongBufferPoolTest
                     checks.remove(check.listnode);
                     check.validate();
 
-                    size = BufferPool.roundUpNormal(check.buffer.capacity());
-                    if (size > BufferPool.CHUNK_SIZE)
+                    size = BufferPool.roundUp(check.buffer.capacity());
+                    if (size > BufferPool.NORMAL_CHUNK_SIZE)
                         size = 0;
 
                     // either share to free, or free immediately
@@ -316,19 +458,16 @@ public class LongBufferPoolTest
                     else
                     {
                         check.validate();
-                        BufferPool.put(check.buffer);
+                        bufferPool.put(check.buffer);
                         totalSize -= size;
                     }
                 }
 
-                if (currentTargetSize == 0)
-                    testEnv.freedAllMemory[threadIdx].compareAndSet(false, true);
-
                 // allocate a new buffer
                 size = (int) Math.max(1, AVG_BUFFER_SIZE + (STDEV_BUFFER_SIZE * rand.nextGaussian()));
-                if (size <= BufferPool.CHUNK_SIZE)
+                if (size <= BufferPool.NORMAL_CHUNK_SIZE)
                 {
-                    totalSize += BufferPool.roundUpNormal(size);
+                    totalSize += BufferPool.roundUp(size);
                     allocate(size);
                 }
                 else if (rand.nextBoolean())
@@ -341,10 +480,10 @@ public class LongBufferPoolTest
                     while (totalSize < testEnv.poolSize)
                     {
                         size = (int) Math.max(1, AVG_BUFFER_SIZE + (STDEV_BUFFER_SIZE * rand.nextGaussian()));
-                        if (size <= BufferPool.CHUNK_SIZE)
+                        if (size <= BufferPool.NORMAL_CHUNK_SIZE)
                         {
                             allocate(size);
-                            totalSize += BufferPool.roundUpNormal(size);
+                            totalSize += BufferPool.roundUp(size);
                         }
                     }
                 }
@@ -356,12 +495,35 @@ public class LongBufferPoolTest
                 while (recycleFromNeighbour());
             }
 
+            /**
+             * Returns all allocated buffers back to the buffer pool.
+             */
+            void freeAll()
+            {
+                while (checks.size() > 0)
+                {
+                    BufferCheck check = sample();
+                    checks.remove(check.listnode);
+                    check.validate();
+                    bufferPool.put(check.buffer);
+                }
+
+                BufferCheck check;
+                while ((check = shareFrom.poll()) != null)
+                {
+                    check.validate();
+                    bufferPool.put(check.buffer);
+                }
+
+                bufferPool.releaseLocal();
+            }
+
             void cleanup()
             {
                 while (checks.size() > 0)
                 {
                     BufferCheck check = checks.get(0);
-                    BufferPool.put(check.buffer);
+                    bufferPool.put(check.buffer);
                     checks.remove(check.listnode);
                 }
                 testEnv.latch.countDown();
@@ -373,13 +535,13 @@ public class LongBufferPoolTest
                 if (check == null)
                     return false;
                 check.validate();
-                BufferPool.put(check.buffer);
+                bufferPool.put(check.buffer);
                 return true;
             }
 
             BufferCheck allocate(int size)
             {
-                ByteBuffer buffer = BufferPool.get(size);
+                ByteBuffer buffer = bufferPool.get(size, BufferType.OFF_HEAP);
                 assertNotNull(buffer);
                 BufferCheck check = new BufferCheck(buffer, rand.nextLong());
                 assertEquals(size, buffer.capacity());
@@ -424,23 +586,25 @@ public class LongBufferPoolTest
         });
     }
 
-    private void startBurnerThreads(TestEnvironment testEnv)
+    private void startBurnerThreads(BufferPool bufferPool, TestEnvironment testEnv)
     {
         // setup some high churn allocate/deallocate, without any checking
+
+        final AtomicLong pendingBuffersCount = new AtomicLong(0);
         final SPSCQueue<ByteBuffer> burn = new SPSCQueue<>();
         final CountDownLatch doneAdd = new CountDownLatch(1);
-        testEnv.addCheckedFuture(testEnv.executorService.submit(new TestUntil(testEnv.until)
+        testEnv.addCheckedFuture(testEnv.executorService.submit(new TestUntil(bufferPool, testEnv.until)
         {
             int count = 0;
             final ThreadLocalRandom rand = ThreadLocalRandom.current();
             void testOne() throws Exception
             {
-                if (count * BufferPool.CHUNK_SIZE >= testEnv.poolSize / 10)
+                if (count * BufferPool.NORMAL_CHUNK_SIZE >= testEnv.poolSize / 10)
                 {
-                    if (burn.exhausted)
+                    if (pendingBuffersCount.get() == 0)
                     {
                         count = 0;
-                        testEnv.burnFreed.compareAndSet(false, true);
+                        testEnv.maybeSuspendAndFreeMemory(bufferPool::releaseLocal);
                     } else
                     {
                         Thread.yield();
@@ -448,7 +612,9 @@ public class LongBufferPoolTest
                     return;
                 }
 
-                ByteBuffer buffer = BufferPool.tryGet(BufferPool.CHUNK_SIZE);
+                ByteBuffer buffer = rand.nextInt(4) < 1
+                        ? bufferPool.tryGet(BufferPool.NORMAL_CHUNK_SIZE)
+                        : bufferPool.tryGet(BufferPool.TINY_ALLOCATION_LIMIT);
                 if (buffer == null)
                 {
                     Thread.yield();
@@ -458,10 +624,12 @@ public class LongBufferPoolTest
                 // 50/50 chance of returning the buffer from the producer thread, or
                 // pass it on to the consumer.
                 if (rand.nextBoolean())
-                    BufferPool.put(buffer);
+                    bufferPool.put(buffer);
                 else
+                {
+                    pendingBuffersCount.incrementAndGet();
                     burn.add(buffer);
-
+                }
                 count++;
             }
             void cleanup()
@@ -469,7 +637,7 @@ public class LongBufferPoolTest
                 doneAdd.countDown();
             }
         }));
-        testEnv.threadResultFuture.add(testEnv.executorService.submit(new TestUntil(testEnv.until)
+        testEnv.threadResultFuture.add(testEnv.executorService.submit(new TestUntil(bufferPool, testEnv.until)
         {
             void testOne() throws Exception
             {
@@ -479,7 +647,8 @@ public class LongBufferPoolTest
                     Thread.yield();
                     return;
                 }
-                BufferPool.put(buffer);
+                bufferPool.put(buffer);
+                pendingBuffersCount.decrementAndGet();
             }
             void cleanup()
             {
@@ -490,9 +659,11 @@ public class LongBufferPoolTest
 
     static abstract class TestUntil implements Callable<Boolean>
     {
+        final BufferPool bufferPool;
         final long until;
-        protected TestUntil(long until)
+        protected TestUntil(BufferPool bufferPool, long until)
         {
+            this.bufferPool = bufferPool;
             this.until = until;
         }
 
@@ -504,7 +675,7 @@ public class LongBufferPoolTest
         {
             try
             {
-                while (System.nanoTime() < until)
+                while (nanoTime() < until)
                 {
                     checkpoint();
                     for (int i = 0 ; i < 100 ; i++)
@@ -515,7 +686,7 @@ public class LongBufferPoolTest
             {
                 logger.error("Got exception {}, current chunk {}",
                              ex.getMessage(),
-                             BufferPool.currentChunk());
+                             bufferPool.unsafeCurrentChunk());
                 ex.printStackTrace();
                 return false;
             }
@@ -523,7 +694,7 @@ public class LongBufferPoolTest
             {
                 logger.error("Got throwable {}, current chunk {}",
                              tr.getMessage(),
-                             BufferPool.currentChunk());
+                             bufferPool.unsafeCurrentChunk());
                 tr.printStackTrace();
                 return false;
             }
@@ -539,13 +710,15 @@ public class LongBufferPoolTest
     {
         try
         {
-            new LongBufferPoolTest().testAllocate(Runtime.getRuntime().availableProcessors(),
-                                                  TimeUnit.HOURS.toNanos(2L), 16 << 20);
+            LongBufferPoolTest.setup();
+            new LongBufferPoolTest().testAllocate(new BufferPool("test_pool", 16 << 20, true),
+                                                  Runtime.getRuntime().availableProcessors(),
+                                                  TimeUnit.HOURS.toNanos(2L));
             System.exit(0);
         }
         catch (Throwable tr)
         {
-            System.out.println(String.format("Test failed - %s", tr.getMessage()));
+            logger.error("Test failed - {}", tr.getMessage(), tr);
             System.exit(1); // Force exit so that non-daemon threads like REQUEST-SCHEDULER do not hang the process on failure
         }
     }

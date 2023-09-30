@@ -21,10 +21,9 @@ import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
 
-import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.filter.ClusteringIndexNamesFilter;
-import org.apache.cassandra.db.filter.ClusteringIndexSliceFilter;
 import org.apache.cassandra.db.filter.DataLimits;
 import org.apache.cassandra.db.filter.RowFilter;
 import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
@@ -34,7 +33,6 @@ import org.apache.cassandra.index.internal.CassandraIndex;
 import org.apache.cassandra.index.internal.CassandraIndexSearcher;
 import org.apache.cassandra.index.internal.IndexEntry;
 import org.apache.cassandra.utils.btree.BTreeSet;
-import org.apache.cassandra.utils.concurrent.OpOrder;
 
 
 public class CompositesSearcher extends CassandraIndexSearcher
@@ -69,12 +67,7 @@ public class CompositesSearcher extends CassandraIndexSearcher
 
             private UnfilteredRowIterator next;
 
-            public boolean isForThrift()
-            {
-                return command.isForThrift();
-            }
-
-            public CFMetaData metadata()
+            public TableMetadata metadata()
             {
                 return command.metadata();
             }
@@ -122,13 +115,13 @@ public class CompositesSearcher extends CassandraIndexSearcher
 
                         // If the index is on a static column, we just need to do a full read on the partition.
                         // Note that we want to re-use the command.columnFilter() in case of future change.
-                        dataCmd = SinglePartitionReadCommand.create(index.baseCfs.metadata,
+                        dataCmd = SinglePartitionReadCommand.create(index.baseCfs.metadata(),
                                                                     command.nowInSec(),
                                                                     command.columnFilter(),
-                                                                    RowFilter.NONE,
+                                                                    RowFilter.none(),
                                                                     DataLimits.NONE,
                                                                     partitionKey,
-                                                                    new ClusteringIndexSliceFilter(Slices.ALL, false));
+                                                                    command.clusteringIndexFilter(partitionKey));
                         entries.add(nextEntry);
                         nextEntry = indexHits.hasNext() ? index.decodeEntry(indexKey, indexHits.next()) : null;
                     }
@@ -140,7 +133,7 @@ public class CompositesSearcher extends CassandraIndexSearcher
                         // in memory so we should consider adding some paging mechanism. However, index hits should
                         // be relatively small so it's much better than the previous code that was materializing all
                         // *data* for a given partition.
-                        BTreeSet.Builder<Clustering> clusterings = BTreeSet.builder(index.baseCfs.getComparator());
+                        BTreeSet.Builder<Clustering<?>> clusterings = BTreeSet.builder(index.baseCfs.getComparator());
                         while (nextEntry != null && partitionKey.getKey().equals(nextEntry.indexedKey))
                         {
                             // We're queried a slice of the index, but some hits may not match some of the clustering column constraints
@@ -159,8 +152,7 @@ public class CompositesSearcher extends CassandraIndexSearcher
 
                         // Query the gathered index hits. We still need to filter stale hits from the resulting query.
                         ClusteringIndexNamesFilter filter = new ClusteringIndexNamesFilter(clusterings.build(), false);
-                        dataCmd = SinglePartitionReadCommand.create(isForThrift(),
-                                                                    index.baseCfs.metadata,
+                        dataCmd = SinglePartitionReadCommand.create(index.baseCfs.metadata(),
                                                                     command.nowInSec(),
                                                                     command.columnFilter(),
                                                                     command.rowFilter(),
@@ -176,7 +168,7 @@ public class CompositesSearcher extends CassandraIndexSearcher
                         filterStaleEntries(dataCmd.queryMemtableAndDisk(index.baseCfs, executionController),
                                            indexKey.getKey(),
                                            entries,
-                                           executionController.writeOpOrderGroup(),
+                                           executionController.getWriteContext(),
                                            command.nowInSec());
 
                     if (dataIter.isEmpty())
@@ -204,21 +196,22 @@ public class CompositesSearcher extends CassandraIndexSearcher
         };
     }
 
-    private void deleteAllEntries(final List<IndexEntry> entries, final OpOrder.Group writeOp, final int nowInSec)
+    private void deleteAllEntries(final List<IndexEntry> entries, final WriteContext ctx, final long nowInSec)
     {
         entries.forEach(entry ->
             index.deleteStaleEntry(entry.indexValue,
                                    entry.indexClustering,
-                                   new DeletionTime(entry.timestamp, nowInSec),
-                                   writeOp));
+                                   DeletionTime.build(entry.timestamp, nowInSec),
+                                   ctx));
     }
 
     // We assume all rows in dataIter belong to the same partition.
+    @SuppressWarnings("resource")
     private UnfilteredRowIterator filterStaleEntries(UnfilteredRowIterator dataIter,
                                                      final ByteBuffer indexValue,
                                                      final List<IndexEntry> entries,
-                                                     final OpOrder.Group writeOp,
-                                                     final int nowInSec)
+                                                     final WriteContext ctx,
+                                                     final long nowInSec)
     {
         // collect stale index entries and delete them when we close this iterator
         final List<IndexEntry> staleEntries = new ArrayList<>();
@@ -251,7 +244,7 @@ public class CompositesSearcher extends CassandraIndexSearcher
                                                                          dataIter.partitionLevelDeletion(),
                                                                          dataIter.isReverseOrder());
             }
-            deleteAllEntries(staleEntries, writeOp, nowInSec);
+            deleteAllEntries(staleEntries, ctx, nowInSec);
         }
         else
         {
@@ -272,33 +265,46 @@ public class CompositesSearcher extends CassandraIndexSearcher
                     return null;
                 }
 
-                private IndexEntry findEntry(Clustering clustering)
+                private IndexEntry findEntry(Clustering<?> clustering)
                 {
                     assert entriesIdx < entries.size();
                     while (entriesIdx < entries.size())
                     {
                         IndexEntry entry = entries.get(entriesIdx++);
+                        Clustering<?> indexedEntryClustering = entry.indexedEntryClustering;
                         // The entries are in clustering order. So that the requested entry should be the
                         // next entry, the one at 'entriesIdx'. However, we can have stale entries, entries
                         // that have no corresponding row in the base table typically because of a range
                         // tombstone or partition level deletion. Delete such stale entries.
                         // For static column, we only need to compare the partition key, otherwise we compare
                         // the whole clustering.
-                        int cmp = comparator.compare(entry.indexedEntryClustering, clustering);
+                        int cmp = comparator.compare(indexedEntryClustering, clustering);
                         assert cmp <= 0; // this would means entries are not in clustering order, which shouldn't happen
                         if (cmp == 0)
                             return entry;
-                        else
-                            staleEntries.add(entry);
+
+                        // COMPACT COMPOSITE tables support null values in there clustering key but
+                        // those tables do not support static columns. By consequence if a table
+                        // has some static columns and all its clustering key elements are null
+                        // it means that the partition exists and contains only static data
+                       if (!dataIter.metadata().hasStaticColumns() || !containsOnlyNullValues(indexedEntryClustering))
+                           staleEntries.add(entry);
                     }
                     // entries correspond to the rows we've queried, so we shouldn't have a row that has no corresponding entry.
                     throw new AssertionError();
                 }
 
+                private boolean containsOnlyNullValues(Clustering<?> indexedEntryClustering)
+                {
+                    int i = 0;
+                    for (; i < indexedEntryClustering.size() && indexedEntryClustering.get(i) == null; i++);
+                    return i == indexedEntryClustering.size();
+                }
+
                 @Override
                 public void onPartitionClose()
                 {
-                    deleteAllEntries(staleEntries, writeOp, nowInSec);
+                    deleteAllEntries(staleEntries, ctx, nowInSec);
                 }
             }
             iteratorToReturn = Transformation.apply(dataIter, new Transform());

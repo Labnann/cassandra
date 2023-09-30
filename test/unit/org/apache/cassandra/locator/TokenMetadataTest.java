@@ -17,20 +17,25 @@
  */
 package org.apache.cassandra.locator;
 
-import java.net.InetAddress;
 import java.net.UnknownHostException;
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
+import com.google.common.collect.HashMultimap;
 import com.google.common.collect.ImmutableMultimap;
 import com.google.common.collect.Iterators;
 import com.google.common.collect.Multimap;
 
 import org.junit.BeforeClass;
+import org.junit.Before;
 import org.junit.Test;
-import org.junit.runner.RunWith;
 
-import org.apache.cassandra.OrderedJUnit4ClassRunner;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.service.StorageService;
@@ -43,7 +48,6 @@ import static org.junit.Assert.assertTrue;
 import static org.apache.cassandra.Util.token;
 
 
-@RunWith(OrderedJUnit4ClassRunner.class)
 public class TokenMetadataTest
 {
     public final static String ONE = "1";
@@ -55,9 +59,14 @@ public class TokenMetadataTest
     public static void beforeClass() throws Throwable
     {
         DatabaseDescriptor.daemonInitialization();
-        tmd = StorageService.instance.getTokenMetadata();
-        tmd.updateNormalToken(token(ONE), InetAddress.getByName("127.0.0.1"));
-        tmd.updateNormalToken(token(SIX), InetAddress.getByName("127.0.0.6"));
+    }
+
+    @Before
+    public void before() throws Throwable
+    {
+        tmd = new TokenMetadata();
+        tmd.updateNormalToken(token(ONE), InetAddressAndPort.getByName("127.0.0.1"));
+        tmd.updateNormalToken(token(SIX), InetAddressAndPort.getByName("127.0.0.6"));
     }
 
     private static void testRingIterator(ArrayList<Token> ring, String start, boolean includeMin, String... expected)
@@ -67,6 +76,27 @@ public class TokenMetadataTest
         assertEquals(actual.toString(), expected.length, actual.size());
         for (int i = 0; i < expected.length; i++)
             assertEquals("Mismatch at index " + i + ": " + actual, token(expected[i]), actual.get(i));
+    }
+
+    /**
+     * This test is very likely (but not guaranteed) to fail if ring invalidations are ever allowed to interleave.
+     */
+    @Test
+    public void testConcurrentInvalidation() throws InterruptedException
+    {
+        long startVersion = tmd.getRingVersion();
+
+        ExecutorService pool = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors() + 1);
+        
+        int invalidations = 1024;
+        
+        for (int i = 0; i < invalidations; i++)
+            pool.execute(() -> tmd.invalidateCachedRings());
+
+        pool.shutdown();
+        
+        assertTrue(pool.awaitTermination(30, TimeUnit.SECONDS));
+        assertEquals(invalidations + startVersion, tmd.getRingVersion());
     }
 
     @Test
@@ -98,8 +128,8 @@ public class TokenMetadataTest
     @Test
     public void testTopologyUpdate_RackConsolidation() throws UnknownHostException
     {
-        final InetAddress first = InetAddress.getByName("127.0.0.1");
-        final InetAddress second = InetAddress.getByName("127.0.0.6");
+        final InetAddressAndPort first = InetAddressAndPort.getByName("127.0.0.1");
+        final InetAddressAndPort second = InetAddressAndPort.getByName("127.0.0.6");
         final String DATA_CENTER = "datacenter1";
         final String RACK1 = "rack1";
         final String RACK2 = "rack2";
@@ -107,19 +137,19 @@ public class TokenMetadataTest
         DatabaseDescriptor.setEndpointSnitch(new AbstractEndpointSnitch()
         {
             @Override
-            public String getRack(InetAddress endpoint)
+            public String getRack(InetAddressAndPort endpoint)
             {
                 return endpoint.equals(first) ? RACK1 : RACK2;
             }
 
             @Override
-            public String getDatacenter(InetAddress endpoint)
+            public String getDatacenter(InetAddressAndPort endpoint)
             {
                 return DATA_CENTER;
             }
 
             @Override
-            public int compareEndpoints(InetAddress target, InetAddress a1, InetAddress a2)
+            public int compareEndpoints(InetAddressAndPort target, Replica a1, Replica a2)
             {
                 return 0;
             }
@@ -134,14 +164,14 @@ public class TokenMetadataTest
         TokenMetadata.Topology topology = tokenMetadata.getTopology();
         assertNotNull(topology);
 
-        Multimap<String, InetAddress> allEndpoints = topology.getDatacenterEndpoints();
+        Multimap<String, InetAddressAndPort> allEndpoints = topology.getDatacenterEndpoints();
         assertNotNull(allEndpoints);
         assertTrue(allEndpoints.size() == 2);
         assertTrue(allEndpoints.containsKey(DATA_CENTER));
         assertTrue(allEndpoints.get(DATA_CENTER).contains(first));
         assertTrue(allEndpoints.get(DATA_CENTER).contains(second));
 
-        Map<String, ImmutableMultimap<String, InetAddress>> racks = topology.getDatacenterRacks();
+        Map<String, ImmutableMultimap<String, InetAddressAndPort>> racks = topology.getDatacenterRacks();
         assertNotNull(racks);
         assertTrue(racks.size() == 1);
         assertTrue(racks.containsKey(DATA_CENTER));
@@ -154,19 +184,19 @@ public class TokenMetadataTest
         DatabaseDescriptor.setEndpointSnitch(new AbstractEndpointSnitch()
         {
             @Override
-            public String getRack(InetAddress endpoint)
+            public String getRack(InetAddressAndPort endpoint)
             {
                 return RACK1;
             }
 
             @Override
-            public String getDatacenter(InetAddress endpoint)
+            public String getDatacenter(InetAddressAndPort endpoint)
             {
                 return DATA_CENTER;
             }
 
             @Override
-            public int compareEndpoints(InetAddress target, InetAddress a1, InetAddress a2)
+            public int compareEndpoints(InetAddressAndPort target, Replica a1, Replica a2)
             {
                 return 0;
             }
@@ -196,8 +226,8 @@ public class TokenMetadataTest
     @Test
     public void testTopologyUpdate_RackExpansion() throws UnknownHostException
     {
-        final InetAddress first = InetAddress.getByName("127.0.0.1");
-        final InetAddress second = InetAddress.getByName("127.0.0.6");
+        final InetAddressAndPort first = InetAddressAndPort.getByName("127.0.0.1");
+        final InetAddressAndPort second = InetAddressAndPort.getByName("127.0.0.6");
         final String DATA_CENTER = "datacenter1";
         final String RACK1 = "rack1";
         final String RACK2 = "rack2";
@@ -205,19 +235,19 @@ public class TokenMetadataTest
         DatabaseDescriptor.setEndpointSnitch(new AbstractEndpointSnitch()
         {
             @Override
-            public String getRack(InetAddress endpoint)
+            public String getRack(InetAddressAndPort endpoint)
             {
                 return RACK1;
             }
 
             @Override
-            public String getDatacenter(InetAddress endpoint)
+            public String getDatacenter(InetAddressAndPort endpoint)
             {
                 return DATA_CENTER;
             }
 
             @Override
-            public int compareEndpoints(InetAddress target, InetAddress a1, InetAddress a2)
+            public int compareEndpoints(InetAddressAndPort target, Replica a1, Replica a2)
             {
                 return 0;
             }
@@ -232,14 +262,14 @@ public class TokenMetadataTest
         TokenMetadata.Topology topology = tokenMetadata.getTopology();
         assertNotNull(topology);
 
-        Multimap<String, InetAddress> allEndpoints = topology.getDatacenterEndpoints();
+        Multimap<String, InetAddressAndPort> allEndpoints = topology.getDatacenterEndpoints();
         assertNotNull(allEndpoints);
         assertTrue(allEndpoints.size() == 2);
         assertTrue(allEndpoints.containsKey(DATA_CENTER));
         assertTrue(allEndpoints.get(DATA_CENTER).contains(first));
         assertTrue(allEndpoints.get(DATA_CENTER).contains(second));
 
-        Map<String, ImmutableMultimap<String, InetAddress>> racks = topology.getDatacenterRacks();
+        Map<String, ImmutableMultimap<String, InetAddressAndPort>> racks = topology.getDatacenterRacks();
         assertNotNull(racks);
         assertTrue(racks.size() == 1);
         assertTrue(racks.containsKey(DATA_CENTER));
@@ -252,19 +282,19 @@ public class TokenMetadataTest
         DatabaseDescriptor.setEndpointSnitch(new AbstractEndpointSnitch()
         {
             @Override
-            public String getRack(InetAddress endpoint)
+            public String getRack(InetAddressAndPort endpoint)
             {
                 return endpoint.equals(first) ? RACK1 : RACK2;
             }
 
             @Override
-            public String getDatacenter(InetAddress endpoint)
+            public String getDatacenter(InetAddressAndPort endpoint)
             {
                 return DATA_CENTER;
             }
 
             @Override
-            public int compareEndpoints(InetAddress target, InetAddress a1, InetAddress a2)
+            public int compareEndpoints(InetAddressAndPort target, Replica a1, Replica a2)
             {
                 return 0;
             }
@@ -288,5 +318,82 @@ public class TokenMetadataTest
         assertTrue(racks.get(DATA_CENTER).containsKey(RACK2));
         assertTrue(racks.get(DATA_CENTER).get(RACK1).contains(first));
         assertTrue(racks.get(DATA_CENTER).get(RACK2).contains(second));
+    }
+
+    @Test
+    public void testEndpointSizes() throws UnknownHostException
+    {
+        final InetAddressAndPort first = InetAddressAndPort.getByName("127.0.0.1");
+        final InetAddressAndPort second = InetAddressAndPort.getByName("127.0.0.6");
+
+        tmd.updateNormalToken(token(ONE), first);
+        tmd.updateNormalToken(token(SIX), second);
+
+        TokenMetadata tokenMetadata = tmd.cloneOnlyTokenMap();
+        assertNotNull(tokenMetadata);
+
+        tokenMetadata.updateHostId(UUID.randomUUID(), first);
+        tokenMetadata.updateHostId(UUID.randomUUID(), second);
+
+        assertEquals(2, tokenMetadata.getSizeOfAllEndpoints());
+        assertEquals(0, tokenMetadata.getSizeOfLeavingEndpoints());
+        assertEquals(0, tokenMetadata.getSizeOfMovingEndpoints());
+
+        tokenMetadata.addLeavingEndpoint(first);
+        assertEquals(1, tokenMetadata.getSizeOfLeavingEndpoints());
+
+        tokenMetadata.removeEndpoint(first);
+        assertEquals(0, tokenMetadata.getSizeOfLeavingEndpoints());
+        assertEquals(1, tokenMetadata.getSizeOfAllEndpoints());
+
+        tokenMetadata.addMovingEndpoint(token(SIX), second);
+        assertEquals(1, tokenMetadata.getSizeOfMovingEndpoints());
+
+        tokenMetadata.removeFromMoving(second);
+        assertEquals(0, tokenMetadata.getSizeOfMovingEndpoints());
+
+        tokenMetadata.removeEndpoint(second);
+        assertEquals(0, tokenMetadata.getSizeOfAllEndpoints());
+        assertEquals(0, tokenMetadata.getSizeOfLeavingEndpoints());
+        assertEquals(0, tokenMetadata.getSizeOfMovingEndpoints());
+    }
+
+
+    @Test
+    public void testRemoveEndpointTokenChange() throws Exception
+    {
+        TokenMetadata metadata = StorageService.instance.getTokenMetadata();
+        metadata.clearUnsafe();
+
+        Collection<Token> tokens = new HashSet<>();
+        tokens.add(DatabaseDescriptor.getPartitioner().getRandomToken());
+        tokens.add(DatabaseDescriptor.getPartitioner().getRandomToken());
+
+        InetAddressAndPort ep1 = InetAddressAndPort.getByName("127.0.0.1");
+        InetAddressAndPort ep2 = InetAddressAndPort.getByName("127.0.0.2");
+
+        Multimap<InetAddressAndPort, Token> endpointTokens = HashMultimap.create();
+        for (Token token : tokens)
+            endpointTokens.put(ep1, token);
+
+        endpointTokens.put(ep2, DatabaseDescriptor.getPartitioner().getRandomToken());
+
+        long ver = metadata.getRingVersion();
+        metadata.updateNormalTokens(endpointTokens);
+        assertTrue(metadata.getRingVersion() > ver);
+
+        // Remove a normal endpoint
+        assertTrue(metadata.isMember(ep2));
+        ver = metadata.getRingVersion();
+        metadata.removeEndpoint(ep2);
+        assertFalse(metadata.isMember(ep2));
+        assertTrue(metadata.getRingVersion() > ver);
+
+        // Remove a non-exist endpoint (e.g. proxy node is not part of token metadata)
+        InetAddressAndPort ep3 = InetAddressAndPort.getByName("127.0.0.3");
+        assertFalse(metadata.isMember(ep3));
+        ver = metadata.getRingVersion();
+        metadata.removeEndpoint(ep3);
+        assertEquals(ver, metadata.getRingVersion());
     }
 }

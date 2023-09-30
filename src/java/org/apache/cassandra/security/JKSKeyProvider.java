@@ -17,7 +17,8 @@
  */
 package org.apache.cassandra.security;
 
-import java.io.FileInputStream;
+import java.nio.file.Files;
+import java.io.InputStream;
 import java.io.IOException;
 import java.security.Key;
 import java.security.KeyStore;
@@ -26,6 +27,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.config.TransparentDataEncryptionOptions;
+import org.apache.cassandra.io.util.File;
 
 /**
  * A {@code KeyProvider} that retrieves keys from a java keystore.
@@ -46,7 +48,7 @@ public class JKSKeyProvider implements KeyProvider
     {
         this.options = options;
         logger.info("initializing keystore from file {}", options.get(PROP_KEYSTORE));
-        try (FileInputStream inputStream = new FileInputStream(options.get(PROP_KEYSTORE)))
+        try (InputStream inputStream = Files.newInputStream(File.getPath(options.get(PROP_KEYSTORE))))
         {
             store = KeyStore.getInstance(options.get(PROP_KEYSTORE_TYPE));
             store.load(inputStream, options.get(PROP_KEYSTORE_PW).toCharArray());

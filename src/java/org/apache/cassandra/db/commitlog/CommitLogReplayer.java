@@ -18,50 +18,62 @@
  */
 package org.apache.cassandra.db.commitlog;
 
-import java.io.File;
 import java.io.IOException;
 import java.util.*;
-import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Predicate;
-import com.google.common.collect.*;
+import com.google.common.collect.HashMultimap;
+import com.google.common.collect.Iterables;
+import com.google.common.collect.Multimap;
+import com.google.common.collect.Ordering;
+
+import org.apache.cassandra.io.util.File;
 import org.apache.commons.lang3.StringUtils;
+
+import org.apache.cassandra.utils.concurrent.Future;
 import org.cliffc.high_scale_lib.NonBlockingHashSet;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.concurrent.Stage;
-import org.apache.cassandra.concurrent.StageManager;
-import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.config.Config;
-import org.apache.cassandra.config.Schema;
-import org.apache.cassandra.config.SchemaConstants;
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.db.Mutation;
 import org.apache.cassandra.db.SystemKeyspace;
 import org.apache.cassandra.db.partitions.PartitionUpdate;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.io.util.RandomAccessReader;
+import org.apache.cassandra.schema.Schema;
+import org.apache.cassandra.schema.SchemaConstants;
+import org.apache.cassandra.schema.TableId;
+import org.apache.cassandra.schema.TableMetadataRef;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.WrappedRunnable;
+
+import static java.lang.String.format;
+import static org.apache.cassandra.config.CassandraRelevantProperties.COMMITLOG_IGNORE_REPLAY_ERRORS;
+import static org.apache.cassandra.config.CassandraRelevantProperties.COMMITLOG_MAX_OUTSTANDING_REPLAY_BYTES;
+import static org.apache.cassandra.config.CassandraRelevantProperties.COMMITLOG_MAX_OUTSTANDING_REPLAY_COUNT;
+import static org.apache.cassandra.config.CassandraRelevantProperties.COMMIT_LOG_REPLAY_LIST;
 
 public class CommitLogReplayer implements CommitLogReadHandler
 {
     @VisibleForTesting
-    public static long MAX_OUTSTANDING_REPLAY_BYTES = Long.getLong("cassandra.commitlog_max_outstanding_replay_bytes", 1024 * 1024 * 64);
+    public static long MAX_OUTSTANDING_REPLAY_BYTES = COMMITLOG_MAX_OUTSTANDING_REPLAY_BYTES.getLong();
     @VisibleForTesting
     public static MutationInitiator mutationInitiator = new MutationInitiator();
-    static final String IGNORE_REPLAY_ERRORS_PROPERTY = Config.PROPERTY_PREFIX + "commitlog.ignorereplayerrors";
     private static final Logger logger = LoggerFactory.getLogger(CommitLogReplayer.class);
-    private static final int MAX_OUTSTANDING_REPLAY_COUNT = Integer.getInteger(Config.PROPERTY_PREFIX + "commitlog_max_outstanding_replay_count", 1024);
+    private static final int MAX_OUTSTANDING_REPLAY_COUNT = COMMITLOG_MAX_OUTSTANDING_REPLAY_COUNT.getInt();
 
     private final Set<Keyspace> keyspacesReplayed;
     private final Queue<Future<Integer>> futures;
 
     private final AtomicInteger replayedCount;
-    private final Map<UUID, IntervalSet<CommitLogPosition>> cfPersisted;
+    private final Map<TableId, IntervalSet<CommitLogPosition>> cfPersisted;
     private final CommitLogPosition globalPosition;
 
     // Used to throttle speed of replay of mutations if we pass the max outstanding count
@@ -71,15 +83,18 @@ public class CommitLogReplayer implements CommitLogReadHandler
     private final CommitLogArchiver archiver;
 
     @VisibleForTesting
+    protected boolean sawCDCMutation;
+
+    @VisibleForTesting
     protected CommitLogReader commitLogReader;
 
     CommitLogReplayer(CommitLog commitLog,
                       CommitLogPosition globalPosition,
-                      Map<UUID, IntervalSet<CommitLogPosition>> cfPersisted,
+                      Map<TableId, IntervalSet<CommitLogPosition>> cfPersisted,
                       ReplayFilter replayFilter)
     {
-        this.keyspacesReplayed = new NonBlockingHashSet<Keyspace>();
-        this.futures = new ArrayDeque<Future<Integer>>();
+        this.keyspacesReplayed = new NonBlockingHashSet<>();
+        this.futures = new ArrayDeque<>();
         // count the number of replayed mutation. We don't really care about atomicity, but we need it to be a reference.
         this.replayedCount = new AtomicInteger();
         this.cfPersisted = cfPersisted;
@@ -89,38 +104,72 @@ public class CommitLogReplayer implements CommitLogReadHandler
         this.commitLogReader = new CommitLogReader();
     }
 
-    public static CommitLogReplayer construct(CommitLog commitLog)
+    public static CommitLogReplayer construct(CommitLog commitLog, UUID localHostId)
     {
         // compute per-CF and global replay intervals
-        Map<UUID, IntervalSet<CommitLogPosition>> cfPersisted = new HashMap<>();
+        Map<TableId, IntervalSet<CommitLogPosition>> cfPersisted = new HashMap<>();
         ReplayFilter replayFilter = ReplayFilter.create();
 
         for (ColumnFamilyStore cfs : ColumnFamilyStore.all())
         {
             // but, if we've truncated the cf in question, then we need to need to start replay after the truncation
-            CommitLogPosition truncatedAt = SystemKeyspace.getTruncatedPosition(cfs.metadata.cfId);
+            CommitLogPosition truncatedAt = SystemKeyspace.getTruncatedPosition(cfs.metadata.id);
             if (truncatedAt != null)
             {
                 // Point in time restore is taken to mean that the tables need to be replayed even if they were
                 // deleted at a later point in time. Any truncation record after that point must thus be cleared prior
                 // to replay (CASSANDRA-9195).
                 long restoreTime = commitLog.archiver.restorePointInTime;
-                long truncatedTime = SystemKeyspace.getTruncatedAt(cfs.metadata.cfId);
+                long truncatedTime = SystemKeyspace.getTruncatedAt(cfs.metadata.id);
                 if (truncatedTime > restoreTime)
                 {
                     if (replayFilter.includes(cfs.metadata))
                     {
                         logger.info("Restore point in time is before latest truncation of table {}.{}. Clearing truncation record.",
-                                    cfs.metadata.ksName,
-                                    cfs.metadata.cfName);
-                        SystemKeyspace.removeTruncationRecord(cfs.metadata.cfId);
+                                    cfs.metadata.keyspace,
+                                    cfs.metadata.name);
+                        SystemKeyspace.removeTruncationRecord(cfs.metadata.id);
                         truncatedAt = null;
                     }
                 }
             }
 
-            IntervalSet<CommitLogPosition> filter = persistedIntervals(cfs.getLiveSSTables(), truncatedAt);
-            cfPersisted.put(cfs.metadata.cfId, filter);
+            IntervalSet<CommitLogPosition> filter;
+            final CommitLogPosition snapshotPosition = commitLog.archiver.snapshotCommitLogPosition;
+            if (snapshotPosition == CommitLogPosition.NONE)
+            {
+                // normal path: snapshot position is not explicitly specified, find it from sstables
+                if (!cfs.memtableWritesAreDurable())
+                {
+                    filter = persistedIntervals(cfs.getLiveSSTables(), truncatedAt, localHostId);
+                }
+                else
+                {
+                    if (commitLog.archiver.restorePointInTime == Long.MAX_VALUE)
+                    {
+                        // Normal restart, everything is persisted and restored by the memtable itself.
+                        filter = new IntervalSet<>(CommitLogPosition.NONE, CommitLog.instance.getCurrentPosition());
+                    }
+                    else
+                    {
+                        // Point-in-time restore with a persistent memtable. In this case user should have restored
+                        // the memtable from a snapshot and specified that snapshot's commit log position, reaching
+                        // the "else" path below.
+                        // If they haven't, do not filter any commit log data -- this supports a mode of operation where
+                        // the user deletes old archived commit log segments when a snapshot completes -- but issue a
+                        // message as this may be inefficient / not what the user wants.
+                        logger.info("Point-in-time restore on a persistent memtable started without a snapshot time. " +
+                                    "All commit log data will be replayed.");
+                        filter = IntervalSet.empty();
+                    }
+                }
+            }
+            else
+            {
+                // If the positions is specified, it must override whatever we calculate.
+                filter = new IntervalSet<>(CommitLogPosition.NONE, snapshotPosition);
+            }
+            cfPersisted.put(cfs.metadata.id, filter);
         }
         CommitLogPosition globalPosition = firstNotCovered(cfPersisted.values());
         logger.debug("Global replay position is {} from columnfamilies {}", globalPosition, FBUtilities.toString(cfPersisted));
@@ -129,13 +178,54 @@ public class CommitLogReplayer implements CommitLogReadHandler
 
     public void replayPath(File file, boolean tolerateTruncation) throws IOException
     {
+        sawCDCMutation = false;
         commitLogReader.readCommitLogSegment(this, file, globalPosition, CommitLogReader.ALL_MUTATIONS, tolerateTruncation);
+        if (sawCDCMutation)
+            handleCDCReplayCompletion(file);
     }
 
     public void replayFiles(File[] clogs) throws IOException
     {
-        commitLogReader.readAllFiles(this, clogs, globalPosition);
+        List<File> filteredLogs = CommitLogReader.filterCommitLogFiles(clogs);
+        int i = 0;
+        for (File file: filteredLogs)
+        {
+            i++;
+            sawCDCMutation = false;
+            commitLogReader.readCommitLogSegment(this, file, globalPosition, i == filteredLogs.size());
+            if (sawCDCMutation)
+                handleCDCReplayCompletion(file);
+        }
     }
+
+
+    /**
+     * Upon replay completion, CDC needs to hard-link files in the CDC folder and calculate index files so consumers can
+     * begin their work.
+     */
+    private void handleCDCReplayCompletion(File f) throws IOException
+    {
+        // Can only reach this point if CDC is enabled, thus we have a CDCSegmentManager
+        ((CommitLogSegmentManagerCDC)CommitLog.instance.segmentManager).addCDCSize(f.length());
+
+        File dest = new File(DatabaseDescriptor.getCDCLogLocation(), f.name());
+
+        // If hard link already exists, assume it's from a previous node run. If people are mucking around in the cdc_raw
+        // directory that's on them.
+        if (!dest.exists())
+            FileUtils.createHardLink(f, dest);
+
+        // The reader has already verified we can deserialize the descriptor.
+        CommitLogDescriptor desc;
+        try(RandomAccessReader reader = RandomAccessReader.open(f))
+        {
+            desc = CommitLogDescriptor.readHeader(reader, DatabaseDescriptor.getEncryptionContext());
+            assert desc != null;
+            assert f.length() < Integer.MAX_VALUE;
+            CommitLogSegment.writeCDCIndexFile(desc, (int)f.length(), true);
+        }
+    }
+
 
     /**
      * Flushes all keyspaces associated with this replayer in parallel, blocking until their flushes are complete.
@@ -143,7 +233,7 @@ public class CommitLogReplayer implements CommitLogReadHandler
      */
     public int blockForWrites()
     {
-        for (Map.Entry<UUID, AtomicInteger> entry : commitLogReader.getInvalidMutations())
+        for (Map.Entry<TableId, AtomicInteger> entry : commitLogReader.getInvalidMutations())
             logger.warn("Skipped {} mutations from unknown (probably removed) CF with id {}", entry.getValue(), entry.getKey());
 
         // wait for all the writes to finish on the mutation stage
@@ -160,12 +250,14 @@ public class CommitLogReplayer implements CommitLogReadHandler
             if (keyspace.getName().equals(SchemaConstants.SYSTEM_KEYSPACE_NAME))
                 flushingSystem = true;
 
-            futures.addAll(keyspace.flush());
+            futures.addAll(keyspace.flush(ColumnFamilyStore.FlushReason.STARTUP));
         }
 
         // also flush batchlog incase of any MV updates
         if (!flushingSystem)
-            futures.add(Keyspace.open(SchemaConstants.SYSTEM_KEYSPACE_NAME).getColumnFamilyStore(SystemKeyspace.BATCHES).forceFlush());
+            futures.add(Keyspace.open(SchemaConstants.SYSTEM_KEYSPACE_NAME)
+                                .getColumnFamilyStore(SystemKeyspace.BATCHES)
+                                .forceFlush(ColumnFamilyStore.FlushReason.INTERNALLY_FORCED));
 
         FBUtilities.waitOnFutures(futures);
 
@@ -189,7 +281,7 @@ public class CommitLogReplayer implements CommitLogReadHandler
             {
                 public void runMayThrow()
                 {
-                    if (Schema.instance.getKSMetaData(mutation.getKeyspaceName()) == null)
+                    if (Schema.instance.getKeyspaceMetadata(mutation.getKeyspaceName()) == null)
                         return;
                     if (commitLogReplayer.pointInTimeExceeded(mutation))
                         return;
@@ -201,32 +293,32 @@ public class CommitLogReplayer implements CommitLogReadHandler
                     //    b) have already been flushed,
                     // or c) are part of a cf that was dropped.
                     // Keep in mind that the cf.name() is suspect. do every thing based on the cfid instead.
-                    Mutation newMutation = null;
+                    Mutation.PartitionUpdateCollector newPUCollector = null;
                     for (PartitionUpdate update : commitLogReplayer.replayFilter.filter(mutation))
                     {
-                        if (Schema.instance.getCF(update.metadata().cfId) == null)
+                        if (Schema.instance.getTableMetadata(update.metadata().id) == null)
                             continue; // dropped
 
                         // replay if current segment is newer than last flushed one or,
                         // if it is the last known segment, if we are after the commit log segment position
-                        if (commitLogReplayer.shouldReplay(update.metadata().cfId, new CommitLogPosition(segmentId, entryLocation)))
+                        if (commitLogReplayer.shouldReplay(update.metadata().id, new CommitLogPosition(segmentId, entryLocation)))
                         {
-                            if (newMutation == null)
-                                newMutation = new Mutation(mutation.getKeyspaceName(), mutation.key());
-                            newMutation.add(update);
+                            if (newPUCollector == null)
+                                newPUCollector = new Mutation.PartitionUpdateCollector(mutation.getKeyspaceName(), mutation.key());
+                            newPUCollector.add(update);
                             commitLogReplayer.replayedCount.incrementAndGet();
                         }
                     }
-                    if (newMutation != null)
+                    if (newPUCollector != null)
                     {
-                        assert !newMutation.isEmpty();
+                        assert !newPUCollector.isEmpty();
 
-                        Keyspace.open(newMutation.getKeyspaceName()).apply(newMutation, false, true, false);
+                        Keyspace.open(newPUCollector.getKeyspaceName()).apply(newPUCollector.build(), false, true, false);
                         commitLogReplayer.keyspacesReplayed.add(keyspace);
                     }
                 }
             };
-            return StageManager.getStage(Stage.MUTATION).submit(runnable, serializedSize);
+            return Stage.MUTATION.submit(runnable, serializedSize);
         }
     }
 
@@ -234,11 +326,25 @@ public class CommitLogReplayer implements CommitLogReadHandler
      * A set of known safe-to-discard commit log replay positions, based on
      * the range covered by on disk sstables and those prior to the most recent truncation record
      */
-    public static IntervalSet<CommitLogPosition> persistedIntervals(Iterable<SSTableReader> onDisk, CommitLogPosition truncatedAt)
+    public static IntervalSet<CommitLogPosition> persistedIntervals(Iterable<SSTableReader> onDisk,
+                                                                    CommitLogPosition truncatedAt,
+                                                                    UUID localhostId)
     {
         IntervalSet.Builder<CommitLogPosition> builder = new IntervalSet.Builder<>();
+        List<String> skippedSSTables = new ArrayList<>();
         for (SSTableReader reader : onDisk)
-            builder.addAll(reader.getSSTableMetadata().commitLogIntervals);
+        {
+            UUID originatingHostId = reader.getSSTableMetadata().originatingHostId;
+            if (originatingHostId != null && originatingHostId.equals(localhostId))
+                builder.addAll(reader.getSSTableMetadata().commitLogIntervals);
+            else
+                skippedSSTables.add(reader.getFilename());
+        }
+
+        if (!skippedSSTables.isEmpty()) {
+            logger.warn("Origin of {} sstables is unknown or doesn't match the local node; commitLogIntervals for them were ignored", skippedSSTables.size());
+            logger.debug("Ignored commitLogIntervals from the following sstables: {}", skippedSSTables);
+        }
 
         if (truncatedAt != null)
             builder.add(CommitLogPosition.NONE, truncatedAt);
@@ -269,30 +375,62 @@ public class CommitLogReplayer implements CommitLogReadHandler
     {
         public abstract Iterable<PartitionUpdate> filter(Mutation mutation);
 
-        public abstract boolean includes(CFMetaData metadata);
+        public abstract boolean includes(TableMetadataRef metadata);
 
+        /**
+         * Creates filter for entities to replay mutations for upon commit log replay.
+         *
+         * @see org.apache.cassandra.config.CassandraRelevantProperties#COMMIT_LOG_REPLAY_LIST
+         * */
         public static ReplayFilter create()
         {
-            // If no replaylist is supplied an empty array of strings is used to replay everything.
-            if (System.getProperty("cassandra.replayList") == null)
+            String replayList = COMMIT_LOG_REPLAY_LIST.getString();
+
+            if (replayList == null)
                 return new AlwaysReplayFilter();
 
             Multimap<String, String> toReplay = HashMultimap.create();
-            for (String rawPair : System.getProperty("cassandra.replayList").split(","))
+            for (String rawPair : replayList.split(","))
             {
-                String[] pair = StringUtils.split(rawPair.trim(), '.');
-                if (pair.length != 2)
-                    throw new IllegalArgumentException("Each table to be replayed must be fully qualified with keyspace name, e.g., 'system.peers'");
+                String trimmedRawPair = rawPair.trim();
+                if (trimmedRawPair.isEmpty() || trimmedRawPair.endsWith("."))
+                    throw new IllegalArgumentException(format("Invalid pair: '%s'", trimmedRawPair));
 
-                Keyspace ks = Schema.instance.getKeyspaceInstance(pair[0]);
+                String[] pair = StringUtils.split(trimmedRawPair, '.');
+
+                if (pair.length > 2)
+                    throw new IllegalArgumentException(format("%s property contains an item which " +
+                                                              "is not in format 'keyspace' or 'keyspace.table' " +
+                                                              "but it is '%s'",
+                                                              COMMIT_LOG_REPLAY_LIST.getKey(),
+                                                              String.join(".", pair)));
+
+                String keyspaceName = pair[0];
+
+                Keyspace ks = Schema.instance.getKeyspaceInstance(keyspaceName);
                 if (ks == null)
-                    throw new IllegalArgumentException("Unknown keyspace " + pair[0]);
-                ColumnFamilyStore cfs = ks.getColumnFamilyStore(pair[1]);
-                if (cfs == null)
-                    throw new IllegalArgumentException(String.format("Unknown table %s.%s", pair[0], pair[1]));
+                    throw new IllegalArgumentException("Unknown keyspace " + keyspaceName);
 
-                toReplay.put(pair[0], pair[1]);
+                if (pair.length == 1)
+                {
+                    for (ColumnFamilyStore cfs : ks.getColumnFamilyStores())
+                        toReplay.put(keyspaceName, cfs.name);
+                }
+                else
+                {
+                    ColumnFamilyStore cfs = ks.getColumnFamilyStore(pair[1]);
+                    if (cfs == null)
+                        throw new IllegalArgumentException(format("Unknown table %s.%s", keyspaceName, pair[1]));
+
+                    toReplay.put(keyspaceName, pair[1]);
+                }
             }
+
+            if (toReplay.isEmpty())
+                logger.info("All tables will be included in commit log replay.");
+            else
+                logger.info("Tables to be replayed: {}", toReplay.asMap().toString());
+
             return new CustomReplayFilter(toReplay);
         }
     }
@@ -304,7 +442,7 @@ public class CommitLogReplayer implements CommitLogReadHandler
             return mutation.getPartitionUpdates();
         }
 
-        public boolean includes(CFMetaData metadata)
+        public boolean includes(TableMetadataRef metadata)
         {
             return true;
         }
@@ -329,14 +467,14 @@ public class CommitLogReplayer implements CommitLogReadHandler
             {
                 public boolean apply(PartitionUpdate upd)
                 {
-                    return cfNames.contains(upd.metadata().cfName);
+                    return cfNames.contains(upd.metadata().name);
                 }
             });
         }
 
-        public boolean includes(CFMetaData metadata)
+        public boolean includes(TableMetadataRef metadata)
         {
-            return toReplay.containsEntry(metadata.ksName, metadata.cfName);
+            return toReplay.containsEntry(metadata.keyspace, metadata.name);
         }
     }
 
@@ -346,9 +484,9 @@ public class CommitLogReplayer implements CommitLogReadHandler
      *
      * @return true iff replay is necessary
      */
-    private boolean shouldReplay(UUID cfId, CommitLogPosition position)
+    private boolean shouldReplay(TableId tableId, CommitLogPosition position)
     {
-        return !cfPersisted.get(cfId).contains(position);
+        return !cfPersisted.get(tableId).contains(position);
     }
 
     protected boolean pointInTimeExceeded(Mutation fm)
@@ -365,6 +503,9 @@ public class CommitLogReplayer implements CommitLogReadHandler
 
     public void handleMutation(Mutation m, int size, int entryLocation, CommitLogDescriptor desc)
     {
+        if (DatabaseDescriptor.isCDCEnabled() && m.trackedByCDC())
+            sawCDCMutation = true;
+
         pendingMutationBytes += size;
         futures.offer(mutationInitiator.initiateMutation(m,
                                                          desc.id,
@@ -385,13 +526,13 @@ public class CommitLogReplayer implements CommitLogReadHandler
     {
         if (exception.permissible)
             logger.error("Ignoring commit log replay error likely due to incomplete flush to disk", exception);
-        else if (Boolean.getBoolean(IGNORE_REPLAY_ERRORS_PROPERTY))
+        else if (COMMITLOG_IGNORE_REPLAY_ERRORS.getBoolean())
             logger.error("Ignoring commit log replay error", exception);
         else if (!CommitLog.handleCommitError("Failed commit log replay", exception))
         {
             logger.error("Replay stopped. If you wish to override this error and continue starting the node ignoring " +
-                         "commit log replay problems, specify -D" + IGNORE_REPLAY_ERRORS_PROPERTY + "=true " +
-                         "on the command line");
+                         "commit log replay problems, specify -D{}=true on the command line",
+                         COMMITLOG_IGNORE_REPLAY_ERRORS.getKey());
             throw new CommitLogReplayException(exception.getMessage(), exception);
         }
         return false;

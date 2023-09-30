@@ -18,12 +18,12 @@
 
 package org.apache.cassandra.db.commitlog;
 
-import java.io.File;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Random;
 
+import org.apache.cassandra.io.util.File;
 import org.junit.Assert;
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -75,7 +75,7 @@ public class CommitLogChainedMarkersTest
 
         byte[] entropy = new byte[1024];
         new Random().nextBytes(entropy);
-        final Mutation m = new RowUpdateBuilder(cfs1.metadata, 0, "k")
+        final Mutation m = new RowUpdateBuilder(cfs1.metadata.get(), 0, "k")
                            .clustering("bytes")
                            .add("val", ByteBuffer.wrap(entropy))
                            .build();
@@ -88,7 +88,7 @@ public class CommitLogChainedMarkersTest
 
         ArrayList<File> toCheck = CommitLogReaderTest.getCommitLogs();
         CommitLogReader reader = new CommitLogReader();
-        CommitLogReaderTest.TestCLRHandler testHandler = new CommitLogReaderTest.TestCLRHandler(cfs1.metadata);
+        CommitLogReaderTest.TestCLRHandler testHandler = new CommitLogReaderTest.TestCLRHandler(cfs1.metadata.get());
         for (File f : toCheck)
             reader.readCommitLogSegment(testHandler, f, CommitLogReader.ALL_MUTATIONS, false);
 

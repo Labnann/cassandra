@@ -30,7 +30,6 @@ import org.apache.cassandra.stress.Operation;
 import org.apache.cassandra.stress.StressAction.MeasurementSink;
 import org.apache.cassandra.stress.generate.DistributionFactory;
 import org.apache.cassandra.stress.generate.DistributionFixed;
-import org.apache.cassandra.stress.generate.PartitionGenerator;
 import org.apache.cassandra.stress.report.Timer;
 import org.apache.commons.math3.distribution.EnumeratedDistribution;
 import org.apache.commons.math3.util.Pair;
@@ -46,17 +45,15 @@ public abstract class SampledOpDistributionFactory<T> implements OpDistributionF
         this.clustering = clustering;
     }
 
-    protected abstract List<? extends Operation> get(Timer timer, PartitionGenerator generator, T key, boolean isWarmup);
-    protected abstract PartitionGenerator newGenerator();
+    protected abstract List<? extends Operation> get(Timer timer, T key, boolean isWarmup);
 
     public OpDistribution get(boolean isWarmup, MeasurementSink sink)
     {
-        PartitionGenerator generator = newGenerator();
         List<Pair<Operation, Double>> operations = new ArrayList<>();
         for (Map.Entry<T, Double> ratio : ratios.entrySet())
         {
             List<? extends Operation> ops = get(new Timer(ratio.getKey().toString(), sink),
-                                                generator, ratio.getKey(), isWarmup);
+                                                ratio.getKey(), isWarmup);
             for (Operation op : ops)
                 operations.add(new Pair<>(op, ratio.getValue() / ops.size()));
         }
@@ -81,7 +78,6 @@ public abstract class SampledOpDistributionFactory<T> implements OpDistributionF
                 public OpDistribution get(boolean isWarmup, MeasurementSink sink)
                 {
                     List<? extends Operation> ops = SampledOpDistributionFactory.this.get(new Timer(ratio.getKey().toString(), sink),
-                                                                                          newGenerator(),
                                                                                           ratio.getKey(),
                                                                                           isWarmup);
                     if (ops.size() == 1)

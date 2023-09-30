@@ -17,9 +17,10 @@
  */
 package org.apache.cassandra.tools.nodetool;
 
-import io.airlift.command.Command;
-import io.airlift.command.Option;
+import io.airlift.airline.Command;
+import io.airlift.airline.Option;
 
+import java.io.PrintStream;
 import java.lang.management.MemoryUsage;
 import java.util.Iterator;
 import java.util.List;
@@ -45,28 +46,30 @@ public class Info extends NodeToolCmd
     {
         boolean gossipInitialized = probe.isGossipRunning();
 
-        System.out.printf("%-23s: %s%n", "ID", probe.getLocalHostId());
-        System.out.printf("%-23s: %s%n", "Gossip active", gossipInitialized);
-        System.out.printf("%-23s: %s%n", "Thrift active", probe.isThriftServerRunning());
-        System.out.printf("%-23s: %s%n", "Native Transport active", probe.isNativeTransportRunning());
-        System.out.printf("%-23s: %s%n", "Load", probe.getLoadString());
+        PrintStream out = probe.output().out;
+        out.printf("%-23s: %s%n", "ID", probe.getLocalHostId());
+        out.printf("%-23s: %s%n", "Gossip active", gossipInitialized);
+        out.printf("%-23s: %s%n", "Native Transport active", probe.isNativeTransportRunning());
+        out.printf("%-23s: %s%n", "Load", probe.getLoadString());
+        out.printf("%-23s: %s%n", "Uncompressed load", probe.getUncompressedLoadString());
+
         if (gossipInitialized)
-            System.out.printf("%-23s: %s%n", "Generation No", probe.getCurrentGenerationNumber());
+            out.printf("%-23s: %s%n", "Generation No", probe.getCurrentGenerationNumber());
         else
-            System.out.printf("%-23s: %s%n", "Generation No", 0);
+            out.printf("%-23s: %s%n", "Generation No", 0);
 
         // Uptime
         long secondsUp = probe.getUptime() / 1000;
-        System.out.printf("%-23s: %d%n", "Uptime (seconds)", secondsUp);
+        out.printf("%-23s: %d%n", "Uptime (seconds)", secondsUp);
 
         // Memory usage
         MemoryUsage heapUsage = probe.getHeapMemoryUsage();
         double memUsed = (double) heapUsage.getUsed() / (1024 * 1024);
         double memMax = (double) heapUsage.getMax() / (1024 * 1024);
-        System.out.printf("%-23s: %.2f / %.2f%n", "Heap Memory (MB)", memUsed, memMax);
+        out.printf("%-23s: %.2f / %.2f%n", "Heap Memory (MB)", memUsed, memMax);
         try
         {
-            System.out.printf("%-23s: %.2f%n", "Off Heap Memory (MB)", getOffHeapMemoryUsed(probe));
+            out.printf("%-23s: %.2f%n", "Off Heap Memory (MB)", getOffHeapMemoryUsed(probe));
         }
         catch (RuntimeException e)
         {
@@ -76,16 +79,16 @@ public class Info extends NodeToolCmd
         }
 
         // Data Center/Rack
-        System.out.printf("%-23s: %s%n", "Data Center", probe.getDataCenter());
-        System.out.printf("%-23s: %s%n", "Rack", probe.getRack());
+        out.printf("%-23s: %s%n", "Data Center", probe.getDataCenter());
+        out.printf("%-23s: %s%n", "Rack", probe.getRack());
 
         // Exceptions
-        System.out.printf("%-23s: %s%n", "Exceptions", probe.getStorageMetric("Exceptions"));
+        out.printf("%-23s: %s%n", "Exceptions", probe.getStorageMetric("Exceptions"));
 
         CacheServiceMBean cacheService = probe.getCacheServiceMBean();
 
         // Key Cache: Hits, Requests, RecentHitRate, SavePeriodInSeconds
-        System.out.printf("%-23s: entries %d, size %s, capacity %s, %d hits, %d requests, %.3f recent hit rate, %d save period in seconds%n",
+        out.printf("%-23s: entries %d, size %s, capacity %s, %d hits, %d requests, %.3f recent hit rate, %d save period in seconds%n",
                 "Key Cache",
                 probe.getCacheMetric("KeyCache", "Entries"),
                 FileUtils.stringifyFileSize((long) probe.getCacheMetric("KeyCache", "Size")),
@@ -96,7 +99,7 @@ public class Info extends NodeToolCmd
                 cacheService.getKeyCacheSavePeriodInSeconds());
 
         // Row Cache: Hits, Requests, RecentHitRate, SavePeriodInSeconds
-        System.out.printf("%-23s: entries %d, size %s, capacity %s, %d hits, %d requests, %.3f recent hit rate, %d save period in seconds%n",
+        out.printf("%-23s: entries %d, size %s, capacity %s, %d hits, %d requests, %.3f recent hit rate, %d save period in seconds%n",
                 "Row Cache",
                 probe.getCacheMetric("RowCache", "Entries"),
                 FileUtils.stringifyFileSize((long) probe.getCacheMetric("RowCache", "Size")),
@@ -107,7 +110,7 @@ public class Info extends NodeToolCmd
                 cacheService.getRowCacheSavePeriodInSeconds());
 
         // Counter Cache: Hits, Requests, RecentHitRate, SavePeriodInSeconds
-        System.out.printf("%-23s: entries %d, size %s, capacity %s, %d hits, %d requests, %.3f recent hit rate, %d save period in seconds%n",
+        out.printf("%-23s: entries %d, size %s, capacity %s, %d hits, %d requests, %.3f recent hit rate, %d save period in seconds%n",
                 "Counter Cache",
                 probe.getCacheMetric("CounterCache", "Entries"),
                 FileUtils.stringifyFileSize((long) probe.getCacheMetric("CounterCache", "Size")),
@@ -120,7 +123,7 @@ public class Info extends NodeToolCmd
         // Chunk Cache: Hits, Requests, RecentHitRate, SavePeriodInSeconds
         try
         {
-            System.out.printf("%-23s: entries %d, size %s, capacity %s, %d misses, %d requests, %.3f recent hit rate, %.3f %s miss latency%n",
+            out.printf("%-23s: entries %d, size %s, capacity %s, %d misses, %d requests, %.3f recent hit rate, %.3f %s miss latency%n",
                     "Chunk Cache",
                     probe.getCacheMetric("ChunkCache", "Entries"),
                     FileUtils.stringifyFileSize((long) probe.getCacheMetric("ChunkCache", "Size")),
@@ -139,8 +142,24 @@ public class Info extends NodeToolCmd
             // Chunk cache is not on.
         }
 
+        // network Cache: capacity, size
+        try
+        {
+            out.printf("%-23s: size %s, overflow size: %s, capacity %s%n", "Network Cache",
+                       FileUtils.stringifyFileSize((long) probe.getBufferPoolMetric("networking", "Size")),
+                       FileUtils.stringifyFileSize((long) probe.getBufferPoolMetric("networking", "OverflowSize")),
+                       FileUtils.stringifyFileSize((long) probe.getBufferPoolMetric("networking", "Capacity")));
+        }
+        catch (RuntimeException e)
+        {
+            if (!(e.getCause() instanceof InstanceNotFoundException))
+                throw e;
+
+            // network cache is not on.
+        }
+
         // Global table stats
-        System.out.printf("%-23s: %s%%%n", "Percent Repaired", probe.getColumnFamilyMetric(null, null, "PercentRepaired"));
+        out.printf("%-23s: %s%%%n", "Percent Repaired", probe.getColumnFamilyMetric(null, null, "PercentRepaired"));
 
         // check if node is already joined, before getting tokens, since it throws exception if not.
         if (probe.isJoined())
@@ -149,20 +168,25 @@ public class Info extends NodeToolCmd
             List<String> tokens = probe.getTokens();
             if (tokens.size() == 1 || this.tokens)
                 for (String token : tokens)
-                    System.out.printf("%-23s: %s%n", "Token", token);
+                    out.printf("%-23s: %s%n", "Token", token);
             else
-                System.out.printf("%-23s: (invoke with -T/--tokens to see all %d tokens)%n", "Token",
+                out.printf("%-23s: (invoke with -T/--tokens to see all %d tokens)%n", "Token",
                                   tokens.size());
         }
         else
         {
-            System.out.printf("%-23s: (node is not joined to the cluster)%n", "Token");
+            out.printf("%-23s: (node is not joined to the cluster)%n", "Token");
         }
+
+        out.printf("%-23s: %s%n", "Bootstrap state", probe.getStorageService().getBootstrapState());
+        out.printf("%-23s: %s%n", "Bootstrap failed", probe.getStorageService().isBootstrapFailed());
+        out.printf("%-23s: %s%n", "Decommissioning", probe.getStorageService().isDecommissioning());
+        out.printf("%-23s: %s%n", "Decommission failed", probe.getStorageService().isDecommissionFailed());
     }
 
     /**
-     * Returns the total off heap memory used in MB.
-     * @return the total off heap memory used in MB.
+     * Returns the total off heap memory used in MiB.
+     * @return the total off heap memory used in MiB.
      */
     private static double getOffHeapMemoryUsed(NodeProbe probe)
     {
@@ -174,7 +198,7 @@ public class Info extends NodeToolCmd
         {
             Entry<String, ColumnFamilyStoreMBean> entry = cfamilies.next();
             String keyspaceName = entry.getKey();
-            String cfName = entry.getValue().getColumnFamilyName();
+            String cfName = entry.getValue().getTableName();
 
             offHeapMemUsedInBytes += (Long) probe.getColumnFamilyMetric(keyspaceName, cfName, "MemtableOffHeapSize");
             offHeapMemUsedInBytes += (Long) probe.getColumnFamilyMetric(keyspaceName, cfName, "BloomFilterOffHeapMemoryUsed");

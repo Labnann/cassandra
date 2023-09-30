@@ -17,38 +17,51 @@
  */
 package org.apache.cassandra.db.commitlog;
 
-import java.io.*;
+import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.util.*;
+import java.nio.file.FileStore;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.TreeMap;
+import java.util.UUID;
+import java.util.concurrent.TimeUnit;
+import java.util.function.BiPredicate;
+import java.util.function.Function;
 import java.util.zip.CRC32;
 
 import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Preconditions;
 import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.config.Config;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.config.ParameterizedClass;
-import org.apache.cassandra.db.*;
-import org.apache.cassandra.exceptions.WriteTimeoutException;
+import org.apache.cassandra.db.Mutation;
+import org.apache.cassandra.exceptions.CDCWriteException;
 import org.apache.cassandra.io.FSWriteError;
 import org.apache.cassandra.io.compress.ICompressor;
 import org.apache.cassandra.io.util.BufferedDataOutputStreamPlus;
 import org.apache.cassandra.io.util.DataOutputBuffer;
 import org.apache.cassandra.io.util.DataOutputBufferFixed;
-import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.io.util.File;
+import org.apache.cassandra.io.util.PathUtils;
 import org.apache.cassandra.metrics.CommitLogMetrics;
 import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.schema.CompressionParams;
+import org.apache.cassandra.schema.TableId;
 import org.apache.cassandra.security.EncryptionContext;
 import org.apache.cassandra.service.StorageService;
-import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.JVMStabilityInspector;
 import org.apache.cassandra.utils.MBeanWrapper;
+import org.apache.cassandra.utils.concurrent.UncheckedInterruptedException;
 
 import static org.apache.cassandra.db.commitlog.CommitLogSegment.Allocation;
-import static org.apache.cassandra.db.commitlog.CommitLogSegment.CommitLogSegmentFileComparator;
 import static org.apache.cassandra.db.commitlog.CommitLogSegment.ENTRY_OVERHEAD_SIZE;
 import static org.apache.cassandra.utils.FBUtilities.updateChecksum;
 import static org.apache.cassandra.utils.FBUtilities.updateChecksumInt;
@@ -63,28 +76,32 @@ public class CommitLog implements CommitLogMBean
 
     public static final CommitLog instance = CommitLog.construct();
 
-    // we only permit records HALF the size of a commit log, to ensure we don't spin allocating many mostly
-    // empty segments when writing large records
-    final long MAX_MUTATION_SIZE = DatabaseDescriptor.getMaxMutationSize();
+    private static final BiPredicate<File, String> unmanagedFilesFilter = (dir, name) -> CommitLogDescriptor.isValid(name) && CommitLogSegment.shouldReplay(name);
 
     final public AbstractCommitLogSegmentManager segmentManager;
 
     public final CommitLogArchiver archiver;
-    final CommitLogMetrics metrics;
+    public final CommitLogMetrics metrics;
     final AbstractCommitLogService executor;
 
     volatile Configuration configuration;
+    private boolean started = false;
 
     private static CommitLog construct()
     {
-        CommitLog log = new CommitLog(CommitLogArchiver.construct());
-
+        CommitLog log = new CommitLog(CommitLogArchiver.construct(), DatabaseDescriptor.getCommitLogSegmentMgrProvider());
         MBeanWrapper.instance.registerMBean(log, "org.apache.cassandra.db:type=Commitlog");
-        return log.start();
+        return log;
     }
 
     @VisibleForTesting
     CommitLog(CommitLogArchiver archiver)
+    {
+        this(archiver, DatabaseDescriptor.getCommitLogSegmentMgrProvider());
+    }
+
+    @VisibleForTesting
+    CommitLog(CommitLogArchiver archiver, Function<CommitLog, AbstractCommitLogSegmentManager> segmentManagerProvider)
     {
         this.configuration = new Configuration(DatabaseDescriptor.getCommitLogCompression(),
                                                DatabaseDescriptor.getEncryptionContext());
@@ -93,23 +110,64 @@ public class CommitLog implements CommitLogMBean
         this.archiver = archiver;
         metrics = new CommitLogMetrics();
 
-        executor = DatabaseDescriptor.getCommitLogSync() == Config.CommitLogSync.batch
-                ? new BatchCommitLogService(this)
-                : new PeriodicCommitLogService(this);
+        switch (DatabaseDescriptor.getCommitLogSync())
+        {
+            case periodic:
+                executor = new PeriodicCommitLogService(this);
+                break;
+            case batch:
+                executor = new BatchCommitLogService(this);
+                break;
+            case group:
+                executor = new GroupCommitLogService(this);
+                break;
+            default:
+                throw new IllegalArgumentException("Unknown commitlog service type: " + DatabaseDescriptor.getCommitLogSync());
+        }
 
-        segmentManager = DatabaseDescriptor.isCDCEnabled()
-                         ? new CommitLogSegmentManagerCDC(this, DatabaseDescriptor.getCommitLogLocation())
-                         : new CommitLogSegmentManagerStandard(this, DatabaseDescriptor.getCommitLogLocation());
+        segmentManager = segmentManagerProvider.apply(this);
 
         // register metrics
         metrics.attach(executor, segmentManager);
     }
 
-    CommitLog start()
+    /**
+     * Tries to start the CommitLog if not already started.
+     */
+    synchronized public CommitLog start()
     {
-        segmentManager.start();
-        executor.start();
+        if (started)
+            return this;
+
+        try
+        {
+            segmentManager.start();
+            executor.start();
+            started = true;
+        } catch (Throwable t)
+        {
+            started = false;
+            throw t;
+        }
         return this;
+    }
+
+    public boolean isStarted()
+    {
+        return started;
+    }
+
+    public boolean hasFilesToReplay()
+    {
+        return getUnmanagedFiles().length > 0;
+    }
+
+    private File[] getUnmanagedFiles()
+    {
+        File[] files = new File(segmentManager.storageDirectory).tryList(unmanagedFilesFilter);
+        if (files == null)
+            return new File[0];
+        return files;
     }
 
     /**
@@ -120,22 +178,20 @@ public class CommitLog implements CommitLogMBean
      */
     public int recoverSegmentsOnDisk() throws IOException
     {
-        FilenameFilter unmanagedFilesFilter = (dir, name) -> CommitLogDescriptor.isValid(name) && CommitLogSegment.shouldReplay(name);
-
         // submit all files for this segment manager for archiving prior to recovery - CASSANDRA-6904
         // The files may have already been archived by normal CommitLog operation. This may cause errors in this
-        // archiving pass, which we should not treat as serious. 
-        for (File file : new File(segmentManager.storageDirectory).listFiles(unmanagedFilesFilter))
+        // archiving pass, which we should not treat as serious.
+        for (File file : getUnmanagedFiles())
         {
-            archiver.maybeArchive(file.getPath(), file.getName());
-            archiver.maybeWaitForArchiving(file.getName());
+            archiver.maybeArchive(file.path(), file.name());
+            archiver.maybeWaitForArchiving(file.name());
         }
 
         assert archiver.archivePending.isEmpty() : "Not all commit log archive tasks were completed before restore";
         archiver.maybeRestoreArchive();
 
         // List the files again as archiver may have added segments.
-        File[] files = new File(segmentManager.storageDirectory).listFiles(unmanagedFilesFilter);
+        File[] files = getUnmanagedFiles();
         int replayed = 0;
         if (files.length == 0)
         {
@@ -143,7 +199,7 @@ public class CommitLog implements CommitLogMBean
         }
         else
         {
-            Arrays.sort(files, new CommitLogSegmentFileComparator());
+            Arrays.sort(files, new CommitLogSegment.CommitLogSegmentFileComparator());
             logger.info("Replaying {}", StringUtils.join(files, ", "));
             replayed = recoverFiles(files);
             logger.info("Log replay complete, {} replayed mutations", replayed);
@@ -163,16 +219,21 @@ public class CommitLog implements CommitLogMBean
      */
     public int recoverFiles(File... clogs) throws IOException
     {
-        CommitLogReplayer replayer = CommitLogReplayer.construct(this);
+        CommitLogReplayer replayer = CommitLogReplayer.construct(this, getLocalHostId());
         replayer.replayFiles(clogs);
         return replayer.blockForWrites();
     }
 
     public void recoverPath(String path) throws IOException
     {
-        CommitLogReplayer replayer = CommitLogReplayer.construct(this);
+        CommitLogReplayer replayer = CommitLogReplayer.construct(this, getLocalHostId());
         replayer.replayPath(new File(path), false);
         replayer.blockForWrites();
+    }
+
+    private static UUID getLocalHostId()
+    {
+        return StorageService.instance.getLocalHostUUID();
     }
 
     /**
@@ -195,9 +256,9 @@ public class CommitLog implements CommitLogMBean
     /**
      * Flushes all dirty CFs, waiting for them to free and recycle any segments they were retaining
      */
-    public void forceRecycleAllSegments(Iterable<UUID> droppedCfs)
+    public void forceRecycleAllSegments(Collection<TableId> droppedTables)
     {
-        segmentManager.forceRecycleAll(droppedCfs);
+        segmentManager.forceRecycleAll(droppedTables);
     }
 
     /**
@@ -205,7 +266,7 @@ public class CommitLog implements CommitLogMBean
      */
     public void forceRecycleAllSegments()
     {
-        segmentManager.forceRecycleAll(Collections.<UUID>emptyList());
+        segmentManager.forceRecycleAll(Collections.emptyList());
     }
 
     /**
@@ -228,25 +289,19 @@ public class CommitLog implements CommitLogMBean
      * Add a Mutation to the commit log. If CDC is enabled, this can fail.
      *
      * @param mutation the Mutation to add to the log
-     * @throws WriteTimeoutException
+     * @throws CDCWriteException
      */
-    public CommitLogPosition add(Mutation mutation) throws WriteTimeoutException
+    public CommitLogPosition add(Mutation mutation) throws CDCWriteException
     {
         assert mutation != null;
+
+        mutation.validateSize(MessagingService.current_version, ENTRY_OVERHEAD_SIZE);
 
         try (DataOutputBuffer dob = DataOutputBuffer.scratchBuffer.get())
         {
             Mutation.serializer.serialize(mutation, dob, MessagingService.current_version);
             int size = dob.getLength();
-
             int totalSize = size + ENTRY_OVERHEAD_SIZE;
-            if (totalSize > MAX_MUTATION_SIZE)
-            {
-                throw new IllegalArgumentException(String.format("Mutation of %s is too large for the maximum size of %s",
-                                                                 FBUtilities.prettyPrintMemory(totalSize),
-                                                                 FBUtilities.prettyPrintMemory(MAX_MUTATION_SIZE)));
-            }
-
             Allocation alloc = segmentManager.allocate(mutation, totalSize);
 
             CRC32 checksum = new CRC32();
@@ -259,7 +314,7 @@ public class CommitLog implements CommitLogMBean
                 buffer.putInt((int) checksum.getValue());
 
                 // checksummed mutation
-                dos.write(dob.getData(), 0, size);
+                dos.write(dob.unsafeGetBufferAndFlip());
                 updateChecksum(checksum, buffer, buffer.position() - size, size);
                 buffer.putInt((int) checksum.getValue());
             }
@@ -285,13 +340,13 @@ public class CommitLog implements CommitLogMBean
      * Modifies the per-CF dirty cursors of any commit log segments for the column family according to the position
      * given. Discards any commit log segments that are no longer used.
      *
-     * @param cfId    the column family ID that was flushed
+     * @param id         the table that was flushed
      * @param lowerBound the lowest covered replay position of the flush
      * @param lowerBound the highest covered replay position of the flush
      */
-    public void discardCompletedSegments(final UUID cfId, final CommitLogPosition lowerBound, final CommitLogPosition upperBound)
+    public void discardCompletedSegments(final TableId id, final CommitLogPosition lowerBound, final CommitLogPosition upperBound)
     {
-        logger.trace("discard completed log segments for {}-{}, table {}", lowerBound, upperBound, cfId);
+        logger.trace("discard completed log segments for {}-{}, table {}", lowerBound, upperBound, id);
 
         // Go thru the active segment files, which are ordered oldest to newest, marking the
         // flushed CF as clean, until we reach the segment file containing the CommitLogPosition passed
@@ -300,7 +355,7 @@ public class CommitLog implements CommitLogMBean
         for (Iterator<CommitLogSegment> iter = segmentManager.getActiveSegments().iterator(); iter.hasNext();)
         {
             CommitLogSegment segment = iter.next();
-            segment.markClean(cfId, lowerBound, upperBound);
+            segment.markClean(id, lowerBound, upperBound);
 
             if (segment.isUnused())
             {
@@ -353,8 +408,9 @@ public class CommitLog implements CommitLogMBean
 
     public List<String> getActiveSegmentNames()
     {
-        List<String> segmentNames = new ArrayList<>();
-        for (CommitLogSegment seg : segmentManager.getActiveSegments())
+        Collection<CommitLogSegment> segments = segmentManager.getActiveSegments();
+        List<String> segmentNames = new ArrayList<>(segments.size());
+        for (CommitLogSegment seg : segments)
             segmentNames.add(seg.getName());
         return segmentNames;
     }
@@ -388,22 +444,70 @@ public class CommitLog implements CommitLogMBean
         return segmentRatios;
     }
 
+    @Override
+    public boolean getCDCBlockWrites()
+    {
+        return DatabaseDescriptor.getCDCBlockWrites();
+    }
+
+    @Override
+    public void setCDCBlockWrites(boolean val)
+    {
+        ensureCDCEnabled("Unable to set block_writes.");
+        boolean oldVal = DatabaseDescriptor.getCDCBlockWrites();
+        CommitLogSegment currentSegment = segmentManager.allocatingFrom();
+        // Update the current segment CDC state to PERMITTED if block_writes is disabled now, and it was in FORBIDDEN state
+        if (!val && currentSegment.getCDCState() == CommitLogSegment.CDCState.FORBIDDEN)
+            currentSegment.setCDCState(CommitLogSegment.CDCState.PERMITTED);
+        DatabaseDescriptor.setCDCBlockWrites(val);
+        logger.info("Updated CDC block_writes from {} to {}", oldVal, val);
+    }
+
+
+    @Override
+    public boolean isCDCOnRepairEnabled()
+    {
+        return DatabaseDescriptor.isCDCOnRepairEnabled();
+    }
+
+    @Override
+    public void setCDCOnRepairEnabled(boolean value)
+    {
+        ensureCDCEnabled("Unable to set cdc_on_repair_enabled.");
+        DatabaseDescriptor.setCDCOnRepairEnabled(value);
+        logger.info("Set cdc_on_repair_enabled to {}", value);
+    }
+
+    private void ensureCDCEnabled(String hint)
+    {
+        Preconditions.checkState(DatabaseDescriptor.isCDCEnabled(), "CDC is not enabled. %s", hint);
+        Preconditions.checkState(segmentManager instanceof CommitLogSegmentManagerCDC,
+                                 "CDC is enabled but we have the wrong CommitLogSegmentManager type: %s. " +
+                                 "Please report this as bug.", segmentManager.getClass().getName());
+    }
+
     /**
      * Shuts down the threads used by the commit log, blocking until completion.
+     * TODO this should accept a timeout, and throw TimeoutException
      */
-    public void shutdownBlocking() throws InterruptedException
+    synchronized public void shutdownBlocking() throws InterruptedException
     {
+        if (!started)
+            return;
+
+        started = false;
         executor.shutdown();
         executor.awaitTermination();
         segmentManager.shutdown();
-        segmentManager.awaitTermination();
+        segmentManager.awaitTermination(1L, TimeUnit.MINUTES);
     }
 
     /**
      * FOR TESTING PURPOSES
      * @return the number of files recovered
      */
-    public int resetUnsafe(boolean deleteSegments) throws IOException
+    @VisibleForTesting
+    synchronized public int resetUnsafe(boolean deleteSegments) throws IOException
     {
         stopUnsafe(deleteSegments);
         resetConfiguration();
@@ -413,16 +517,23 @@ public class CommitLog implements CommitLogMBean
     /**
      * FOR TESTING PURPOSES.
      */
-    public void resetConfiguration()
+    @VisibleForTesting
+    synchronized public void resetConfiguration()
     {
         configuration = new Configuration(DatabaseDescriptor.getCommitLogCompression(),
                                           DatabaseDescriptor.getEncryptionContext());
     }
 
     /**
+     * FOR TESTING PURPOSES
      */
-    public void stopUnsafe(boolean deleteSegments)
+    @VisibleForTesting
+    synchronized public void stopUnsafe(boolean deleteSegments)
     {
+        if (!started)
+            return;
+
+        started = false;
         executor.shutdown();
         try
         {
@@ -430,22 +541,28 @@ public class CommitLog implements CommitLogMBean
         }
         catch (InterruptedException e)
         {
-            throw new RuntimeException(e);
+            throw new UncheckedInterruptedException(e);
         }
         segmentManager.stopUnsafe(deleteSegments);
         CommitLogSegment.resetReplayLimit();
         if (DatabaseDescriptor.isCDCEnabled() && deleteSegments)
-            for (File f : new File(DatabaseDescriptor.getCDCLogLocation()).listFiles())
-                FileUtils.deleteWithConfirm(f);
-
+            for (File f : new File(DatabaseDescriptor.getCDCLogLocation()).tryList())
+                f.delete();
     }
 
     /**
      * FOR TESTING PURPOSES
      */
-    public int restartUnsafe() throws IOException
+    @VisibleForTesting
+    synchronized public int restartUnsafe() throws IOException
     {
+        started = false;
         return start().recoverSegmentsOnDisk();
+    }
+
+    public static long freeDiskSpace()
+    {
+        return PathUtils.tryGetSpace(new File(DatabaseDescriptor.getCommitLogLocation()).toPath(), FileStore::getTotalSpace);
     }
 
     @VisibleForTesting
@@ -460,14 +577,34 @@ public class CommitLog implements CommitLogMBean
                 StorageService.instance.stopTransports();
                 //$FALL-THROUGH$
             case stop_commit:
-                logger.error(String.format("%s. Commit disk failure policy is %s; terminating thread", message, DatabaseDescriptor.getCommitFailurePolicy()), t);
+                String errorMsg = String.format("%s. Commit disk failure policy is %s; terminating thread.", message, DatabaseDescriptor.getCommitFailurePolicy());
+                logger.error(addAdditionalInformationIfPossible(errorMsg), t);
                 return false;
             case ignore:
-                logger.error(message, t);
+                logger.error(addAdditionalInformationIfPossible(message), t);
                 return true;
             default:
                 throw new AssertionError(DatabaseDescriptor.getCommitFailurePolicy());
         }
+    }
+
+    /**
+     * Add additional information to the error message if the commit directory does not have enough free space.
+     *
+     * @param msg the original error message
+     * @return the message with additional information if possible
+     */
+    private static String addAdditionalInformationIfPossible(String msg)
+    {
+        long unallocatedSpace = freeDiskSpace();
+        int segmentSize = DatabaseDescriptor.getCommitLogSegmentSize();
+
+        if (unallocatedSpace < segmentSize)
+        {
+            return String.format("%s. %d bytes required for next commitlog segment but only %d bytes available. Check %s to see if not enough free space is the reason for this error.",
+                                 msg, segmentSize, unallocatedSpace, DatabaseDescriptor.getCommitLogLocation());
+        }
+        return msg;
     }
 
     public static final class Configuration
@@ -509,7 +646,7 @@ public class CommitLog implements CommitLogMBean
          */
         public boolean useEncryption()
         {
-            return encryptionContext.isEnabled();
+            return encryptionContext != null && encryptionContext.isEnabled();
         }
 
         /**

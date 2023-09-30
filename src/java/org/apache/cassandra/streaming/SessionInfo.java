@@ -18,7 +18,7 @@
 package org.apache.cassandra.streaming;
 
 import java.io.Serializable;
-import java.net.InetAddress;
+import java.net.InetSocketAddress;
 import java.util.Collection;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -27,14 +27,16 @@ import com.google.common.base.Predicate;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterables;
 
+import org.apache.cassandra.utils.FBUtilities;
+
 /**
  * Stream session info.
  */
 public final class SessionInfo implements Serializable
 {
-    public final InetAddress peer;
+    public final InetSocketAddress peer;
     public final int sessionIndex;
-    public final InetAddress connecting;
+    public final InetSocketAddress connecting;
     /** Immutable collection of receiving summaries */
     public final Collection<StreamSummary> receivingSummaries;
     /** Immutable collection of sending summaries*/
@@ -42,24 +44,31 @@ public final class SessionInfo implements Serializable
     /** Current session state */
     public final StreamSession.State state;
 
-    private final Map<String, ProgressInfo> receivingFiles;
-    private final Map<String, ProgressInfo> sendingFiles;
+    private final Map<String, ProgressInfo> receivingFiles = new ConcurrentHashMap<>();
+    private final Map<String, ProgressInfo> sendingFiles = new ConcurrentHashMap<>();
 
-    public SessionInfo(InetAddress peer,
+    public final String failureReason;
+
+    public SessionInfo(InetSocketAddress peer,
                        int sessionIndex,
-                       InetAddress connecting,
+                       InetSocketAddress connecting,
                        Collection<StreamSummary> receivingSummaries,
                        Collection<StreamSummary> sendingSummaries,
-                       StreamSession.State state)
+                       StreamSession.State state,
+                       String failureReason)
     {
         this.peer = peer;
         this.sessionIndex = sessionIndex;
         this.connecting = connecting;
         this.receivingSummaries = ImmutableSet.copyOf(receivingSummaries);
         this.sendingSummaries = ImmutableSet.copyOf(sendingSummaries);
-        this.receivingFiles = new ConcurrentHashMap<>();
-        this.sendingFiles = new ConcurrentHashMap<>();
         this.state = state;
+        this.failureReason =  failureReason;
+    }
+
+    public SessionInfo(SessionInfo other)
+    {
+        this(other.peer, other.sessionIndex, other.connecting, other.receivingSummaries, other.sendingSummaries, other.state, other.failureReason);
     }
 
     public boolean isFailed()
@@ -67,8 +76,13 @@ public final class SessionInfo implements Serializable
         return state == StreamSession.State.FAILED;
     }
 
+    public boolean isAborted()
+    {
+        return state == StreamSession.State.ABORTED;
+    }
+
     /**
-     * Update progress of receiving/sending file.
+     * Update progress of receiving/sending stream.
      *
      * @param newProgress new progress info
      */
@@ -155,11 +169,11 @@ public final class SessionInfo implements Serializable
         return getTotalSizes(sendingSummaries);
     }
 
-    private long getTotalSizeInProgress(Collection<ProgressInfo> files)
+    private long getTotalSizeInProgress(Collection<ProgressInfo> streams)
     {
         long total = 0;
-        for (ProgressInfo file : files)
-            total += file.currentBytes;
+        for (ProgressInfo stream : streams)
+            total += stream.currentBytes;
         return total;
     }
 
@@ -189,5 +203,15 @@ public final class SessionInfo implements Serializable
             }
         });
         return Iterables.size(completed);
+    }
+
+    public SessionSummary createSummary()
+    {
+        return new SessionSummary(FBUtilities.getBroadcastAddressAndPort(), peer, receivingSummaries, sendingSummaries);
+    }
+
+    public String getFailureReason()
+    {
+        return failureReason;
     }
 }

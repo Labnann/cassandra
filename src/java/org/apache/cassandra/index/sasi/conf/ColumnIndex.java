@@ -28,13 +28,12 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import com.google.common.annotations.VisibleForTesting;
 
-import org.apache.cassandra.config.ColumnDefinition;
 import org.apache.cassandra.cql3.Operator;
 import org.apache.cassandra.db.DecoratedKey;
-import org.apache.cassandra.db.Memtable;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.AsciiType;
 import org.apache.cassandra.db.marshal.UTF8Type;
+import org.apache.cassandra.db.memtable.Memtable;
 import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.index.sasi.analyzer.AbstractAnalyzer;
@@ -47,7 +46,9 @@ import org.apache.cassandra.index.sasi.plan.Expression.Op;
 import org.apache.cassandra.index.sasi.utils.RangeIterator;
 import org.apache.cassandra.index.sasi.utils.RangeUnionIterator;
 import org.apache.cassandra.io.sstable.Component;
+import org.apache.cassandra.io.sstable.format.SSTableFormat.Components;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.IndexMetadata;
 import org.apache.cassandra.utils.FBUtilities;
 
@@ -57,7 +58,7 @@ public class ColumnIndex
 
     private final AbstractType<?> keyValidator;
 
-    private final ColumnDefinition column;
+    private final ColumnMetadata column;
     private final Optional<IndexMetadata> config;
 
     private final AtomicReference<IndexMemtable> memtable;
@@ -70,7 +71,7 @@ public class ColumnIndex
 
     private final boolean isTokenized;
 
-    public ColumnIndex(AbstractType<?> keyValidator, ColumnDefinition column, IndexMetadata metadata)
+    public ColumnIndex(AbstractType<?> keyValidator, ColumnMetadata column, IndexMetadata metadata)
     {
         this.keyValidator = keyValidator;
         this.column = column;
@@ -78,7 +79,7 @@ public class ColumnIndex
         this.mode = IndexMode.getMode(column, config);
         this.memtable = new AtomicReference<>(new IndexMemtable(this));
         this.tracker = new DataTracker(keyValidator, this);
-        this.component = new Component(Component.Type.SECONDARY_INDEX, String.format(FILE_NAME_FORMAT, getIndexName()));
+        this.component = Components.Types.SECONDARY_INDEX.createComponent(String.format(FILE_NAME_FORMAT, getIndexName()));
         this.isTokenized = getAnalyzer().isTokenizing();
     }
 
@@ -147,7 +148,7 @@ public class ColumnIndex
         tracker.update(oldSSTables, newSSTables);
     }
 
-    public ColumnDefinition getDefinition()
+    public ColumnMetadata getDefinition()
     {
         return column;
     }
@@ -223,13 +224,13 @@ public class ColumnIndex
 
         Op operator = Op.valueOf(op);
         return !(isTokenized && operator == Op.EQ) // EQ is only applicable to non-tokenized indexes
+               && operator != Op.IN // IN operator is not supported
                && !(isTokenized && mode.mode == OnDiskIndexBuilder.Mode.CONTAINS && operator == Op.PREFIX) // PREFIX not supported on tokenized CONTAINS mode indexes
                && !(isLiteral() && operator == Op.RANGE) // RANGE only applicable to indexes non-literal indexes
                && mode.supports(operator); // for all other cases let's refer to index itself
-
     }
 
-    public static ByteBuffer getValueOf(ColumnDefinition column, Row row, int nowInSecs)
+    public static ByteBuffer getValueOf(ColumnMetadata column, Row row, long nowInSecs)
     {
         if (row == null)
             return null;
@@ -241,7 +242,7 @@ public class ColumnIndex
                 if (row.isStatic())
                     return null;
 
-                return row.clustering().get(column.position());
+                return row.clustering().bufferAt(column.position());
 
             // treat static cell retrieval the same was as regular
             // only if row kind is STATIC otherwise return null
@@ -249,8 +250,8 @@ public class ColumnIndex
                 if (!row.isStatic())
                     return null;
             case REGULAR:
-                Cell cell = row.getCell(column);
-                return cell == null || !cell.isLive(nowInSecs) ? null : cell.value();
+                Cell<?> cell = row.getCell(column);
+                return cell == null || !cell.isLive(nowInSecs) ? null : cell.buffer();
 
             default:
                 return null;

@@ -18,8 +18,8 @@
 package org.apache.cassandra.tools.nodetool;
 
 import static com.google.common.base.Preconditions.checkArgument;
-import io.airlift.command.Arguments;
-import io.airlift.command.Command;
+import io.airlift.airline.Arguments;
+import io.airlift.airline.Command;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -42,8 +42,8 @@ public class GetCompactionThreshold extends NodeToolCmd
         String cf = args.get(1);
 
         ColumnFamilyStoreMBean cfsProxy = probe.getCfsProxy(ks, cf);
-        System.out.println("Current compaction thresholds for " + ks + "/" + cf + ": \n" +
-                " min = " + cfsProxy.getMinimumCompactionThreshold() + ", " +
-                " max = " + cfsProxy.getMaximumCompactionThreshold());
+        probe.output().out.println("Current compaction thresholds for " + ks + "/" + cf + ": \n" +
+                            " min = " + cfsProxy.getMinimumCompactionThreshold() + ", " +
+                            " max = " + cfsProxy.getMaximumCompactionThreshold());
     }
 }

@@ -17,39 +17,42 @@
  */
 package org.apache.cassandra.utils;
 
-import java.io.File;
 import java.io.FileDescriptor;
-import java.io.FileInputStream;
 import java.io.IOException;
 import java.lang.reflect.Field;
 import java.nio.channels.FileChannel;
 import java.util.concurrent.TimeUnit;
 
+import org.apache.cassandra.io.util.File;
+import org.apache.cassandra.io.util.FileInputStreamPlus;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.sun.jna.LastErrorException;
-import sun.nio.ch.FileChannelImpl;
 
+import org.apache.cassandra.io.FSWriteError;
+
+import static org.apache.cassandra.config.CassandraRelevantProperties.IGNORE_MISSING_NATIVE_FILE_HINTS;
+import static org.apache.cassandra.config.CassandraRelevantProperties.OS_ARCH;
+import static org.apache.cassandra.config.CassandraRelevantProperties.OS_NAME;
 import static org.apache.cassandra.utils.NativeLibrary.OSType.LINUX;
 import static org.apache.cassandra.utils.NativeLibrary.OSType.MAC;
-import static org.apache.cassandra.utils.NativeLibrary.OSType.WINDOWS;
 import static org.apache.cassandra.utils.NativeLibrary.OSType.AIX;
 
 public final class NativeLibrary
 {
     private static final Logger logger = LoggerFactory.getLogger(NativeLibrary.class);
+    private static final boolean REQUIRE = !IGNORE_MISSING_NATIVE_FILE_HINTS.getBoolean();
 
     public enum OSType
     {
         LINUX,
         MAC,
-        WINDOWS,
         AIX,
         OTHER;
     }
 
-    private static final OSType osType;
+    public static final OSType osType;
 
     private static final int MCL_CURRENT;
     private static final int MCL_FUTURE;
@@ -78,7 +81,14 @@ public final class NativeLibrary
     static
     {
         FILE_DESCRIPTOR_FD_FIELD = FBUtilities.getProtectedField(FileDescriptor.class, "fd");
-        FILE_CHANNEL_FD_FIELD = FBUtilities.getProtectedField(FileChannelImpl.class, "fd");
+        try
+        {
+            FILE_CHANNEL_FD_FIELD = FBUtilities.getProtectedField(Class.forName("sun.nio.ch.FileChannelImpl"), "fd");
+        }
+        catch (ClassNotFoundException e)
+        {
+            throw new RuntimeException(e);
+        }
 
         // detect the OS type the JVM is running on and then set the CLibraryWrapper
         // instance to a compatable implementation of CLibraryWrapper for that OS type
@@ -86,14 +96,13 @@ public final class NativeLibrary
         switch (osType)
         {
             case MAC: wrappedLibrary = new NativeLibraryDarwin(); break;
-            case WINDOWS: wrappedLibrary = new NativeLibraryWindows(); break;
             case LINUX:
             case AIX:
             case OTHER:
             default: wrappedLibrary = new NativeLibraryLinux();
         }
 
-        if (System.getProperty("os.arch").toLowerCase().contains("ppc"))
+        if (OS_ARCH.getString().toLowerCase().contains("ppc"))
         {
             if (osType == LINUX)
             {
@@ -125,12 +134,14 @@ public final class NativeLibrary
      */
     private static OSType getOsType()
     {
-        String osName = System.getProperty("os.name").toLowerCase();
-        if (osName.contains("mac"))
+        String osName = OS_NAME.getString().toLowerCase();
+        if  (osName.contains("linux"))
+            return LINUX;
+        else if (osName.contains("mac"))
             return MAC;
-        else if (osName.contains("windows"))
-            return WINDOWS;
-        else if (osName.contains("aix"))
+
+        logger.warn("the current operating system, {}, is unsupported by Cassandra", osName);
+        if (osName.contains("aix"))
             return AIX;
         else
             // fall back to the Linux impl for all unknown OS types until otherwise implicitly supported as needed
@@ -146,7 +157,8 @@ public final class NativeLibrary
         }
         catch (NoSuchMethodError x)
         {
-            logger.warn("Obsolete version of JNA present; unable to read errno. Upgrade to JNA 3.2.7 or later");
+            if (REQUIRE)
+                logger.warn("Obsolete version of JNA present; unable to read errno. Upgrade to JNA 3.2.7 or later");
             return 0;
         }
     }
@@ -186,7 +198,7 @@ public final class NativeLibrary
             {
                 logger.warn("Unable to lock JVM memory (ENOMEM)."
                         + " This can result in part of the JVM being swapped out, especially with mmapped I/O enabled."
-                        + " Increase RLIMIT_MEMLOCK or run Cassandra as root.");
+                        + " Increase RLIMIT_MEMLOCK.");
             }
             else if (osType != MAC)
             {
@@ -202,7 +214,7 @@ public final class NativeLibrary
         if (!f.exists())
             return;
 
-        try (FileInputStream fis = new FileInputStream(f))
+        try (FileInputStreamPlus fis = new FileInputStreamPlus(f))
         {
             trySkipCache(getfd(fis.getChannel()), offset, len, path);
         }
@@ -278,7 +290,8 @@ public final class NativeLibrary
             if (!(e instanceof LastErrorException))
                 throw e;
 
-            logger.warn("fcntl({}, {}, {}) failed, errno ({}).", fd, command, flags, errno(e));
+            if (REQUIRE)
+                logger.warn("fcntl({}, {}, {}) failed, errno ({}).", fd, command, flags, errno(e));
         }
 
         return result;
@@ -301,7 +314,8 @@ public final class NativeLibrary
             if (!(e instanceof LastErrorException))
                 throw e;
 
-            logger.warn("open({}, O_RDONLY) failed, errno ({}).", path, errno(e));
+            if (REQUIRE)
+                logger.warn("open({}, O_RDONLY) failed, errno ({}).", path, errno(e));
         }
 
         return fd;
@@ -325,7 +339,12 @@ public final class NativeLibrary
             if (!(e instanceof LastErrorException))
                 throw e;
 
-            logger.warn("fsync({}) failed, errorno ({}) {}", fd, errno(e), e);
+            if (REQUIRE)
+            {
+                String errMsg = String.format("fsync(%s) failed, errno (%s) %s", fd, errno(e), e.getMessage());
+                logger.warn(errMsg);
+                throw new FSWriteError(e, errMsg);
+            }
         }
     }
 
@@ -347,7 +366,12 @@ public final class NativeLibrary
             if (!(e instanceof LastErrorException))
                 throw e;
 
-            logger.warn("close({}) failed, errno ({}).", fd, errno(e));
+            if (REQUIRE)
+            {
+                String errMsg = String.format("close(%d) failed, errno (%d).", fd, errno(e));
+                logger.warn(errMsg);
+                throw new FSWriteError(e, errMsg);
+            }
         }
     }
 
@@ -359,7 +383,8 @@ public final class NativeLibrary
         }
         catch (IllegalArgumentException|IllegalAccessException e)
         {
-            logger.warn("Unable to read fd field from FileChannel");
+            if (REQUIRE)
+                logger.warn("Unable to read fd field from FileChannel", e);
         }
         return -1;
     }
@@ -377,8 +402,11 @@ public final class NativeLibrary
         }
         catch (Exception e)
         {
-            JVMStabilityInspector.inspectThrowable(e);
-            logger.warn("Unable to read fd field from FileDescriptor");
+            if (REQUIRE)
+            {
+                JVMStabilityInspector.inspectThrowable(e);
+                logger.warn("Unable to read fd field from FileDescriptor", e);
+            }
         }
 
         return -1;
@@ -393,9 +421,14 @@ public final class NativeLibrary
         {
             return wrappedLibrary.callGetpid();
         }
+        catch (UnsatisfiedLinkError e)
+        {
+            // if JNA is unavailable just skipping
+        }
         catch (Exception e)
         {
-            logger.info("Failed to get PID from JNA", e);
+            if (REQUIRE)
+                logger.info("Failed to get PID from JNA", e);
         }
 
         return -1;

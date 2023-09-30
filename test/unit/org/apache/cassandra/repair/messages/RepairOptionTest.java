@@ -25,16 +25,13 @@ import java.util.Set;
 
 import org.junit.Test;
 
-import com.google.common.collect.ImmutableMap;
-
-import org.apache.cassandra.config.Config;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.dht.IPartitioner;
 import org.apache.cassandra.dht.Murmur3Partitioner;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.repair.RepairParallelism;
-import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.streaming.PreviewKind;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -53,11 +50,7 @@ public class RepairOptionTest
 
         // parse with empty options
         RepairOption option = RepairOption.parse(new HashMap<String, String>(), partitioner);
-
-        if (FBUtilities.isWindows && (DatabaseDescriptor.getDiskAccessMode() != Config.DiskAccessMode.standard || DatabaseDescriptor.getIndexAccessMode() != Config.DiskAccessMode.standard))
-            assertTrue(option.getParallelism() == RepairParallelism.PARALLEL);
-        else
-            assertTrue(option.getParallelism() == RepairParallelism.SEQUENTIAL);
+        assertTrue(option.getParallelism() == RepairParallelism.SEQUENTIAL);
 
         assertFalse(option.isPrimaryRange());
         assertFalse(option.isIncremental());
@@ -149,14 +142,83 @@ public class RepairOptionTest
     }
 
     @Test
-    public void testIncrementalRepairWithSubrangesIsNotGlobal() throws Exception
+    public void testForceOption() throws Exception
     {
-        RepairOption ro = RepairOption.parse(ImmutableMap.of(RepairOption.INCREMENTAL_KEY, "true", RepairOption.RANGES_KEY, "41:42"),
-                           Murmur3Partitioner.instance);
-        assertFalse(ro.isGlobal());
-        ro = RepairOption.parse(ImmutableMap.of(RepairOption.INCREMENTAL_KEY, "true", RepairOption.RANGES_KEY, ""),
-                Murmur3Partitioner.instance);
-        assertTrue(ro.isGlobal());
+        RepairOption option;
+        Map<String, String> options = new HashMap<>();
+
+        // default value
+        option = RepairOption.parse(options, Murmur3Partitioner.instance);
+        assertFalse(option.isForcedRepair());
+
+        // explicit true
+        options.put(RepairOption.FORCE_REPAIR_KEY, "true");
+        option = RepairOption.parse(options, Murmur3Partitioner.instance);
+        assertTrue(option.isForcedRepair());
+
+        // explicit false
+        options.put(RepairOption.FORCE_REPAIR_KEY, "false");
+        option = RepairOption.parse(options, Murmur3Partitioner.instance);
+        assertFalse(option.isForcedRepair());
+    }
+
+    @Test
+    public void testOptimiseStreams()
+    {
+        boolean optFull = DatabaseDescriptor.autoOptimiseFullRepairStreams();
+        boolean optInc = DatabaseDescriptor.autoOptimiseIncRepairStreams();
+        boolean optPreview = DatabaseDescriptor.autoOptimisePreviewRepairStreams();
+        try
+        {
+            for (PreviewKind previewKind : PreviewKind.values())
+                for (boolean inc : new boolean[] {true, false})
+                    assertOptimise(previewKind, inc);
+        }
+        finally
+        {
+            setOptimise(optFull, optInc, optPreview);
+        }
+    }
+
+    private void assertHelper(Map<String, String> options, boolean full, boolean inc, boolean preview, boolean expected)
+    {
+        setOptimise(full, inc, preview);
+        assertEquals(expected, RepairOption.parse(options, Murmur3Partitioner.instance).optimiseStreams());
+    }
+
+    private void setOptimise(boolean full, boolean inc, boolean preview)
+    {
+        DatabaseDescriptor.setAutoOptimiseFullRepairStreams(full);
+        DatabaseDescriptor.setAutoOptimiseIncRepairStreams(inc);
+        DatabaseDescriptor.setAutoOptimisePreviewRepairStreams(preview);
+    }
+
+    private void assertOptimise(PreviewKind previewKind, boolean incremental)
+    {
+        Map<String, String> options = new HashMap<>();
+        options.put(RepairOption.PREVIEW, previewKind.toString());
+        options.put(RepairOption.INCREMENTAL_KEY, Boolean.toString(incremental));
+        for (boolean a : new boolean[]{ true, false })
+        {
+            for (boolean b : new boolean[]{ true, false })
+            {
+                if (previewKind.isPreview())
+                {
+                    assertHelper(options, a, b, true, true);
+                    assertHelper(options, a, b, false, false);
+                }
+                else if (incremental)
+                {
+                    assertHelper(options, a, true, b, true);
+                    assertHelper(options, a, false, b, false);
+                }
+                else
+                {
+                    assertHelper(options, true, a, b, true);
+                    assertHelper(options, false, a, b, false);
+                }
+            }
+        }
     }
 
     private void assertParseThrowsIllegalArgumentExceptionWithMessage(Map<String, String> optionsToParse, String expectedErrorMessage)

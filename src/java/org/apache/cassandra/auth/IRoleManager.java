@@ -17,8 +17,10 @@
  */
 package org.apache.cassandra.auth;
 
+import java.util.Collections;
 import java.util.Map;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.exceptions.RequestExecutionException;
@@ -30,7 +32,7 @@ import org.apache.cassandra.exceptions.RequestValidationException;
  * alteration and the granting and revoking of roles to other
  * roles.
  */
-public interface IRoleManager
+public interface IRoleManager extends AuthCache.BulkLoader<RoleResource, Set<Role>>
 {
 
     /**
@@ -40,7 +42,7 @@ public interface IRoleManager
      */
     public enum Option
     {
-        SUPERUSER, PASSWORD, LOGIN, OPTIONS
+        SUPERUSER, PASSWORD, LOGIN, OPTIONS, HASHED_PASSWORD
     }
 
     /**
@@ -135,6 +137,23 @@ public interface IRoleManager
     Set<RoleResource> getRoles(RoleResource grantee, boolean includeInherited) throws RequestValidationException, RequestExecutionException;
 
     /**
+     * Used to retrieve detailed role info on the full set of roles granted to a grantee.
+     * This method was not part of the V1 IRoleManager API, so a default impl is supplied which uses the V1
+     * methods to retrieve the detailed role info for the grantee. This is essentially what clients of this interface
+     * would have to do themselves. Implementations can provide optimized versions of this method where the details
+     * can be retrieved more efficiently.
+     *
+     * @param grantee identifies the role whose granted roles are retrieved
+     * @return A set of Role objects detailing the roles granted to the grantee, either directly or through inheritance.
+     */
+     default Set<Role> getRoleDetails(RoleResource grantee)
+     {
+         return getRoles(grantee, true).stream()
+                                       .map(roleResource -> Roles.fromRoleResource(roleResource, this))
+                                       .collect(Collectors.toSet());
+     }
+
+    /**
      * Called during the execution of an unqualified LIST ROLES query.
      * Returns the total set of distinct roles in the system.
      *
@@ -208,4 +227,59 @@ public interface IRoleManager
      * For example, use this method to create any required keyspaces/column families.
      */
     void setup();
+
+    /**
+     * Each valid identity is associated with a role in the identity_to_role table, this method returns role
+     * of a given identity
+     *
+     * @param identity identity whose role to be retrieved
+     * @return role of the given identity
+     */
+    default String roleForIdentity(String identity)
+    {
+        return null;
+    }
+
+    /**
+     * Returns all the authorized identities from the identity_to_role table
+     *
+     * @return Map of identity -> roles
+     */
+    default Map<String, String> authorizedIdentities()
+    {
+        return Collections.emptyMap();
+    }
+
+    /**
+     * Adds a row (identity, role) to the identity_to_role table
+     *
+     * @param identity identity to be added
+     * @param role role that is associated with the identity
+     */
+    default void addIdentity(String identity, String role)
+    {
+    }
+
+    /**
+     * Returns if an identity exists in the identity_to_role
+     *
+     * @param identity identity whose existence to verify
+     * @return
+     */
+    default boolean isExistingIdentity(String identity)
+    {
+        return false;
+    }
+
+    /**
+     * Called on the execution of DROP IDENTITY statement for removing a given identity from the identity_role table.
+     * This implies we want to revoke the access for the given identity.
+     *
+     * @param identity identity that has to be removed from the table
+     */
+    default void dropIdentity(String identity)
+    {
+
+    }
+
 }

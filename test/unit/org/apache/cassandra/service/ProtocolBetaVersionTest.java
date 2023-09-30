@@ -25,9 +25,9 @@ import org.apache.cassandra.cql3.*;
 import org.apache.cassandra.transport.*;
 import org.apache.cassandra.transport.messages.*;
 
-import static junit.framework.Assert.assertEquals;
-import static junit.framework.Assert.assertTrue;
-import static junit.framework.Assert.fail;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 public class ProtocolBetaVersionTest extends CQLTester
 {
@@ -35,7 +35,7 @@ public class ProtocolBetaVersionTest extends CQLTester
     public static void setUp()
     {
         requireNetwork();
-        DatabaseDescriptor.setBatchSizeWarnThresholdInKB(1);
+        DatabaseDescriptor.setBatchSizeWarnThresholdInKiB(1);
     }
 
     private ProtocolVersion getBetaVersion()
@@ -68,7 +68,7 @@ public class ProtocolBetaVersionTest extends CQLTester
         createTable("CREATE TABLE %s (pk int PRIMARY KEY, v int)");
         assertTrue(betaVersion.isBeta()); // change to another beta version or remove test if no beta version
 
-        try (SimpleClient client = new SimpleClient(nativeAddr.getHostAddress(), nativePort, betaVersion, true, new EncryptionOptions.ClientEncryptionOptions()))
+        try (SimpleClient client = new SimpleClient(nativeAddr.getHostAddress(), nativePort, betaVersion, true, new EncryptionOptions()))
         {
             client.connect(false);
             for (int i = 0; i < 10; i++)
@@ -103,14 +103,14 @@ public class ProtocolBetaVersionTest extends CQLTester
         }
 
         assertTrue(betaVersion.isBeta()); // change to another beta version or remove test if no beta version
-        try (SimpleClient client = new SimpleClient(nativeAddr.getHostAddress(), nativePort, betaVersion, false, new EncryptionOptions.ClientEncryptionOptions()))
+        try (SimpleClient client = new SimpleClient(nativeAddr.getHostAddress(), nativePort, betaVersion, false, new EncryptionOptions()))
         {
             client.connect(false);
             fail("Exception should have been thrown");
         }
         catch (Exception e)
         {
-            assertEquals("Beta version of server used (5/v5-beta), but USE_BETA flag is not set",
+            assertEquals("Beta version of server used (6/v6-beta), but USE_BETA flag is not set",
                          e.getMessage());
         }
     }

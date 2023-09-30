@@ -17,6 +17,9 @@
  */
 package org.apache.cassandra.cql3;
 
+import java.util.Calendar;
+import java.util.Locale;
+import java.util.TimeZone;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -24,8 +27,12 @@ import com.google.common.base.Objects;
 
 import org.apache.cassandra.serializers.MarshalException;
 
+import static org.apache.cassandra.cql3.statements.RequestValidations.checkFalse;
 import static org.apache.cassandra.cql3.statements.RequestValidations.checkTrue;
 import static org.apache.cassandra.cql3.statements.RequestValidations.invalidRequest;
+import static org.apache.commons.lang3.time.DateUtils.MILLIS_PER_DAY;
+
+import io.netty.util.concurrent.FastThreadLocal;
 
 /**
  * Represents a duration. A durations store separately months, days, and seconds due to the fact that
@@ -40,6 +47,17 @@ public final class Duration
     public static final long NANOS_PER_HOUR = 60 * NANOS_PER_MINUTE;
     public static final int DAYS_PER_WEEK = 7;
     public static final int MONTHS_PER_YEAR = 12;
+
+    // For some operations, like floor, a Calendar is needed if months or years are involved. Unfortunatly, creating a
+    // Calendar is a costly operation so instead of creating one with every call we reuse them.
+    private static final FastThreadLocal<Calendar> CALENDAR_PROVIDER = new FastThreadLocal<Calendar>()
+    {
+        @Override
+        public Calendar initialValue()
+        {
+            return Calendar.getInstance(TimeZone.getTimeZone("UTC"), Locale.US);
+        }
+    };
 
     /**
      * The Regexp used to parse the duration provided as String.
@@ -265,6 +283,53 @@ public final class Duration
         return nanoseconds;
     }
 
+    /**
+     * Adds this duration to the specified time in milliseconds.
+     * @param timeInMillis the time to which the duration must be added
+     * @return the specified time plus this duration
+     */
+    public long addTo(long timeInMillis)
+    {
+        return add(timeInMillis, months, days, nanoseconds);
+    }
+
+    /**
+     * Substracts this duration from the specified time in milliseconds.
+     * @param timeInMillis the time from which the duration must be substracted
+     * @return the specified time minus this duration
+     */
+    public long substractFrom(long timeInMillis)
+    {
+        return add(timeInMillis, -months, -days, -nanoseconds);
+    }
+
+    /**
+     * Adds the specified months, days and nanoseconds to the specified time in milliseconds.
+     *
+     * @param timeInMillis the time to which the months, days and nanoseconds must be added
+     * @param months the number of months to add
+     * @param days the number of days to add
+     * @param nanoseconds the number of nanoseconds to add
+     * @return the specified time plus the months, days and nanoseconds
+     */
+    private static long add(long timeInMillis, int months, int days, long nanoseconds)
+    {
+        // If the duration does not contains any months we can can ignore daylight saving,
+        // as time zones are not supported, and simply look at the milliseconds
+        if (months == 0)
+        {
+            long durationInMillis = (days * MILLIS_PER_DAY) + (nanoseconds / NANOS_PER_MILLI);
+            return timeInMillis + durationInMillis;
+        }
+
+        Calendar calendar = Calendar.getInstance(TimeZone.getTimeZone("UTC"), Locale.US);
+        calendar.setTimeInMillis(timeInMillis);
+        calendar.add(Calendar.MONTH, months);
+        calendar.add(Calendar.DAY_OF_MONTH, days);
+        calendar.add(Calendar.MILLISECOND, (int) (nanoseconds / NANOS_PER_MILLI));
+        return calendar.getTimeInMillis();
+    }
+
     @Override
     public int hashCode()
     {
@@ -288,7 +353,7 @@ public final class Duration
     {
         StringBuilder builder = new StringBuilder();
 
-        if (months < 0 || days < 0 || nanoseconds < 0)
+        if (isNegative())
             builder.append('-');
 
         long remainder = append(builder, Math.abs(months), MONTHS_PER_YEAR, "y");
@@ -309,6 +374,24 @@ public final class Duration
     }
 
     /**
+     * Checks if that duration has a day precision (nothing bellow the day level).
+     * @return {@code true} if that duration has a day precision, {@code false} otherwise
+     */
+    public boolean hasDayPrecision()
+    {
+        return getNanoseconds() == 0;
+    }
+
+    /**
+     * Checks if that duration has a millisecond precision (nothing bellow the millisecond level).
+     * @return {@code true} if that duration has a millisecond precision, {@code false} otherwise
+     */
+    public boolean hasMillisecondPrecision()
+    {
+        return getNanoseconds() % NANOS_PER_MILLI == 0;
+    }
+
+    /**
      * Appends the result of the division to the specified builder if the dividend is not zero.
      *
      * @param builder the builder to append to
@@ -324,6 +407,124 @@ public final class Duration
 
         builder.append(dividend / divisor).append(unit);
         return dividend % divisor;
+    }
+
+    /**
+     * Rounds a timestamp down to the closest multiple of a duration.
+     *
+     * @param timeInMillis the time to round in millisecond
+     * @param duration the duration
+     * @param startingTimeInMillis the time offset in milliseconds
+     * @return the timestamp rounded down to the closest multiple of the duration
+     */
+    public static long floorTimestamp(long timeInMillis, Duration duration, long startingTimeInMillis)
+    {
+        checkFalse(startingTimeInMillis > timeInMillis, "The floor function starting time is greater than the provided time");
+        checkFalse(duration.isNegative(), "Negative durations are not supported by the floor function");
+
+        // If the duration does not contain any months we can ignore daylight saving,
+        // as time zones are not supported, and simply look at the milliseconds
+        if (duration.months == 0)
+        {
+            long durationInMillis = getDurationMilliseconds(duration);
+
+            // If the duration is smaller than millisecond
+            if (durationInMillis == 0)
+                return timeInMillis;
+
+            long delta = (timeInMillis - startingTimeInMillis) % durationInMillis;
+            return timeInMillis - delta;
+        }
+
+        /*
+         * Otherwise, we resort to Calendar for the computation.
+         * What we're trying to compute is the largest integer 'multiplier' value such that
+         *   startingTimeMillis + (multiplier * duration) <= timeInMillis
+         * at which point we want to return 'startingTimeMillis + (multiplier * duration)'.
+         *
+         * One option would be to add 'duration' to 'statingTimeMillis' in a loop until we
+         * cross 'timeInMillis' and return how many iterator we did. But this might be slow if there is very many
+         * steps.
+         *
+         * So instead we first estimate 'multiplier' using the number of months between 'startingTimeMillis'
+         * and 'timeInMillis' ('durationInMonths' below) and the duration months. As the real computation
+         * should also take the 'days' and 'nanoseconds' parts of the duration, this multiplier may overshoot,
+         * so we detect it and work back from that, decreasing the multiplier until we find the proper one.
+         */
+
+        Calendar calendar = CALENDAR_PROVIDER.get();
+
+        calendar.setTimeInMillis(timeInMillis);
+        int year = calendar.get(Calendar.YEAR);
+        int month = calendar.get(Calendar.MONTH);
+
+        calendar.setTimeInMillis(startingTimeInMillis);
+        int startingYear = calendar.get(Calendar.YEAR);
+        int startingMonth = calendar.get(Calendar.MONTH);
+
+        int durationInMonths = (year - startingYear) * MONTHS_PER_YEAR + (month - startingMonth);
+        int multiplier = durationInMonths / duration.months;
+
+        calendar.add(Calendar.MONTH, multiplier * duration.months);
+
+        // If the duration was only containing months, we are done.
+        if (duration.days == 0 && duration.nanoseconds == 0)
+            return calendar.getTimeInMillis();
+
+        long durationInMillis = getDurationMilliseconds(duration);
+        long floor = calendar.getTimeInMillis() + (multiplier * durationInMillis);
+
+        // Once the milliseconds have been added we might have gone too far. If it is the case we will reduce the
+        // multiplier until the floor value is smaller than time in millis.
+        while (floor > timeInMillis)
+        {
+            multiplier--;
+            calendar.add(Calendar.MONTH, -duration.months);
+            floor = calendar.getTimeInMillis() + (multiplier * durationInMillis);
+        }
+
+        return Math.max(startingTimeInMillis, floor);
+    }
+
+    /**
+     * Returns the milliseconds part of the duration ignoring the month part
+     *
+     * @param duration the duration
+     * @return the milliseconds corresponding to the duration days and nanoseconds
+     */
+    private static long getDurationMilliseconds(Duration duration)
+    {
+        // We can ignore daylight saving as time zones are not supported
+        return (duration.days * MILLIS_PER_DAY) + (duration.nanoseconds / NANOS_PER_MILLI);
+    }
+
+    /**
+     * Rounds a time down to the closest multiple of a duration.
+     *
+     * @param timeInNanos the time of day in nanoseconds
+     * @param duration the duration
+     * @return the time rounded down to the closest multiple of the duration
+     */
+    public static long floorTime(long timeInNanos, Duration duration)
+    {
+        checkFalse(duration.isNegative(), "Negative durations are not supported by the floor function");
+        checkFalse(duration.getMonths() != 0 || duration.getDays() != 0 || duration.getNanoseconds() > (NANOS_PER_HOUR * 24),
+                   "For time values, the floor can only be computed for durations smaller that a day");
+
+        if (duration.nanoseconds == 0)
+            return timeInNanos;
+
+        long delta = timeInNanos % duration.nanoseconds;
+        return timeInNanos - delta;
+    }
+
+    /**
+     * Checks if the duration is negative.
+     * @return {@code true} if the duration is negative, {@code false} otherwise
+     */
+    public boolean isNegative()
+    {
+        return nanoseconds < 0 || days < 0 || months < 0;
     }
 
     private static class Builder

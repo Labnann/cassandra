@@ -20,9 +20,10 @@ package org.apache.cassandra.db;
 import java.nio.ByteBuffer;
 import java.util.*;
 
-import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.config.ColumnDefinition;
-import org.apache.cassandra.config.Schema;
+import org.apache.cassandra.schema.ColumnMetadata;
+import org.apache.cassandra.schema.TableId;
+import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.cql3.ColumnIdentifier;
 import org.apache.cassandra.db.context.CounterContext;
 import org.apache.cassandra.db.partitions.PartitionUpdate;
@@ -35,7 +36,8 @@ import org.apache.cassandra.db.marshal.*;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.CounterId;
 import org.apache.cassandra.utils.FBUtilities;
-import org.apache.cassandra.utils.UUIDGen;
+
+import static org.apache.cassandra.utils.TimeUUID.Generator.nextTimeUUIDAsBytes;
 
 public abstract class SimpleBuilders
 {
@@ -43,25 +45,25 @@ public abstract class SimpleBuilders
     {
     }
 
-    private static DecoratedKey makePartitonKey(CFMetaData metadata, Object... partitionKey)
+    private static DecoratedKey makePartitonKey(TableMetadata metadata, Object... partitionKey)
     {
         if (partitionKey.length == 1 && partitionKey[0] instanceof DecoratedKey)
             return (DecoratedKey)partitionKey[0];
 
-        ByteBuffer key = CFMetaData.serializePartitionKey(metadata.getKeyValidatorAsClusteringComparator().make(partitionKey));
-        return metadata.decorateKey(key);
+        ByteBuffer key = metadata.partitionKeyAsClusteringComparator().make(partitionKey).serializeAsPartitionKey();
+        return metadata.partitioner.decorateKey(key);
     }
 
-    private static Clustering makeClustering(CFMetaData metadata, Object... clusteringColumns)
+    private static Clustering<?> makeClustering(TableMetadata metadata, Object... clusteringColumns)
     {
         if (clusteringColumns.length == 1 && clusteringColumns[0] instanceof Clustering)
-            return (Clustering)clusteringColumns[0];
+            return (Clustering<?>)clusteringColumns[0];
 
         if (clusteringColumns.length == 0)
         {
             // If the table has clustering columns, passing no values is for updating the static values, so check we
             // do have some static columns defined.
-            assert metadata.comparator.size() == 0 || !metadata.partitionColumns().statics.isEmpty();
+            assert metadata.comparator.size() == 0 || !metadata.staticColumns().isEmpty();
             return metadata.comparator.size() == 0 ? Clustering.EMPTY : Clustering.STATIC_CLUSTERING;
         }
         else
@@ -74,7 +76,7 @@ public abstract class SimpleBuilders
     {
         protected long timestamp = FBUtilities.timestampMicros();
         protected int ttl = 0;
-        protected int nowInSec = FBUtilities.nowInSeconds();
+        protected long nowInSec = FBUtilities.nowInSeconds();
 
         protected void copyParams(AbstractBuilder<?> other)
         {
@@ -95,7 +97,7 @@ public abstract class SimpleBuilders
             return (T)this;
         }
 
-        public T nowInSec(int nowInSec)
+        public T nowInSec(long nowInSec)
         {
             this.nowInSec = nowInSec;
             return (T)this;
@@ -107,7 +109,7 @@ public abstract class SimpleBuilders
         private final String keyspaceName;
         private final DecoratedKey key;
 
-        private final Map<UUID, PartitionUpdateBuilder> updateBuilders = new HashMap<>();
+        private final Map<TableId, PartitionUpdateBuilder> updateBuilders = new HashMap<>();
 
         public MutationBuilder(String keyspaceName, DecoratedKey key)
         {
@@ -115,15 +117,15 @@ public abstract class SimpleBuilders
             this.key = key;
         }
 
-        public PartitionUpdate.SimpleBuilder update(CFMetaData metadata)
+        public PartitionUpdate.SimpleBuilder update(TableMetadata metadata)
         {
-            assert metadata.ksName.equals(keyspaceName);
+            assert metadata.keyspace.equals(keyspaceName);
 
-            PartitionUpdateBuilder builder = updateBuilders.get(metadata.cfId);
+            PartitionUpdateBuilder builder = updateBuilders.get(metadata.id);
             if (builder == null)
             {
                 builder = new PartitionUpdateBuilder(metadata, key);
-                updateBuilders.put(metadata.cfId, builder);
+                updateBuilders.put(metadata.id, builder);
             }
 
             copyParams(builder);
@@ -133,7 +135,7 @@ public abstract class SimpleBuilders
 
         public PartitionUpdate.SimpleBuilder update(String tableName)
         {
-            CFMetaData metadata = Schema.instance.getCFMetaData(keyspaceName, tableName);
+            TableMetadata metadata = Schema.instance.getTableMetadata(keyspaceName, tableName);
             assert metadata != null : "Unknown table " + tableName + " in keyspace " + keyspaceName;
             return update(metadata);
         }
@@ -145,36 +147,37 @@ public abstract class SimpleBuilders
             if (updateBuilders.size() == 1)
                 return new Mutation(updateBuilders.values().iterator().next().build());
 
-            Mutation mutation = new Mutation(keyspaceName, key);
+            Mutation.PartitionUpdateCollector mutationBuilder = new Mutation.PartitionUpdateCollector(keyspaceName, key);
             for (PartitionUpdateBuilder builder : updateBuilders.values())
-                mutation.add(builder.build());
-            return mutation;
+                mutationBuilder.add(builder.build());
+            return mutationBuilder.build();
         }
     }
 
     public static class PartitionUpdateBuilder extends AbstractBuilder<PartitionUpdate.SimpleBuilder> implements PartitionUpdate.SimpleBuilder
     {
-        private final CFMetaData metadata;
+        private final TableMetadata metadata;
         private final DecoratedKey key;
-        private final Map<Clustering, RowBuilder> rowBuilders = new HashMap<>();
+        private final Map<Clustering<?>, RowBuilder> rowBuilders = new HashMap<>();
         private List<RTBuilder> rangeBuilders = null; // We use that rarely, so create lazily
+        private List<RangeTombstone> rangeTombstones = null;
 
         private DeletionTime partitionDeletion = DeletionTime.LIVE;
 
-        public PartitionUpdateBuilder(CFMetaData metadata, Object... partitionKeyValues)
+        public PartitionUpdateBuilder(TableMetadata metadata, Object... partitionKeyValues)
         {
             this.metadata = metadata;
             this.key = makePartitonKey(metadata, partitionKeyValues);
         }
 
-        public CFMetaData metadata()
+        public TableMetadata metadata()
         {
             return metadata;
         }
 
         public Row.SimpleBuilder row(Object... clusteringValues)
         {
-            Clustering clustering = makeClustering(metadata, clusteringValues);
+            Clustering<?> clustering = makeClustering(metadata, clusteringValues);
             RowBuilder builder = rowBuilders.get(clustering);
             if (builder == null)
             {
@@ -189,7 +192,7 @@ public abstract class SimpleBuilders
 
         public PartitionUpdate.SimpleBuilder delete()
         {
-            this.partitionDeletion = new DeletionTime(timestamp, nowInSec);
+            this.partitionDeletion = DeletionTime.build(timestamp, nowInSec);
             return this;
         }
 
@@ -198,21 +201,29 @@ public abstract class SimpleBuilders
             if (rangeBuilders == null)
                 rangeBuilders = new ArrayList<>();
 
-            RTBuilder builder = new RTBuilder(metadata.comparator, new DeletionTime(timestamp, nowInSec));
+            RTBuilder builder = new RTBuilder(metadata.comparator, DeletionTime.build(timestamp, nowInSec));
             rangeBuilders.add(builder);
             return builder;
+        }
+
+        public PartitionUpdate.SimpleBuilder addRangeTombstone(RangeTombstone rt)
+        {
+            if (rangeTombstones == null)
+                rangeTombstones = new ArrayList<>();
+            rangeTombstones.add(rt);
+            return this;
         }
 
         public PartitionUpdate build()
         {
             // Collect all updated columns
-            PartitionColumns.Builder columns = PartitionColumns.builder();
+            RegularAndStaticColumns.Builder columns = RegularAndStaticColumns.builder();
             for (RowBuilder builder : rowBuilders.values())
                 columns.addAll(builder.columns());
 
             // Note that rowBuilders.size() could include the static column so could be 1 off the really need capacity
             // of the final PartitionUpdate, but as that's just a sizing hint, we'll live.
-            PartitionUpdate update = new PartitionUpdate(metadata, key, columns.build(), rowBuilders.size());
+            PartitionUpdate.Builder update = new PartitionUpdate.Builder(metadata, key, columns.build(), rowBuilders.size());
 
             update.addPartitionDeletion(partitionDeletion);
             if (rangeBuilders != null)
@@ -221,10 +232,16 @@ public abstract class SimpleBuilders
                     update.add(builder.build());
             }
 
+            if (rangeTombstones != null)
+            {
+                for (RangeTombstone rt : rangeTombstones)
+                    update.add(rt);
+            }
+
             for (RowBuilder builder : rowBuilders.values())
                 update.add(builder.build());
 
-            return update;
+            return update.build();
         }
 
         public Mutation buildAsMutation()
@@ -287,8 +304,8 @@ public abstract class SimpleBuilders
 
             private RangeTombstone build()
             {
-                ClusteringBound startBound = ClusteringBound.create(comparator, true, startInclusive, start);
-                ClusteringBound endBound = ClusteringBound.create(comparator, false, endInclusive, end);
+                ClusteringBound<?> startBound = ClusteringBound.create(comparator, true, startInclusive, start);
+                ClusteringBound<?> endBound = ClusteringBound.create(comparator, false, endInclusive, end);
                 return new RangeTombstone(Slice.make(startBound, endBound), deletionTime);
             }
         }
@@ -296,23 +313,23 @@ public abstract class SimpleBuilders
 
     public static class RowBuilder extends AbstractBuilder<Row.SimpleBuilder> implements Row.SimpleBuilder
     {
-        private final CFMetaData metadata;
+        private final TableMetadata metadata;
 
-        private final Set<ColumnDefinition> columns = new HashSet<>();
+        private final Set<ColumnMetadata> columns = new HashSet<>();
         private final Row.Builder builder;
 
         private boolean initiated;
         private boolean noPrimaryKeyLivenessInfo;
 
-        public RowBuilder(CFMetaData metadata, Object... clusteringColumns)
+        public RowBuilder(TableMetadata metadata, Object... clusteringColumns)
         {
             this.metadata = metadata;
-            this.builder = BTreeRow.unsortedBuilder(FBUtilities.nowInSeconds());
+            this.builder = BTreeRow.unsortedBuilder();
 
             this.builder.newRow(makeClustering(metadata, clusteringColumns));
         }
 
-        Set<ColumnDefinition> columns()
+        Set<ColumnMetadata> columns()
         {
             return columns;
         }
@@ -325,8 +342,8 @@ public abstract class SimpleBuilders
             if (initiated)
                 return;
 
-            // If a CQL table, add the "row marker"
-            if (metadata.isCQLTable() && !noPrimaryKeyLivenessInfo)
+            // Adds the row liveness
+            if (!metadata.isCompactTable() && !noPrimaryKeyLivenessInfo)
                 builder.addPrimaryKeyLivenessInfo(LivenessInfo.create(timestamp, ttl, nowInSec));
 
             initiated = true;
@@ -345,10 +362,10 @@ public abstract class SimpleBuilders
         private Row.SimpleBuilder add(String columnName, Object value, boolean overwriteForCollection)
         {
             maybeInit();
-            ColumnDefinition column = getColumn(columnName);
+            ColumnMetadata column = getColumn(columnName);
 
             if (!overwriteForCollection && !(column.type.isMultiCell() && column.type.isCollection()))
-                throw new IllegalArgumentException("appendAll() can only be called on non-frozen colletions");
+                throw new IllegalArgumentException("appendAll() can only be called on non-frozen collections");
 
             columns.add(column);
 
@@ -362,20 +379,20 @@ public abstract class SimpleBuilders
 
             if (value == null)
             {
-                builder.addComplexDeletion(column, new DeletionTime(timestamp, nowInSec));
+                builder.addComplexDeletion(column, DeletionTime.build(timestamp, nowInSec));
                 return this;
             }
 
             // Erase previous entry if any.
             if (overwriteForCollection)
-                builder.addComplexDeletion(column, new DeletionTime(timestamp - 1, nowInSec));
+                builder.addComplexDeletion(column, DeletionTime.build(timestamp - 1, nowInSec));
             switch (((CollectionType)column.type).kind)
             {
                 case LIST:
                     ListType lt = (ListType)column.type;
                     assert value instanceof List;
                     for (Object elt : (List)value)
-                        builder.addCell(cell(column, toByteBuffer(elt, lt.getElementsType()), CellPath.create(ByteBuffer.wrap(UUIDGen.getTimeUUIDBytes()))));
+                        builder.addCell(cell(column, toByteBuffer(elt, lt.getElementsType()), CellPath.create(ByteBuffer.wrap(nextTimeUUIDAsBytes()))));
                     break;
                 case SET:
                     SetType st = (SetType)column.type;
@@ -400,7 +417,13 @@ public abstract class SimpleBuilders
         public Row.SimpleBuilder delete()
         {
             assert !initiated : "If called, delete() should be called before any other column value addition";
-            builder.addRowDeletion(Row.Deletion.regular(new DeletionTime(timestamp, nowInSec)));
+            builder.addRowDeletion(Row.Deletion.regular(DeletionTime.build(timestamp, nowInSec)));
+            return this;
+        }
+
+        public Row.SimpleBuilder deletePrevious()
+        {
+            builder.addRowDeletion(Row.Deletion.regular(DeletionTime.build(timestamp - 1, nowInSec)));
             return this;
         }
 
@@ -421,16 +444,16 @@ public abstract class SimpleBuilders
             return builder.build();
         }
 
-        private ColumnDefinition getColumn(String columnName)
+        private ColumnMetadata getColumn(String columnName)
         {
-            ColumnDefinition column = metadata.getColumnDefinition(new ColumnIdentifier(columnName, true));
+            ColumnMetadata column = metadata.getColumn(new ColumnIdentifier(columnName, true));
             assert column != null : "Cannot find column " + columnName;
             assert !column.isPrimaryKeyColumn();
             assert !column.isStatic() || builder.clustering() == Clustering.STATIC_CLUSTERING : "Cannot add non-static column to static-row";
             return column;
         }
 
-        private Cell cell(ColumnDefinition column, ByteBuffer value, CellPath path)
+        private Cell<?> cell(ColumnMetadata column, ByteBuffer value, CellPath path)
         {
             if (value == null)
                 return BufferCell.tombstone(column, timestamp, nowInSec, path);

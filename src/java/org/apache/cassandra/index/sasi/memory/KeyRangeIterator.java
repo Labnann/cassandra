@@ -25,21 +25,22 @@ import java.util.concurrent.ConcurrentSkipListSet;
 
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.index.sasi.disk.Token;
-import org.apache.cassandra.index.sasi.utils.AbstractIterator;
 import org.apache.cassandra.index.sasi.utils.CombinedValue;
 import org.apache.cassandra.index.sasi.utils.RangeIterator;
 
-import com.carrotsearch.hppc.LongOpenHashSet;
+import com.carrotsearch.hppc.LongHashSet;
 import com.carrotsearch.hppc.LongSet;
+import org.apache.cassandra.utils.AbstractGuavaIterator;
+
 import com.google.common.collect.PeekingIterator;
 
 public class KeyRangeIterator extends RangeIterator<Long, Token>
 {
     private final DKIterator iterator;
 
-    public KeyRangeIterator(ConcurrentSkipListSet<DecoratedKey> keys)
+    public KeyRangeIterator(ConcurrentSkipListSet<DecoratedKey> keys, int size)
     {
-        super((Long) keys.first().getToken().getTokenValue(), (Long) keys.last().getToken().getTokenValue(), keys.size());
+        super((Long) keys.first().getToken().getTokenValue(), (Long) keys.last().getToken().getTokenValue(), size);
         this.iterator = new DKIterator(keys.iterator());
     }
 
@@ -64,7 +65,7 @@ public class KeyRangeIterator extends RangeIterator<Long, Token>
     public void close() throws IOException
     {}
 
-    private static class DKIterator extends AbstractIterator<DecoratedKey> implements PeekingIterator<DecoratedKey>
+    private static class DKIterator extends AbstractGuavaIterator<DecoratedKey> implements PeekingIterator<DecoratedKey>
     {
         private final Iterator<DecoratedKey> keys;
 
@@ -95,7 +96,7 @@ public class KeyRangeIterator extends RangeIterator<Long, Token>
 
         public LongSet getOffsets()
         {
-            LongSet offsets = new LongOpenHashSet(4);
+            LongSet offsets = new LongHashSet(4);
             for (DecoratedKey key : keys)
                 offsets.add((long) key.getToken().getTokenValue());
 

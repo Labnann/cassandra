@@ -18,20 +18,29 @@
 package org.apache.cassandra.hints;
 
 import java.io.IOException;
-import java.util.*;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ExecutionException;
+import java.nio.ByteBuffer;
 import java.util.concurrent.TimeUnit;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Throwables;
+import com.google.common.primitives.Ints;
 
-import org.apache.cassandra.db.*;
+import javax.annotation.Nullable;
+import org.apache.cassandra.db.Mutation;
+import org.apache.cassandra.db.SystemKeyspace;
 import org.apache.cassandra.io.IVersionedSerializer;
+import org.apache.cassandra.io.util.DataInputBuffer;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.schema.TableId;
+import org.apache.cassandra.utils.concurrent.Future;
+import org.apache.cassandra.utils.concurrent.ImmediateFuture;
+import org.apache.cassandra.utils.vint.VIntCoding;
 
+import static org.apache.cassandra.config.CassandraRelevantProperties.CASSANDRA_MAX_HINT_TTL;
 import static org.apache.cassandra.db.TypeSizes.sizeof;
 import static org.apache.cassandra.db.TypeSizes.sizeofUnsignedVInt;
+import static org.apache.cassandra.utils.Clock.Global.currentTimeMillis;
 
 /**
  * Encapsulates the hinted mutation, its creation time, and the gc grace seconds param for each table involved.
@@ -51,10 +60,11 @@ import static org.apache.cassandra.db.TypeSizes.sizeofUnsignedVInt;
 public final class Hint
 {
     public static final Serializer serializer = new Serializer();
+    static final int maxHintTTL = CASSANDRA_MAX_HINT_TTL.getInt();
 
     final Mutation mutation;
     final long creationTime;  // time of hint creation (in milliseconds)
-    final int gcgs; // the smallest gc gs of all involved tables
+    final int gcgs; // the smallest gc gs of all involved tables (in seconds)
 
     private Hint(Mutation mutation, long creationTime, int gcgs)
     {
@@ -85,13 +95,13 @@ public final class Hint
     /**
      * Applies the contained mutation unless it's expired, filtering out any updates for truncated tables
      */
-    CompletableFuture<?> applyFuture()
+    Future<?> applyFuture()
     {
         if (isLive())
         {
-            // filter out partition update for table that have been truncated since hint's creation
+            // filter out partition update for tables that have been truncated since hint's creation
             Mutation filtered = mutation;
-            for (UUID id : mutation.getColumnFamilyIds())
+            for (TableId id : mutation.getTableIds())
                 if (creationTime <= SystemKeyspace.getTruncatedAt(id))
                     filtered = filtered.without(id);
 
@@ -99,7 +109,7 @@ public final class Hint
                 return filtered.applyFuture();
         }
 
-        return CompletableFuture.completedFuture(null);
+        return ImmediateFuture.success(null);
     }
 
     void apply()
@@ -110,18 +120,42 @@ public final class Hint
         }
         catch (Exception e)
         {
-            throw Throwables.propagate(e.getCause());
+            Throwables.throwIfUnchecked(e.getCause());
+            throw new RuntimeException(e.getCause());
         }
+    }
+
+    /**
+     * @return the overall ttl of the hint - the minimum of all mutation's tables' gc gs now and at the time of creation
+     */
+    int ttl()
+    {
+        return Math.min(gcgs, mutation.smallestGCGS());
     }
 
     /**
      * @return calculates whether or not it is safe to apply the hint without risking to resurrect any deleted data
      */
-    boolean isLive()
+    public boolean isLive()
+    {
+        return isLive(creationTime, currentTimeMillis(), ttl());
+    }
+
+    static boolean isLive(long creationTime, long now, int hintTTL)
+    {
+        return expirationInMillis(creationTime, hintTTL) > now;
+    }
+
+    @VisibleForTesting
+    long expirationInMillis()
     {
         int smallestGCGS = Math.min(gcgs, mutation.smallestGCGS());
-        long expirationTime = creationTime + TimeUnit.SECONDS.toMillis(smallestGCGS);
-        return expirationTime > System.currentTimeMillis();
+        return expirationInMillis(creationTime, smallestGCGS);
+    }
+
+    private static long expirationInMillis(long creationTime, int hintTTL)
+    {
+        return creationTime + TimeUnit.SECONDS.toMillis(Math.min(hintTTL, maxHintTTL));
     }
 
     static final class Serializer implements IVersionedSerializer<Hint>
@@ -130,22 +164,82 @@ public final class Hint
         {
             long size = sizeof(hint.creationTime);
             size += sizeofUnsignedVInt(hint.gcgs);
-            size += Mutation.serializer.serializedSize(hint.mutation, version);
+            size += hint.mutation.serializedSize(version);
             return size;
         }
 
         public void serialize(Hint hint, DataOutputPlus out, int version) throws IOException
         {
             out.writeLong(hint.creationTime);
-            out.writeUnsignedVInt(hint.gcgs);
+            out.writeUnsignedVInt32(hint.gcgs);
             Mutation.serializer.serialize(hint.mutation, out, version);
         }
 
         public Hint deserialize(DataInputPlus in, int version) throws IOException
         {
             long creationTime = in.readLong();
-            int gcgs = (int) in.readUnsignedVInt();
+            int gcgs = in.readUnsignedVInt32();
             return new Hint(Mutation.serializer.deserialize(in, version), creationTime, gcgs);
+        }
+
+        public long getHintCreationTime(ByteBuffer hintBuffer, int version)
+        {
+            return hintBuffer.getLong(0);
+        }
+
+        /**
+         * Will short-circuit Mutation deserialization if the hint is definitely dead. If a Hint instance is
+         * returned, there is a chance it's live, if gcgs on one of the table involved got reduced between
+         * hint creation and deserialization, but this does not impact correctness - an extra liveness check will
+         * also be performed on the receiving end.
+         *
+         * @return null if the hint is definitely dead, a Hint instance if it's likely live
+         */
+        @Nullable
+        Hint deserializeIfLive(DataInputPlus in, long now, long size, int version) throws IOException
+        {
+            long creationTime = in.readLong();
+            int gcgs = in.readUnsignedVInt32();
+            int bytesRead = sizeof(creationTime) + sizeofUnsignedVInt(gcgs);
+
+            if (isLive(creationTime, now, gcgs))
+                return new Hint(Mutation.serializer.deserialize(in, version), creationTime, gcgs);
+
+            in.skipBytesFully(Ints.checkedCast(size) - bytesRead);
+            return null;
+        }
+
+        /**
+         * Will short-circuit ByteBuffer allocation if the hint is definitely dead. If a ByteBuffer instance is
+         * returned, there is a chance it's live, if gcgs on one of the table involved got reduced between
+         * hint creation and deserialization, but this does not impact correctness - an extra liveness check will
+         * also be performed on the receiving end.
+         *
+         * @return null if the hint is definitely dead, a ByteBuffer instance if it's likely live
+         */
+        @Nullable
+        ByteBuffer readBufferIfLive(DataInputPlus in, long now, int size, int version) throws IOException
+        {
+            int maxHeaderSize = Math.min(sizeof(Long.MAX_VALUE) + VIntCoding.MAX_SIZE, size);
+            byte[] header = new byte[maxHeaderSize];
+            in.readFully(header);
+
+            try (DataInputBuffer input = new DataInputBuffer(header))
+            {
+                long creationTime = input.readLong();
+                int gcgs = input.readUnsignedVInt32();
+
+                if (!isLive(creationTime, now, gcgs))
+                {
+                    in.skipBytesFully(size - maxHeaderSize);
+                    return null;
+                }
+            }
+
+            byte[] bytes = new byte[size];
+            System.arraycopy(header, 0, bytes, 0, header.length);
+            in.readFully(bytes, header.length, size - header.length);
+            return ByteBuffer.wrap(bytes);
         }
     }
 }

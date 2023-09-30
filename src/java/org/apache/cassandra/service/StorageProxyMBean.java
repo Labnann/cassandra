@@ -21,6 +21,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
+
 public interface StorageProxyMBean
 {
     public long getTotalHints();
@@ -31,6 +32,8 @@ public interface StorageProxyMBean
     public Set<String> getHintedHandoffDisabledDCs();
     public int getMaxHintWindow();
     public void setMaxHintWindow(int ms);
+    public int getMaxHintsSizePerHostInMiB();
+    public void setMaxHintsSizePerHostInMiB(int value);
     public int getMaxHintsInProgress();
     public void setMaxHintsInProgress(int qs);
     public int getHintsInProgress();
@@ -58,12 +61,87 @@ public interface StorageProxyMBean
     public long getReadRepairAttempted();
     public long getReadRepairRepairedBlocking();
     public long getReadRepairRepairedBackground();
+    public long getReadRepairRepairTimedOut();
 
+    @Deprecated
     public int getOtcBacklogExpirationInterval();
+
+    public void loadPartitionDenylist();
+    public int getPartitionDenylistLoadAttempts();
+    public int getPartitionDenylistLoadSuccesses();
+    public void setEnablePartitionDenylist(boolean enabled);
+    public void setEnableDenylistWrites(boolean enabled);
+    public void setEnableDenylistReads(boolean enabled);
+    public void setEnableDenylistRangeReads(boolean enabled);
+    public boolean denylistKey(String keyspace, String table, String partitionKeyAsString);
+    public boolean removeDenylistKey(String keyspace, String table, String partitionKeyAsString);
+    public void setDenylistMaxKeysPerTable(int value);
+    public void setDenylistMaxKeysTotal(int value);
+    public boolean isKeyDenylisted(String keyspace, String table, String partitionKeyAsString);
+
+    @Deprecated
     public void setOtcBacklogExpirationInterval(int intervalInMillis);
 
     /** Returns each live node's schema version */
-    public Map<String, List<String>> getSchemaVersions();
+    @Deprecated public Map<String, List<String>> getSchemaVersions();
+    public Map<String, List<String>> getSchemaVersionsWithPort();
 
     public int getNumberOfTables();
+
+    public String getIdealConsistencyLevel();
+    public String setIdealConsistencyLevel(String cl);
+
+    public void logBlockingReadRepairAttemptsForNSeconds(int seconds);
+    public boolean isLoggingReadRepairs();
+
+    /**
+     * Tracking and reporting of variances in the repaired data set across replicas at read time
+     */
+    void enableRepairedDataTrackingForRangeReads();
+    void disableRepairedDataTrackingForRangeReads();
+    boolean getRepairedDataTrackingEnabledForRangeReads();
+
+    void enableRepairedDataTrackingForPartitionReads();
+    void disableRepairedDataTrackingForPartitionReads();
+    boolean getRepairedDataTrackingEnabledForPartitionReads();
+
+    void enableReportingUnconfirmedRepairedDataMismatches();
+    void disableReportingUnconfirmedRepairedDataMismatches();
+    boolean getReportingUnconfirmedRepairedDataMismatchesEnabled();
+
+    void enableSnapshotOnRepairedDataMismatch();
+    void disableSnapshotOnRepairedDataMismatch();
+    boolean getSnapshotOnRepairedDataMismatchEnabled();
+
+    void enableSnapshotOnDuplicateRowDetection();
+    void disableSnapshotOnDuplicateRowDetection();
+    boolean getSnapshotOnDuplicateRowDetectionEnabled();
+
+    boolean getCheckForDuplicateRowsDuringReads();
+    void enableCheckForDuplicateRowsDuringReads();
+    void disableCheckForDuplicateRowsDuringReads();
+    boolean getCheckForDuplicateRowsDuringCompaction();
+    void enableCheckForDuplicateRowsDuringCompaction();
+    void disableCheckForDuplicateRowsDuringCompaction();
+
+    void setPaxosVariant(String variant);
+    String getPaxosVariant();
+
+    boolean getUseStatementsEnabled();
+    void setUseStatementsEnabled(boolean enabled);
+
+    void setPaxosContentionStrategy(String variant);
+    String getPaxosContentionStrategy();
+
+    void setPaxosCoordinatorLockingDisabled(boolean disabled);
+    boolean getPaxosCoordinatorLockingDisabled();
+
+    public boolean getDumpHeapOnUncaughtException();
+    public void setDumpHeapOnUncaughtException(boolean enabled);
+
+    boolean getSStableReadRatePersistenceEnabled();
+    void setSStableReadRatePersistenceEnabled(boolean enabled);
+
+    boolean getClientRequestSizeMetricsEnabled();
+    void setClientRequestSizeMetricsEnabled(boolean enabled);
 }

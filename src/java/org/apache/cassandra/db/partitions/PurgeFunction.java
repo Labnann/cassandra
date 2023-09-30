@@ -17,7 +17,7 @@
  */
 package org.apache.cassandra.db.partitions;
 
-import java.util.function.Predicate;
+import java.util.function.LongPredicate;
 
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.rows.*;
@@ -25,30 +25,26 @@ import org.apache.cassandra.db.transform.Transformation;
 
 public abstract class PurgeFunction extends Transformation<UnfilteredRowIterator>
 {
-    private final boolean isForThrift;
     private final DeletionPurger purger;
-    private final int nowInSec;
+    private final long nowInSec;
 
     private final boolean enforceStrictLiveness;
     private boolean isReverseOrder;
 
-    public PurgeFunction(boolean isForThrift,
-                         int nowInSec,
-                         int gcBefore,
-                         int oldestUnrepairedTombstone,
-                         boolean onlyPurgeRepairedTombstones,
+    private boolean ignoreGcGraceSeconds;
+
+    public PurgeFunction(long nowInSec, long gcBefore, long oldestUnrepairedTombstone, boolean onlyPurgeRepairedTombstones,
                          boolean enforceStrictLiveness)
     {
-        this.isForThrift = isForThrift;
         this.nowInSec = nowInSec;
         this.purger = (timestamp, localDeletionTime) ->
                       !(onlyPurgeRepairedTombstones && localDeletionTime >= oldestUnrepairedTombstone)
-                      && localDeletionTime < gcBefore
+                      && (localDeletionTime < gcBefore || ignoreGcGraceSeconds)
                       && getPurgeEvaluator().test(timestamp);
         this.enforceStrictLiveness = enforceStrictLiveness;
     }
 
-    protected abstract Predicate<Long> getPurgeEvaluator();
+    protected abstract LongPredicate getPurgeEvaluator();
 
     // Called at the beginning of each new partition
     protected void onNewPartition(DecoratedKey partitionKey)
@@ -65,14 +61,29 @@ public abstract class PurgeFunction extends Transformation<UnfilteredRowIterator
     {
     }
 
+    // Called at the beginning of each new partition
+    // Return true if the current partitionKey ignores the gc_grace_seconds during compaction.
+    protected boolean shouldIgnoreGcGrace()
+    {
+        return false;
+    }
+
+    protected void setReverseOrder(boolean isReverseOrder)
+    {
+        this.isReverseOrder = isReverseOrder;
+    }
+
     @Override
+    @SuppressWarnings("resource")
     protected UnfilteredRowIterator applyToPartition(UnfilteredRowIterator partition)
     {
         onNewPartition(partition.partitionKey());
 
-        isReverseOrder = partition.isReverseOrder();
+        ignoreGcGraceSeconds = shouldIgnoreGcGrace();
+
+        setReverseOrder(partition.isReverseOrder());
         UnfilteredRowIterator purged = Transformation.apply(partition, this);
-        if (!isForThrift && purged.isEmpty())
+        if (purged.isEmpty())
         {
             onEmptyPartitionPostPurge(purged.partitionKey());
             purged.close();

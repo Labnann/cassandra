@@ -22,7 +22,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 
-import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.cql3.Operator;
 import org.apache.cassandra.index.sasi.analyzer.AbstractAnalyzer;
 import org.apache.cassandra.index.sasi.conf.ColumnIndex;
@@ -47,7 +47,7 @@ public class Expression
 
     public enum Op
     {
-        EQ, MATCH, PREFIX, SUFFIX, CONTAINS, NOT_EQ, RANGE;
+        EQ, MATCH, PREFIX, SUFFIX, CONTAINS, NOT_EQ, RANGE, IN;
 
         public static Op valueOf(Operator operator)
         {
@@ -55,6 +55,9 @@ public class Expression
             {
                 case EQ:
                     return EQ;
+
+                case IN:
+                    return IN;
 
                 case NEQ:
                     return NOT_EQ;
@@ -115,7 +118,7 @@ public class Expression
     @VisibleForTesting
     public Expression(String name, AbstractType<?> validator)
     {
-        this(null, new ColumnIndex(UTF8Type.instance, ColumnDefinition.regularDef("sasi", "internal", name, validator), null));
+        this(null, new ColumnIndex(UTF8Type.instance, ColumnMetadata.regularColumn("sasi", "internal", name, validator), null));
     }
 
     public Expression setLower(Bound newLower)
@@ -335,7 +338,7 @@ public class Expression
         if (!hasLower())
             return true;
 
-        int cmp = term.compareTo(validator, lower.value, false);
+        int cmp = term.compareTo(validator, lower.value, operation == Op.RANGE && !isLiteral);
         return cmp > 0 || cmp == 0 && lower.inclusive;
     }
 
@@ -344,7 +347,7 @@ public class Expression
         if (!hasUpper())
             return true;
 
-        int cmp = term.compareTo(validator, upper.value, false);
+        int cmp = term.compareTo(validator, upper.value, operation == Op.RANGE && !isLiteral);
         return cmp < 0 || cmp == 0 && upper.inclusive;
     }
 
@@ -410,6 +413,14 @@ public class Expression
 
             Bound o = (Bound) other;
             return value.equals(o.value) && inclusive == o.inclusive;
+        }
+
+        public int hashCode()
+        {
+            HashCodeBuilder builder = new HashCodeBuilder();
+            builder.append(value);
+            builder.append(inclusive);
+            return builder.toHashCode();
         }
     }
 }

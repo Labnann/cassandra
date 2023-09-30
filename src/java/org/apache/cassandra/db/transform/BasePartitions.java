@@ -20,8 +20,6 @@
  */
 package org.apache.cassandra.db.transform;
 
-import java.util.Collections;
-
 import org.apache.cassandra.db.partitions.BasePartitionIterator;
 import org.apache.cassandra.db.rows.BaseRowIterator;
 import org.apache.cassandra.utils.Throwables;
@@ -77,6 +75,7 @@ implements BasePartitionIterator<R>
         return fail;
     }
 
+    @SuppressWarnings("resource")
     public final boolean hasNext()
     {
         BaseRowIterator<?> next = null;
@@ -89,7 +88,7 @@ implements BasePartitionIterator<R>
                 Transformation[] fs = stack;
                 int len = length;
 
-                while (!stop.isSignalled && input.hasNext())
+                while (!stop.isSignalled && !stopChild.isSignalled && input.hasNext())
                 {
                     next = input.next();
                     for (int i = 0 ; next != null & i < len ; i++)
@@ -102,7 +101,7 @@ implements BasePartitionIterator<R>
                     }
                 }
 
-                if (stop.isSignalled || stopChild.isSignalled || !hasMoreContents())
+                if (stop.isSignalled || !hasMoreContents())
                     return false;
             }
             return true;
@@ -111,7 +110,7 @@ implements BasePartitionIterator<R>
         catch (Throwable t)
         {
             if (next != null)
-                Throwables.close(t, Collections.singleton(next));
+                Throwables.close(t, next);
             throw t;
         }
     }

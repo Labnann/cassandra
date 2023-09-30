@@ -21,20 +21,21 @@ import java.util.HashMap;
 import java.util.Map;
 import javax.management.openmbean.*;
 
-import com.google.common.base.Throwables;
-
 import org.apache.cassandra.streaming.StreamEvent;
 
 public class SessionCompleteEventCompositeData
 {
     private static final String[] ITEM_NAMES = new String[]{"planId",
                                                             "peer",
+                                                            "peer storage port",
                                                             "success"};
     private static final String[] ITEM_DESCS = new String[]{"Plan ID",
                                                             "Session peer",
+                                                            "Session peer storage port",
                                                             "Indicates whether session was successful"};
     private static final OpenType<?>[] ITEM_TYPES = new OpenType[]{SimpleType.STRING,
                                                                    SimpleType.STRING,
+                                                                   SimpleType.INTEGER,
                                                                    SimpleType.BOOLEAN};
 
     public static final CompositeType COMPOSITE_TYPE;
@@ -50,7 +51,7 @@ public class SessionCompleteEventCompositeData
         }
         catch (OpenDataException e)
         {
-            throw Throwables.propagate(e);
+            throw new RuntimeException(e);
         }
     }
 
@@ -58,15 +59,16 @@ public class SessionCompleteEventCompositeData
     {
         Map<String, Object> valueMap = new HashMap<>();
         valueMap.put(ITEM_NAMES[0], event.planId.toString());
-        valueMap.put(ITEM_NAMES[1], event.peer.getHostAddress());
-        valueMap.put(ITEM_NAMES[2], event.success);
+        valueMap.put(ITEM_NAMES[1], event.peer.getAddress().getHostAddress());
+        valueMap.put(ITEM_NAMES[2], event.peer.getPort());
+        valueMap.put(ITEM_NAMES[3], event.success);
         try
         {
             return new CompositeDataSupport(COMPOSITE_TYPE, valueMap);
         }
         catch (OpenDataException e)
         {
-            throw Throwables.propagate(e);
+            throw new RuntimeException(e);
         }
     }
 }

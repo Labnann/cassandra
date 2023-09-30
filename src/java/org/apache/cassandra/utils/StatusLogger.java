@@ -17,44 +17,64 @@
  */
 package org.apache.cassandra.utils;
 
-import java.lang.management.ManagementFactory;
-import java.util.Map;
-import javax.management.*;
+import java.util.concurrent.locks.ReentrantLock;
 
-import org.apache.cassandra.cache.*;
-
-import org.apache.cassandra.metrics.ThreadPoolMetrics;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.cassandra.cache.AutoSavingCache;
+import org.apache.cassandra.cache.IRowCacheEntry;
+import org.apache.cassandra.cache.KeyCacheKey;
+import org.apache.cassandra.cache.RowCacheKey;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.ColumnFamilyStore;
-import org.apache.cassandra.db.RowIndexEntry;
 import org.apache.cassandra.db.compaction.CompactionManager;
+import org.apache.cassandra.io.sstable.AbstractRowIndexEntry;
+import org.apache.cassandra.metrics.CassandraMetricsRegistry;
+import org.apache.cassandra.metrics.ThreadPoolMetrics;
 import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.service.CacheService;
 
 public class StatusLogger
 {
     private static final Logger logger = LoggerFactory.getLogger(StatusLogger.class);
-
+    private static final ReentrantLock busyMonitor = new ReentrantLock();
 
     public static void log()
     {
-        MBeanServer server = ManagementFactory.getPlatformMBeanServer();
-
-        // everything from o.a.c.concurrent
-        logger.info(String.format("%-25s%10s%10s%15s%10s%18s", "Pool Name", "Active", "Pending", "Completed", "Blocked", "All Time Blocked"));
-
-        for (Map.Entry<String, String> tpool : ThreadPoolMetrics.getJmxThreadPools(server).entries())
+        // avoid logging more than once at the same time. throw away any attempts to log concurrently, as it would be
+        // confusing and noisy for operators - and don't bother logging again, immediately as it'll just be the same data
+        if (busyMonitor.tryLock())
         {
-            logger.info(String.format("%-25s%10s%10s%15s%10s%18s%n",
-                                      tpool.getValue(),
-                                      ThreadPoolMetrics.getJmxMetric(server, tpool.getKey(), tpool.getValue(), "ActiveTasks"),
-                                      ThreadPoolMetrics.getJmxMetric(server, tpool.getKey(), tpool.getValue(), "PendingTasks"),
-                                      ThreadPoolMetrics.getJmxMetric(server, tpool.getKey(), tpool.getValue(), "CompletedTasks"),
-                                      ThreadPoolMetrics.getJmxMetric(server, tpool.getKey(), tpool.getValue(), "CurrentlyBlockedTasks"),
-                                      ThreadPoolMetrics.getJmxMetric(server, tpool.getKey(), tpool.getValue(), "TotalBlockedTasks")));
+            try
+            {
+                logStatus();
+            }
+            finally
+            {
+                busyMonitor.unlock();
+            }
+        }
+        else
+        {
+            logger.trace("StatusLogger is busy");
+        }
+    }
+
+    private static void logStatus()
+    {
+        // everything from o.a.c.concurrent
+        logger.info(String.format("%-28s%10s%10s%15s%10s%18s", "Pool Name", "Active", "Pending", "Completed", "Blocked", "All Time Blocked"));
+
+        for (ThreadPoolMetrics tpool : CassandraMetricsRegistry.Metrics.allThreadPoolMetrics())
+        {
+            logger.info(String.format("%-28s%10s%10s%15s%10s%18s",
+                                      tpool.poolName,
+                                      tpool.activeTasks.getValue(),
+                                      tpool.pendingTasks.getValue(),
+                                      tpool.completedTasks.getValue(),
+                                      tpool.currentBlocked.getCount(),
+                                      tpool.totalBlocked.getCount()));
         }
 
         // one offs
@@ -74,7 +94,7 @@ public class StatusLogger
                                   "MessagingService", "n/a", pendingLargeMessages + "/" + pendingSmallMessages));
 
         // Global key/row cache information
-        AutoSavingCache<KeyCacheKey, RowIndexEntry> keyCache = CacheService.instance.keyCache;
+        AutoSavingCache<KeyCacheKey, AbstractRowIndexEntry> keyCache = CacheService.instance.keyCache;
         AutoSavingCache<RowCacheKey, IRowCacheEntry> rowCache = CacheService.instance.rowCache;
 
         int keyCacheKeysToSave = DatabaseDescriptor.getKeyCacheKeysToSave();
@@ -99,7 +119,7 @@ public class StatusLogger
         for (ColumnFamilyStore cfs : ColumnFamilyStore.all())
         {
             logger.info(String.format("%-25s%20s",
-                                      cfs.keyspace.getName() + "." + cfs.name,
+                                      cfs.getKeyspaceName() + "." + cfs.name,
                                       cfs.metric.memtableColumnsCount.getValue() + "," + cfs.metric.memtableLiveDataSize.getValue()));
         }
     }

@@ -19,19 +19,27 @@ package org.apache.cassandra.db.marshal;
 
 import java.nio.ByteBuffer;
 
+import org.apache.commons.lang3.mutable.MutableFloat;
+
 import org.apache.cassandra.cql3.CQL3Type;
 import org.apache.cassandra.cql3.Constants;
 import org.apache.cassandra.cql3.Term;
+import org.apache.cassandra.cql3.functions.ArgumentDeserializer;
 import org.apache.cassandra.serializers.TypeSerializer;
 import org.apache.cassandra.serializers.FloatSerializer;
 import org.apache.cassandra.serializers.MarshalException;
 import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.bytecomparable.ByteComparable;
+import org.apache.cassandra.utils.bytecomparable.ByteSource;
+import org.apache.cassandra.utils.bytecomparable.ByteSourceInverse;
 
 
-public class FloatType extends AbstractType<Float>
+public class FloatType extends NumberType<Float>
 {
     public static final FloatType instance = new FloatType();
+
+    private static final ByteBuffer MASKED_VALUE = instance.decompose(0f);
 
     FloatType() {super(ComparisonType.CUSTOM);} // singleton
 
@@ -40,12 +48,27 @@ public class FloatType extends AbstractType<Float>
         return true;
     }
 
-    public int compareCustom(ByteBuffer o1, ByteBuffer o2)
+    @Override
+    public boolean isFloatingPoint()
     {
-        if (!o1.hasRemaining() || !o2.hasRemaining())
-            return o1.hasRemaining() ? 1 : o2.hasRemaining() ? -1 : 0;
+        return true;
+    }
 
-        return compose(o1).compareTo(compose(o2));
+    public <VL, VR> int compareCustom(VL left, ValueAccessor<VL> accessorL, VR right, ValueAccessor<VR> accessorR)
+    {
+        return compareComposed(left, accessorL, right, accessorR, this);
+    }
+
+    @Override
+    public <V> ByteSource asComparableBytes(ValueAccessor<V> accessor, V data, ByteComparable.Version version)
+    {
+        return ByteSource.optionalSignedFixedLengthFloat(accessor, data);
+    }
+
+    @Override
+    public <V> V fromComparableBytes(ValueAccessor<V> accessor, ByteSource.Peekable comparableBytes, ByteComparable.Version version)
+    {
+        return ByteSourceInverse.getOptionalSignedFixedLengthFloat(accessor, comparableBytes, 4);
     }
 
     public ByteBuffer fromString(String source) throws MarshalException
@@ -56,8 +79,7 @@ public class FloatType extends AbstractType<Float>
 
       try
       {
-          float f = Float.parseFloat(source);
-          return ByteBufferUtil.bytes(f);
+          return decompose(Float.parseFloat(source));
       }
       catch (NumberFormatException e1)
       {
@@ -86,6 +108,8 @@ public class FloatType extends AbstractType<Float>
     public String toJSONString(ByteBuffer buffer, ProtocolVersion protocolVersion)
     {
         Float value = getSerializer().deserialize(buffer);
+        if (value == null)
+            return "\"\"";
         // JSON does not support NaN, Infinity and -Infinity values. Most of the parser convert them into null.
         if (value.isNaN() || value.isInfinite())
             return "null";
@@ -103,8 +127,93 @@ public class FloatType extends AbstractType<Float>
     }
 
     @Override
-    protected int valueLengthIfFixed()
+    public ArgumentDeserializer getArgumentDeserializer()
+    {
+        return new NumberArgumentDeserializer<MutableFloat>(new MutableFloat())
+        {
+            @Override
+            protected void setMutableValue(MutableFloat mutable, ByteBuffer buffer)
+            {
+                mutable.setValue(ByteBufferUtil.toFloat(buffer));
+            }
+        };
+    }
+
+    @Override
+    public int valueLengthIfFixed()
     {
         return 4;
+    }
+
+    @Override
+    public ByteBuffer add(Number left, Number right)
+    {
+        return ByteBufferUtil.bytes(left.floatValue() + right.floatValue());
+    }
+
+    @Override
+    public ByteBuffer substract(Number left, Number right)
+    {
+        return ByteBufferUtil.bytes(left.floatValue() - right.floatValue());
+    }
+
+    @Override
+    public ByteBuffer multiply(Number left, Number right)
+    {
+        return ByteBufferUtil.bytes(left.floatValue() * right.floatValue());
+    }
+
+    @Override
+    public ByteBuffer divide(Number left, Number right)
+    {
+        return ByteBufferUtil.bytes(left.floatValue() / right.floatValue());
+    }
+
+    @Override
+    public ByteBuffer mod(Number left, Number right)
+    {
+        return ByteBufferUtil.bytes(left.floatValue() % right.floatValue());
+    }
+
+    @Override
+    public ByteBuffer negate(Number input)
+    {
+        return ByteBufferUtil.bytes(-input.floatValue());
+    }
+
+    @Override
+    public ByteBuffer abs(Number input)
+    {
+        return ByteBufferUtil.bytes(Math.abs(input.floatValue()));
+    }
+
+    @Override
+    public ByteBuffer exp(Number input)
+    {
+        return ByteBufferUtil.bytes((float) Math.exp(input.floatValue()));
+    }
+
+    @Override
+    public ByteBuffer log(Number input)
+    {
+        return ByteBufferUtil.bytes((float) Math.log(input.floatValue()));
+    }
+
+    @Override
+    public ByteBuffer log10(Number input)
+    {
+        return ByteBufferUtil.bytes((float) Math.log10(input.floatValue()));
+    }
+
+    @Override
+    public ByteBuffer round(Number input)
+    {
+        return ByteBufferUtil.bytes((float) Math.round(input.floatValue()));
+    }
+
+    @Override
+    public ByteBuffer getMaskedValue()
+    {
+        return MASKED_VALUE;
     }
 }

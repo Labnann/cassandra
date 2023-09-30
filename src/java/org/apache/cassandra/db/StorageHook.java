@@ -18,45 +18,41 @@
 
 package org.apache.cassandra.db;
 
-import java.util.UUID;
-
 import org.apache.cassandra.db.filter.ClusteringIndexFilter;
 import org.apache.cassandra.db.filter.ColumnFilter;
 import org.apache.cassandra.db.partitions.PartitionUpdate;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.db.rows.UnfilteredRowIteratorWithLowerBound;
+import org.apache.cassandra.io.sstable.SSTableReadsListener;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
-import org.apache.cassandra.io.sstable.format.SSTableReadsListener;
+import org.apache.cassandra.schema.TableId;
 import org.apache.cassandra.utils.FBUtilities;
+
+import static org.apache.cassandra.config.CassandraRelevantProperties.STORAGE_HOOK;
 
 public interface StorageHook
 {
     public static final StorageHook instance = createHook();
 
-    public void reportWrite(UUID cfid, PartitionUpdate partitionUpdate);
-    public void reportRead(UUID cfid, DecoratedKey key);
+    public void reportWrite(TableId tableId, PartitionUpdate partitionUpdate);
+    public void reportRead(TableId tableId, DecoratedKey key);
     public UnfilteredRowIteratorWithLowerBound makeRowIteratorWithLowerBound(ColumnFamilyStore cfs,
-                                                                      DecoratedKey partitionKey,
-                                                                      SSTableReader sstable,
-                                                                      ClusteringIndexFilter filter,
-                                                                      ColumnFilter selectedColumns,
-                                                                      boolean isForThrift,
-                                                                      int nowInSec,
-                                                                      boolean applyThriftTransformation,
-                                                                      SSTableReadsListener listener);
-
+                                                                             SSTableReader sstable,
+                                                                             DecoratedKey partitionKey,
+                                                                             ClusteringIndexFilter filter,
+                                                                             ColumnFilter selectedColumns,
+                                                                             SSTableReadsListener listener);
     public UnfilteredRowIterator makeRowIterator(ColumnFamilyStore cfs,
                                                  SSTableReader sstable,
                                                  DecoratedKey key,
                                                  Slices slices,
                                                  ColumnFilter selectedColumns,
                                                  boolean reversed,
-                                                 boolean isForThrift,
                                                  SSTableReadsListener listener);
 
     static StorageHook createHook()
     {
-        String className =  System.getProperty("cassandra.storage_hook");
+        String className = STORAGE_HOOK.getString();
         if (className != null)
         {
             return FBUtilities.construct(className, StorageHook.class.getSimpleName());
@@ -64,27 +60,20 @@ public interface StorageHook
 
         return new StorageHook()
         {
-            public void reportWrite(UUID cfid, PartitionUpdate partitionUpdate) {}
+            public void reportWrite(TableId tableId, PartitionUpdate partitionUpdate) {}
 
-            public void reportRead(UUID cfid, DecoratedKey key) {}
+            public void reportRead(TableId tableId, DecoratedKey key) {}
 
             public UnfilteredRowIteratorWithLowerBound makeRowIteratorWithLowerBound(ColumnFamilyStore cfs,
-                                                                                     DecoratedKey partitionKey,
-                                                                                     SSTableReader sstable,
+                                                                                     SSTableReader sstable, DecoratedKey partitionKey,
                                                                                      ClusteringIndexFilter filter,
                                                                                      ColumnFilter selectedColumns,
-                                                                                     boolean isForThrift,
-                                                                                     int nowInSec,
-                                                                                     boolean applyThriftTransformation,
                                                                                      SSTableReadsListener listener)
             {
                 return new UnfilteredRowIteratorWithLowerBound(partitionKey,
                                                                sstable,
                                                                filter,
                                                                selectedColumns,
-                                                               isForThrift,
-                                                               nowInSec,
-                                                               applyThriftTransformation,
                                                                listener);
             }
 
@@ -94,10 +83,9 @@ public interface StorageHook
                                                          Slices slices,
                                                          ColumnFilter selectedColumns,
                                                          boolean reversed,
-                                                         boolean isForThrift,
                                                          SSTableReadsListener listener)
             {
-                return sstable.iterator(key, slices, selectedColumns, reversed, isForThrift, listener);
+                return sstable.rowIterator(key, slices, selectedColumns, reversed, listener);
             }
         };
     }

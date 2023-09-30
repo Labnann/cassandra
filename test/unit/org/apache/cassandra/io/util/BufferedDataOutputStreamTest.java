@@ -20,15 +20,14 @@
  */
 package org.apache.cassandra.io.util;
 
-import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
-import java.io.DataInput;
-import java.io.DataInputStream;
-import java.io.DataOutput;
-import java.io.DataOutputStream;
-import java.io.IOException;
-import java.io.OutputStream;
-import java.io.UTFDataFormatException;
+import com.google.common.primitives.UnsignedBytes;
+import com.google.common.primitives.UnsignedLong;
+import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.CassandraUInt;
+import org.apache.cassandra.utils.vint.VIntCoding;
+import org.junit.Test;
+
+import java.io.*;
 import java.lang.reflect.Field;
 import java.nio.BufferOverflowException;
 import java.nio.ByteBuffer;
@@ -37,17 +36,16 @@ import java.nio.channels.WritableByteChannel;
 import java.util.Arrays;
 import java.util.Random;
 
-import org.apache.cassandra.utils.vint.VIntCoding;
-import org.junit.Test;
-
-import com.google.common.primitives.UnsignedBytes;
-import com.google.common.primitives.UnsignedInteger;
-import com.google.common.primitives.UnsignedLong;
-
+import static org.apache.cassandra.utils.Clock.Global.nanoTime;
+import static org.apache.cassandra.utils.FBUtilities.preventIllegalAccessWarnings;
 import static org.junit.Assert.*;
 
 public class BufferedDataOutputStreamTest
 {
+    static
+    {
+        preventIllegalAccessWarnings();
+    }
 
     @Test(expected = BufferOverflowException.class)
     public void testDataOutputBufferFixedByes() throws Exception
@@ -166,7 +164,7 @@ public class BufferedDataOutputStreamTest
 
     static Field baos_bytes;
     static {
-        long seed = System.nanoTime();
+        long seed = nanoTime();
         //seed = 210187780999648L;
         System.out.println("Seed " + seed);
         r = new Random(seed);
@@ -578,7 +576,7 @@ public class BufferedDataOutputStreamTest
         long testValues[] = new long[] { //-1 };
                 0, 1
                 , UnsignedLong.MAX_VALUE.longValue(), UnsignedLong.MAX_VALUE.longValue() - 1, UnsignedLong.MAX_VALUE.longValue() + 1
-                , UnsignedInteger.MAX_VALUE.longValue(), UnsignedInteger.MAX_VALUE.longValue() - 1, UnsignedInteger.MAX_VALUE.longValue() + 1
+                , CassandraUInt.MAX_VALUE_LONG, CassandraUInt.MAX_VALUE_LONG - 1, CassandraUInt.MAX_VALUE_LONG + 1
                 , UnsignedBytes.MAX_VALUE, UnsignedBytes.MAX_VALUE - 1, UnsignedBytes.MAX_VALUE + 1
                 , 65536, 65536 - 1, 65536 + 1 };
         testValues = enrich(testValues);
@@ -611,47 +609,19 @@ public class BufferedDataOutputStreamTest
     }
 
     @Test
-    public void testWriteExcessSlow() throws Exception
+    public void testWriteBytes() throws Exception
     {
-        try (DataOutputBuffer dob = new DataOutputBuffer(4))
+        setUp();
+        DataOutputStreamPlus dosp = new BufferedDataOutputStreamPlus(adapter, 8);
+        for (int i = 0; i < 1000; i++)
         {
-            dob.strictFlushing = true;
-            ByteBuffer buf = ByteBuffer.allocateDirect(8);
-            buf.putLong(0, 42);
-            dob.write(buf);
-            assertEquals(42, ByteBuffer.wrap(dob.toByteArray()).getLong());
+            long val = r.nextLong();
+            int size = r.nextInt(9);
+            byte[] bytes = ByteBufferUtil.bytes(val).array();
+            canonical.write(bytes, 0, size);
+            dosp.writeMostSignificantBytes(val, size);
         }
-    }
-
-    @Test
-    public void testApplyToChannel() throws Exception
-    {
-        setUp();
-        Object obj = new Object();
-        Object retval = ndosp.applyToChannel( channel -> {
-            ByteBuffer buf = ByteBuffer.allocate(8);
-            buf.putLong(0, 42);
-            try
-            {
-                channel.write(buf);
-            }
-            catch (Exception e)
-            {
-                throw new RuntimeException(e);
-            }
-            return obj;
-        });
-        assertEquals(obj, retval);
-        assertEquals(42, ByteBuffer.wrap(generated.toByteArray()).getLong());
-    }
-
-    @Test(expected = UnsupportedOperationException.class)
-    public void testApplyToChannelThrowsForMisaligned() throws Exception
-    {
-        setUp();
-        ndosp.strictFlushing = true;
-        ndosp.applyToChannel( channel -> {
-            return null;
-        });
+        dosp.flush();
+        assertArrayEquals(canonical.toByteArray(), generated.toByteArray());
     }
 }

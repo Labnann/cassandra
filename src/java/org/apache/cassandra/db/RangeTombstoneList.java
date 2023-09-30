@@ -22,13 +22,16 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.Iterator;
 
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.utils.AbstractIterator;
+import org.apache.cassandra.utils.CassandraUInt;
+
 import com.google.common.collect.Iterators;
 
 import org.apache.cassandra.cache.IMeasurableMemory;
 import org.apache.cassandra.db.rows.*;
 import org.apache.cassandra.utils.ObjectSizes;
-import org.apache.cassandra.utils.memory.AbstractAllocator;
+import org.apache.cassandra.utils.memory.ByteBufferCloner;
 
 /**
  * Data structure holding the range tombstones of a ColumnFamily.
@@ -54,29 +57,35 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
 
     // Note: we don't want to use a List for the markedAts and delTimes to avoid boxing. We could
     // use a List for starts and ends, but having arrays everywhere is almost simpler.
-    private ClusteringBound[] starts;
-    private ClusteringBound[] ends;
+    private ClusteringBound<?>[] starts;
+    private ClusteringBound<?>[] ends;
     private long[] markedAts;
-    private int[] delTimes;
+    private int[] delTimesUnsignedIntegers;
 
     private long boundaryHeapSize;
     private int size;
 
-    private RangeTombstoneList(ClusteringComparator comparator, ClusteringBound[] starts, ClusteringBound[] ends, long[] markedAts, int[] delTimes, long boundaryHeapSize, int size)
+    private RangeTombstoneList(ClusteringComparator comparator,
+                               ClusteringBound<?>[] starts,
+                               ClusteringBound<?>[] ends,
+                               long[] markedAts,
+                               int[] delTimesUnsignedIntegers,
+                               long boundaryHeapSize,
+                               int size)
     {
-        assert starts.length == ends.length && starts.length == markedAts.length && starts.length == delTimes.length;
+        assert starts.length == ends.length && starts.length == markedAts.length && starts.length == delTimesUnsignedIntegers.length;
         this.comparator = comparator;
         this.starts = starts;
         this.ends = ends;
         this.markedAts = markedAts;
-        this.delTimes = delTimes;
+        this.delTimesUnsignedIntegers = delTimesUnsignedIntegers;
         this.size = size;
         this.boundaryHeapSize = boundaryHeapSize;
     }
 
     public RangeTombstoneList(ClusteringComparator comparator, int capacity)
     {
-        this(comparator, new ClusteringBound[capacity], new ClusteringBound[capacity], new long[capacity], new int[capacity], 0, 0);
+        this(comparator, new ClusteringBound<?>[capacity], new ClusteringBound<?>[capacity], new long[capacity], new int[capacity], 0, 0);
     }
 
     public boolean isEmpty()
@@ -100,35 +109,35 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
                                       Arrays.copyOf(starts, size),
                                       Arrays.copyOf(ends, size),
                                       Arrays.copyOf(markedAts, size),
-                                      Arrays.copyOf(delTimes, size),
+                                      Arrays.copyOf(delTimesUnsignedIntegers, size),
                                       boundaryHeapSize, size);
     }
 
-    public RangeTombstoneList copy(AbstractAllocator allocator)
+    public RangeTombstoneList clone(ByteBufferCloner cloner)
     {
         RangeTombstoneList copy =  new RangeTombstoneList(comparator,
-                                                          new ClusteringBound[size],
-                                                          new ClusteringBound[size],
+                                                          new ClusteringBound<?>[size],
+                                                          new ClusteringBound<?>[size],
                                                           Arrays.copyOf(markedAts, size),
-                                                          Arrays.copyOf(delTimes, size),
+                                                          Arrays.copyOf(delTimesUnsignedIntegers, size),
                                                           boundaryHeapSize, size);
 
 
         for (int i = 0; i < size; i++)
         {
-            copy.starts[i] = clone(starts[i], allocator);
-            copy.ends[i] = clone(ends[i], allocator);
+            copy.starts[i] = clone(starts[i], cloner);
+            copy.ends[i] = clone(ends[i], cloner);
         }
 
         return copy;
     }
 
-    private static ClusteringBound clone(ClusteringBound bound, AbstractAllocator allocator)
+    private static <T> ClusteringBound<ByteBuffer> clone(ClusteringBound<T> bound, ByteBufferCloner cloner)
     {
         ByteBuffer[] values = new ByteBuffer[bound.size()];
         for (int i = 0; i < values.length; i++)
-            values[i] = allocator.clone(bound.get(i));
-        return new ClusteringBound(bound.kind(), values);
+            values[i] = cloner.clone(bound.get(i), bound.accessor());
+        return new BufferClusteringBound(bound.kind(), values);
     }
 
     public void add(RangeTombstone tombstone)
@@ -136,7 +145,7 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
         add(tombstone.deletedSlice().start(),
             tombstone.deletedSlice().end(),
             tombstone.deletionTime().markedForDeleteAt(),
-            tombstone.deletionTime().localDeletionTime());
+            tombstone.deletionTime().localDeletionTimeUnsignedInteger);
     }
 
     /**
@@ -145,11 +154,11 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
      * This method will be faster if the new tombstone sort after all the currently existing ones (this is a common use case),
      * but it doesn't assume it.
      */
-    public void add(ClusteringBound start, ClusteringBound end, long markedAt, int delTime)
+    private void add(ClusteringBound<?> start, ClusteringBound<?> end, long markedAt, int delTimeUnsignedInteger)
     {
         if (isEmpty())
         {
-            addInternal(0, start, end, markedAt, delTime);
+            addInternal(0, start, end, markedAt, delTimeUnsignedInteger);
             return;
         }
 
@@ -158,13 +167,13 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
         // Fast path if we add in sorted order
         if (c <= 0)
         {
-            addInternal(size, start, end, markedAt, delTime);
+            addInternal(size, start, end, markedAt, delTimeUnsignedInteger);
         }
         else
         {
             // Note: insertFrom expect i to be the insertion point in term of interval ends
             int pos = Arrays.binarySearch(ends, 0, size, start, comparator);
-            insertFrom((pos >= 0 ? pos+1 : -pos-1), start, end, markedAt, delTime);
+            insertFrom((pos >= 0 ? pos+1 : -pos-1), start, end, markedAt, delTimeUnsignedInteger);
         }
         boundaryHeapSize += start.unsharedHeapSize() + end.unsharedHeapSize();
     }
@@ -204,7 +213,7 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
         if (size > 10 * tombstones.size)
         {
             for (int i = 0; i < tombstones.size; i++)
-                add(tombstones.starts[i], tombstones.ends[i], tombstones.markedAts[i], tombstones.delTimes[i]);
+                add(tombstones.starts[i], tombstones.ends[i], tombstones.markedAts[i], tombstones.delTimesUnsignedIntegers[i]);
         }
         else
         {
@@ -214,7 +223,7 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
             {
                 if (comparator.compare(tombstones.starts[j], ends[i]) < 0)
                 {
-                    insertFrom(i, tombstones.starts[j], tombstones.ends[j], tombstones.markedAts[j], tombstones.delTimes[j]);
+                    insertFrom(i, tombstones.starts[j], tombstones.ends[j], tombstones.markedAts[j], tombstones.delTimesUnsignedIntegers[j]);
                     j++;
                 }
                 else
@@ -224,7 +233,7 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
             }
             // Addds the remaining ones from tombstones if any (note that addInternal will increment size if relevant).
             for (; j < tombstones.size; j++)
-                addInternal(size, tombstones.starts[j], tombstones.ends[j], tombstones.markedAts[j], tombstones.delTimes[j]);
+                addInternal(size, tombstones.starts[j], tombstones.ends[j], tombstones.markedAts[j], tombstones.delTimesUnsignedIntegers[j]);
         }
     }
 
@@ -232,7 +241,7 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
      * Returns whether the given name/timestamp pair is deleted by one of the tombstone
      * of this RangeTombstoneList.
      */
-    public boolean isDeleted(Clustering clustering, Cell cell)
+    public boolean isDeleted(Clustering<?> clustering, Cell<?> cell)
     {
         int idx = searchInternal(clustering, 0, size);
         // No matter what the counter cell's timestamp is, a tombstone always takes precedence. See CASSANDRA-7346.
@@ -243,13 +252,13 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
      * Returns the DeletionTime for the tombstone overlapping {@code name} (there can't be more than one),
      * or null if {@code name} is not covered by any tombstone.
      */
-    public DeletionTime searchDeletionTime(Clustering name)
+    public DeletionTime searchDeletionTime(Clustering<?> name)
     {
         int idx = searchInternal(name, 0, size);
-        return idx < 0 ? null : new DeletionTime(markedAts[idx], delTimes[idx]);
+        return idx < 0 ? null : DeletionTime.buildUnsafeWithUnsignedInteger(markedAts[idx], delTimesUnsignedIntegers[idx]);
     }
 
-    public RangeTombstone search(Clustering name)
+    public RangeTombstone search(Clustering<?> name)
     {
         int idx = searchInternal(name, 0, size);
         return idx < 0 ? null : rangeTombstone(idx);
@@ -261,7 +270,7 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
      *
      * Note that bounds are not in the range if they fall on its boundary.
      */
-    private int searchInternal(ClusteringPrefix name, int startIdx, int endIdx)
+    private int searchInternal(ClusteringPrefix<?> name, int startIdx, int endIdx)
     {
         if (isEmpty())
             return -1;
@@ -291,7 +300,7 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
         {
             dataSize += starts[i].dataSize() + ends[i].dataSize();
             dataSize += TypeSizes.sizeof(markedAts[i]);
-            dataSize += TypeSizes.sizeof(delTimes[i]);
+            dataSize += TypeSizes.sizeof(delTimesUnsignedIntegers[i]);
         }
         return dataSize;
     }
@@ -309,7 +318,7 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
         for (int i = 0; i < size; i++)
         {
             collector.updateTimestamp(markedAts[i]);
-            collector.updateLocalDeletionTime(delTimes[i]);
+            collector.updateLocalDeletionTime(CassandraUInt.toLong(delTimesUnsignedIntegers[i]));
         }
     }
 
@@ -321,22 +330,22 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
 
     private RangeTombstone rangeTombstone(int idx)
     {
-        return new RangeTombstone(Slice.make(starts[idx], ends[idx]), new DeletionTime(markedAts[idx], delTimes[idx]));
+        return new RangeTombstone(Slice.make(starts[idx], ends[idx]), DeletionTime.buildUnsafeWithUnsignedInteger(markedAts[idx], delTimesUnsignedIntegers[idx]));
     }
 
-    private RangeTombstone rangeTombstoneWithNewStart(int idx, ClusteringBound newStart)
+    private RangeTombstone rangeTombstoneWithNewStart(int idx, ClusteringBound<?> newStart)
     {
-        return new RangeTombstone(Slice.make(newStart, ends[idx]), new DeletionTime(markedAts[idx], delTimes[idx]));
+        return new RangeTombstone(Slice.make(newStart, ends[idx]), DeletionTime.buildUnsafeWithUnsignedInteger(markedAts[idx], delTimesUnsignedIntegers[idx]));
     }
 
-    private RangeTombstone rangeTombstoneWithNewEnd(int idx, ClusteringBound newEnd)
+    private RangeTombstone rangeTombstoneWithNewEnd(int idx, ClusteringBound<?> newEnd)
     {
-        return new RangeTombstone(Slice.make(starts[idx], newEnd), new DeletionTime(markedAts[idx], delTimes[idx]));
+        return new RangeTombstone(Slice.make(starts[idx], newEnd), DeletionTime.buildUnsafeWithUnsignedInteger(markedAts[idx], delTimesUnsignedIntegers[idx]));
     }
 
-    private RangeTombstone rangeTombstoneWithNewBounds(int idx, ClusteringBound newStart, ClusteringBound newEnd)
+    private RangeTombstone rangeTombstoneWithNewBounds(int idx, ClusteringBound<?> newStart, ClusteringBound<?> newEnd)
     {
-        return new RangeTombstone(Slice.make(newStart, newEnd), new DeletionTime(markedAts[idx], delTimes[idx]));
+        return new RangeTombstone(Slice.make(newStart, newEnd), DeletionTime.buildUnsafeWithUnsignedInteger(markedAts[idx], delTimesUnsignedIntegers[idx]));
     }
 
     public Iterator<RangeTombstone> iterator()
@@ -344,6 +353,7 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
         return iterator(false);
     }
 
+    @SuppressWarnings("resource")
     public Iterator<RangeTombstone> iterator(boolean reversed)
     {
         return reversed
@@ -380,13 +390,13 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
 
     private Iterator<RangeTombstone> forwardIterator(final Slice slice)
     {
-        int startIdx = slice.start() == ClusteringBound.BOTTOM ? 0 : searchInternal(slice.start(), 0, size);
+        int startIdx = slice.start().isBottom() ? 0 : searchInternal(slice.start(), 0, size);
         final int start = startIdx < 0 ? -startIdx-1 : startIdx;
 
         if (start >= size)
             return Collections.emptyIterator();
 
-        int finishIdx = slice.end() == ClusteringBound.TOP ? size - 1 : searchInternal(slice.end(), start, size);
+        int finishIdx = slice.end().isTop() ? size - 1 : searchInternal(slice.end(), start, size);
         // if stopIdx is the first range after 'slice.end()' we care only until the previous range
         final int finish = finishIdx < 0 ? -finishIdx-2 : finishIdx;
 
@@ -397,8 +407,10 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
         {
             // We want to make sure the range are stricly included within the queried slice as this
             // make it easier to combine things when iterating over successive slices.
-            ClusteringBound s = comparator.compare(starts[start], slice.start()) < 0 ? slice.start() : starts[start];
-            ClusteringBound e = comparator.compare(slice.end(), ends[start]) < 0 ? slice.end() : ends[start];
+            ClusteringBound<?> s = comparator.compare(starts[start], slice.start()) < 0 ? slice.start() : starts[start];
+            ClusteringBound<?> e = comparator.compare(slice.end(), ends[start]) < 0 ? slice.end() : ends[start];
+            if (Slice.isEmpty(comparator, s, e))
+                return Collections.emptyIterator();
             return Iterators.<RangeTombstone>singletonIterator(rangeTombstoneWithNewBounds(start, s, e));
         }
 
@@ -425,14 +437,14 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
 
     private Iterator<RangeTombstone> reverseIterator(final Slice slice)
     {
-        int startIdx = slice.end() == ClusteringBound.TOP ? size - 1 : searchInternal(slice.end(), 0, size);
+        int startIdx = slice.end().isTop() ? size - 1 : searchInternal(slice.end(), 0, size);
         // if startIdx is the first range after 'slice.end()' we care only until the previous range
         final int start = startIdx < 0 ? -startIdx-2 : startIdx;
 
         if (start < 0)
             return Collections.emptyIterator();
 
-        int finishIdx = slice.start() == ClusteringBound.BOTTOM ? 0 : searchInternal(slice.start(), 0, start + 1);  // include same as finish
+        int finishIdx = slice.start().isBottom() ? 0 : searchInternal(slice.start(), 0, start + 1);  // include same as finish
         // if stopIdx is the first range after 'slice.end()' we care only until the previous range
         final int finish = finishIdx < 0 ? -finishIdx-1 : finishIdx;
 
@@ -443,8 +455,10 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
         {
             // We want to make sure the range are stricly included within the queried slice as this
             // make it easier to combine things when iterator over successive slices.
-            ClusteringBound s = comparator.compare(starts[start], slice.start()) < 0 ? slice.start() : starts[start];
-            ClusteringBound e = comparator.compare(slice.end(), ends[start]) < 0 ? slice.end() : ends[start];
+            ClusteringBound<?> s = comparator.compare(starts[start], slice.start()) < 0 ? slice.start() : starts[start];
+            ClusteringBound<?> e = comparator.compare(slice.end(), ends[start]) < 0 ? slice.end() : ends[start];
+            if (Slice.isEmpty(comparator, s, e))
+                return Collections.emptyIterator();
             return Iterators.<RangeTombstone>singletonIterator(rangeTombstoneWithNewBounds(start, s, e));
         }
 
@@ -485,7 +499,7 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
                 return false;
             if (markedAts[i] != that.markedAts[i])
                 return false;
-            if (delTimes[i] != that.delTimes[i])
+            if (delTimesUnsignedIntegers[i] != that.delTimesUnsignedIntegers[i])
                 return false;
         }
         return true;
@@ -499,7 +513,7 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
         {
             result += starts[i].hashCode() + ends[i].hashCode();
             result += (int)(markedAts[i] ^ (markedAts[i] >>> 32));
-            result += delTimes[i];
+            result += delTimesUnsignedIntegers[i];
         }
         return result;
     }
@@ -510,7 +524,7 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
         System.arraycopy(src.starts, 0, dst.starts, 0, src.size);
         System.arraycopy(src.ends, 0, dst.ends, 0, src.size);
         System.arraycopy(src.markedAts, 0, dst.markedAts, 0, src.size);
-        System.arraycopy(src.delTimes, 0, dst.delTimes, 0, src.size);
+        System.arraycopy(src.delTimesUnsignedIntegers, 0, dst.delTimesUnsignedIntegers, 0, src.size);
         dst.size = src.size;
         dst.boundaryHeapSize = src.boundaryHeapSize;
     }
@@ -527,7 +541,7 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
      *   - e_i <= s_i+1
      * Basically, range are non overlapping and in order.
      */
-    private void insertFrom(int i, ClusteringBound start, ClusteringBound end, long markedAt, int delTime)
+    private void insertFrom(int i, ClusteringBound<?> start, ClusteringBound<?> end, long markedAt, int delTimeUnsignedInternal)
     {
         while (i < size)
         {
@@ -546,12 +560,12 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
                 // First deal with what might come before the newly added one.
                 if (comparator.compare(starts[i], start) < 0)
                 {
-                    ClusteringBound newEnd = start.invert();
+                    ClusteringBound<?> newEnd = start.invert();
                     if (!Slice.isEmpty(comparator, starts[i], newEnd))
                     {
-                        addInternal(i, starts[i], newEnd, markedAts[i], delTimes[i]);
+                        addInternal(i, starts[i], newEnd, markedAts[i], delTimesUnsignedIntegers[i]);
                         i++;
-                        setInternal(i, start, ends[i], markedAts[i], delTimes[i]);
+                        setInternal(i, start, ends[i], markedAts[i], delTimesUnsignedIntegers[i]);
                     }
                 }
 
@@ -563,7 +577,7 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
                 {
                     // Here start <= starts[i] and end < starts[i]
                     // This means the current element is before the current one.
-                    addInternal(i, start, end, markedAt, delTime);
+                    addInternal(i, start, end, markedAt, delTimeUnsignedInternal);
                     return;
                 }
 
@@ -580,11 +594,11 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
                     // we're good with the next element
                     if (i == size-1 || comparator.compare(end, starts[i+1]) <= 0)
                     {
-                        setInternal(i, start, end, markedAt, delTime);
+                        setInternal(i, start, end, markedAt, delTimeUnsignedInternal);
                         return;
                     }
 
-                    setInternal(i, start, starts[i+1].invert(), markedAt, delTime);
+                    setInternal(i, start, starts[i+1].invert(), markedAt, delTimeUnsignedInternal);
                     start = starts[i+1];
                     i++;
                 }
@@ -592,12 +606,12 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
                 {
                     // We don't overwrite fully. Insert the new interval, and then update the now next
                     // one to reflect the not overwritten parts. We're then done.
-                    addInternal(i, start, end, markedAt, delTime);
+                    addInternal(i, start, end, markedAt, delTimeUnsignedInternal);
                     i++;
-                    ClusteringBound newStart = end.invert();
+                    ClusteringBound<?> newStart = end.invert();
                     if (!Slice.isEmpty(comparator, newStart, ends[i]))
                     {
-                        setInternal(i, newStart, ends[i], markedAts[i], delTimes[i]);
+                        setInternal(i, newStart, ends[i], markedAts[i], delTimesUnsignedIntegers[i]);
                     }
                     return;
                 }
@@ -613,13 +627,13 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
                     // otherwise insert until the beginning of the current element
                     if (comparator.compare(end, starts[i]) <= 0)
                     {
-                        addInternal(i, start, end, markedAt, delTime);
+                        addInternal(i, start, end, markedAt, delTimeUnsignedInternal);
                         return;
                     }
-                    ClusteringBound newEnd = starts[i].invert();
+                    ClusteringBound<?> newEnd = starts[i].invert();
                     if (!Slice.isEmpty(comparator, start, newEnd))
                     {
-                        addInternal(i, start, newEnd, markedAt, delTime);
+                        addInternal(i, start, newEnd, markedAt, delTimeUnsignedInternal);
                         i++;
                     }
                 }
@@ -637,7 +651,7 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
         }
 
         // If we got there, then just insert the remainder at the end
-        addInternal(i, start, end, markedAt, delTime);
+        addInternal(i, start, end, markedAt, delTimeUnsignedInternal);
     }
 
     private int capacity()
@@ -648,7 +662,7 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
     /*
      * Adds the new tombstone at index i, growing and/or moving elements to make room for it.
      */
-    private void addInternal(int i, ClusteringBound start, ClusteringBound end, long markedAt, int delTime)
+    private void addInternal(int i, ClusteringBound<?> start, ClusteringBound<?> end, long markedAt, int delTimeUnsignedInteger)
     {
         assert i >= 0;
 
@@ -657,7 +671,7 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
         else if (i < size)
             moveElements(i);
 
-        setInternal(i, start, end, markedAt, delTime);
+        setInternal(i, start, end, markedAt, delTimeUnsignedInteger);
         size++;
     }
 
@@ -666,7 +680,12 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
      */
     private void growToFree(int i)
     {
-        int newLength = (capacity() * 3) / 2 + 1;
+        // Introduce getRangeTombstoneResizeFactor
+        int newLength = (int) Math.ceil(capacity() * DatabaseDescriptor.getRangeTombstoneListGrowthFactor());
+        // Fallback to the original calculation if the newLength calculated from the resize factor is not valid.
+        if (newLength <= capacity())
+            newLength = ((capacity() * 3) / 2) + 1;
+        
         grow(i, newLength);
     }
 
@@ -684,15 +703,15 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
         starts = grow(starts, size, newLength, i);
         ends = grow(ends, size, newLength, i);
         markedAts = grow(markedAts, size, newLength, i);
-        delTimes = grow(delTimes, size, newLength, i);
+        delTimesUnsignedIntegers = grow(delTimesUnsignedIntegers, size, newLength, i);
     }
 
-    private static ClusteringBound[] grow(ClusteringBound[] a, int size, int newLength, int i)
+    private static ClusteringBound<?>[] grow(ClusteringBound<?>[] a, int size, int newLength, int i)
     {
         if (i < 0 || i >= size)
             return Arrays.copyOf(a, newLength);
 
-        ClusteringBound[] newA = new ClusteringBound[newLength];
+        ClusteringBound<?>[] newA = new ClusteringBound<?>[newLength];
         System.arraycopy(a, 0, newA, 0, i);
         System.arraycopy(a, i, newA, i+1, size - i);
         return newA;
@@ -731,20 +750,20 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
         System.arraycopy(starts, i, starts, i+1, size - i);
         System.arraycopy(ends, i, ends, i+1, size - i);
         System.arraycopy(markedAts, i, markedAts, i+1, size - i);
-        System.arraycopy(delTimes, i, delTimes, i+1, size - i);
+        System.arraycopy(delTimesUnsignedIntegers, i, delTimesUnsignedIntegers, i+1, size - i);
         // we set starts[i] to null to indicate the position is now empty, so that we update boundaryHeapSize
         // when we set it
         starts[i] = null;
     }
 
-    private void setInternal(int i, ClusteringBound start, ClusteringBound end, long markedAt, int delTime)
+    private void setInternal(int i, ClusteringBound<?> start, ClusteringBound<?> end, long markedAt, int delTimeUnsignedInteger)
     {
         if (starts[i] != null)
             boundaryHeapSize -= starts[i].unsharedHeapSize() + ends[i].unsharedHeapSize();
         starts[i] = start;
         ends[i] = end;
         markedAts[i] = markedAt;
-        delTimes[i] = delTime;
+        delTimesUnsignedIntegers[i] = delTimeUnsignedInteger;
         boundaryHeapSize += start.unsharedHeapSize() + end.unsharedHeapSize();
     }
 
@@ -756,6 +775,6 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
                 + ObjectSizes.sizeOfArray(starts)
                 + ObjectSizes.sizeOfArray(ends)
                 + ObjectSizes.sizeOfArray(markedAts)
-                + ObjectSizes.sizeOfArray(delTimes);
+                + ObjectSizes.sizeOfArray(delTimesUnsignedIntegers);
     }
 }

@@ -17,33 +17,55 @@
  */
 package org.apache.cassandra.db.lifecycle;
 
-import java.io.File;
 import java.nio.file.Path;
-import java.util.*;
-import java.util.function.BiFunction;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.IdentityHashMap;
+import java.util.List;
+import java.util.Set;
+import java.util.function.BiPredicate;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Predicate;
-import com.google.common.collect.*;
-
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.Iterables;
+import com.google.common.collect.Lists;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Directories;
 import org.apache.cassandra.db.compaction.OperationType;
 import org.apache.cassandra.io.sstable.SSTable;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.sstable.format.SSTableReader.UniqueIdentifier;
+import org.apache.cassandra.io.util.File;
+import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.utils.Throwables;
+import org.apache.cassandra.utils.TimeUUID;
 import org.apache.cassandra.utils.concurrent.Transactional;
 
 import static com.google.common.base.Functions.compose;
-import static com.google.common.base.Predicates.*;
+import static com.google.common.base.Predicates.in;
 import static com.google.common.collect.ImmutableSet.copyOf;
-import static com.google.common.collect.Iterables.*;
+import static com.google.common.collect.Iterables.concat;
+import static com.google.common.collect.Iterables.getFirst;
+import static com.google.common.collect.Iterables.transform;
 import static java.util.Collections.singleton;
-import static org.apache.cassandra.db.lifecycle.Helpers.*;
+import static org.apache.cassandra.db.lifecycle.Helpers.abortObsoletion;
+import static org.apache.cassandra.db.lifecycle.Helpers.checkNotReplaced;
+import static org.apache.cassandra.db.lifecycle.Helpers.concatUniq;
+import static org.apache.cassandra.db.lifecycle.Helpers.emptySet;
+import static org.apache.cassandra.db.lifecycle.Helpers.filterIn;
+import static org.apache.cassandra.db.lifecycle.Helpers.filterOut;
+import static org.apache.cassandra.db.lifecycle.Helpers.markObsolete;
+import static org.apache.cassandra.db.lifecycle.Helpers.orIn;
+import static org.apache.cassandra.db.lifecycle.Helpers.prepareForObsoletion;
+import static org.apache.cassandra.db.lifecycle.Helpers.select;
+import static org.apache.cassandra.db.lifecycle.Helpers.selectFirst;
+import static org.apache.cassandra.db.lifecycle.Helpers.setReplaced;
 import static org.apache.cassandra.db.lifecycle.View.updateCompacting;
 import static org.apache.cassandra.db.lifecycle.View.updateLiveSet;
 import static org.apache.cassandra.utils.Throwables.maybeFail;
@@ -56,7 +78,7 @@ import static org.apache.cassandra.utils.concurrent.Refs.selfRefs;
  * action to occur at the beginning of the commit phase, but also *requires* that the prepareToCommit() phase only take
  * actions that can be rolled back.
  */
-public class LifecycleTransaction extends Transactional.AbstractTransactional implements LifecycleNewTracker
+public class LifecycleTransaction extends Transactional.AbstractTransactional implements ILifecycleTransaction
 {
     private static final Logger logger = LoggerFactory.getLogger(LifecycleTransaction.class);
 
@@ -124,6 +146,10 @@ public class LifecycleTransaction extends Transactional.AbstractTransactional im
     // the tidier and their readers, to be used for marking readers obsoleted during a commit
     private List<LogTransaction.Obsoletion> obsoletions;
 
+    // commit/rollback hooks
+    private List<Runnable> commitHooks = new ArrayList<>();
+    private List<Runnable> abortHooks = new ArrayList<>();
+
     /**
      * construct a Transaction for use in an offline operation
      */
@@ -138,7 +164,7 @@ public class LifecycleTransaction extends Transactional.AbstractTransactional im
     public static LifecycleTransaction offline(OperationType operationType, Iterable<SSTableReader> readers)
     {
         // if offline, for simplicity we just use a dummy tracker
-        Tracker dummy = new Tracker(null, false);
+        Tracker dummy = Tracker.newDummyTracker();
         dummy.addInitialSSTables(readers);
         dummy.apply(updateCompacting(emptySet(), readers));
         return new LifecycleTransaction(dummy, operationType, readers);
@@ -150,17 +176,17 @@ public class LifecycleTransaction extends Transactional.AbstractTransactional im
     @SuppressWarnings("resource") // log closed during postCleanup
     public static LifecycleTransaction offline(OperationType operationType)
     {
-        Tracker dummy = new Tracker(null, false);
+        Tracker dummy = Tracker.newDummyTracker();
         return new LifecycleTransaction(dummy, new LogTransaction(operationType, dummy), Collections.emptyList());
     }
 
     @SuppressWarnings("resource") // log closed during postCleanup
-    LifecycleTransaction(Tracker tracker, OperationType operationType, Iterable<SSTableReader> readers)
+    LifecycleTransaction(Tracker tracker, OperationType operationType, Iterable<? extends SSTableReader> readers)
     {
         this(tracker, new LogTransaction(operationType, tracker), readers);
     }
 
-    LifecycleTransaction(Tracker tracker, LogTransaction log, Iterable<SSTableReader> readers)
+    LifecycleTransaction(Tracker tracker, LogTransaction log, Iterable<? extends SSTableReader> readers)
     {
         this.tracker = tracker;
         this.log = log;
@@ -183,7 +209,7 @@ public class LifecycleTransaction extends Transactional.AbstractTransactional im
         return log.type();
     }
 
-    public UUID opId()
+    public TimeUUID opId()
     {
         return log.id();
     }
@@ -224,11 +250,13 @@ public class LifecycleTransaction extends Transactional.AbstractTransactional im
 
         accumulate = markObsolete(obsoletions, accumulate);
         accumulate = tracker.updateSizeTracking(logged.obsolete, logged.update, accumulate);
+        accumulate = runOnCommitHooks(accumulate);
         accumulate = release(selfRefs(logged.obsolete), accumulate);
         accumulate = tracker.notifySSTablesChanged(originals, logged.update, log.type(), accumulate);
 
         return accumulate;
     }
+
 
     /**
      * undo all of the changes made by this transaction, resetting the state to its original form
@@ -260,6 +288,7 @@ public class LifecycleTransaction extends Transactional.AbstractTransactional im
         accumulate = tracker.notifySSTablesChanged(invalid, restored, OperationType.COMPACTION, accumulate);
         // setReplaced immediately preceding versions that have not been obsoleted
         accumulate = setReplaced(logged.update, accumulate);
+        accumulate = runOnAbortooks(accumulate);
         // we have replaced all of logged.update and never made visible staged.update,
         // and the files we have logged as obsolete we clone fresh versions of, so they are no longer needed either
         // any _staged_ obsoletes should either be in staged.update already, and dealt with there,
@@ -268,6 +297,32 @@ public class LifecycleTransaction extends Transactional.AbstractTransactional im
 
         logged.clear();
         staged.clear();
+        return accumulate;
+    }
+
+    private Throwable runOnCommitHooks(Throwable accumulate)
+    {
+        return runHooks(commitHooks, accumulate);
+    }
+
+    private Throwable runOnAbortooks(Throwable accumulate)
+    {
+        return runHooks(abortHooks, accumulate);
+    }
+
+    private static Throwable runHooks(Iterable<Runnable> hooks, Throwable accumulate)
+    {
+        for (Runnable hook : hooks)
+        {
+            try
+            {
+                hook.run();
+            }
+            catch (Exception e)
+            {
+                accumulate = Throwables.merge(accumulate, e);
+            }
+        }
         return accumulate;
     }
 
@@ -281,11 +336,6 @@ public class LifecycleTransaction extends Transactional.AbstractTransactional im
     public boolean isOffline()
     {
         return tracker.isDummy();
-    }
-
-    public void permitRedundantTransitions()
-    {
-        super.permitRedundantTransitions();
     }
 
     /**
@@ -372,6 +422,16 @@ public class LifecycleTransaction extends Transactional.AbstractTransactional im
         staged.obsolete.add(reader);
     }
 
+    public void runOnCommit(Runnable fn)
+    {
+        commitHooks.add(fn);
+    }
+
+    public void runOnAbort(Runnable fn)
+    {
+        abortHooks.add(fn);
+    }
+
     /**
      * obsolete every file in the original transaction
      */
@@ -417,7 +477,7 @@ public class LifecycleTransaction extends Transactional.AbstractTransactional im
     private List<SSTableReader> restoreUpdatedOriginals()
     {
         Iterable<SSTableReader> torestore = filterIn(originals, logged.update, logged.obsolete);
-        return ImmutableList.copyOf(transform(torestore, (reader) -> current(reader).cloneWithRestoredStart(reader.first)));
+        return ImmutableList.copyOf(transform(torestore, (reader) -> current(reader).cloneWithRestoredStart(reader.getFirst())));
     }
 
     /**
@@ -544,9 +604,9 @@ public class LifecycleTransaction extends Transactional.AbstractTransactional im
         return LogTransaction.removeUnfinishedLeftovers(cfs.getDirectories().getCFDirectories());
     }
 
-    public static boolean removeUnfinishedLeftovers(CFMetaData cfMetaData)
+    public static boolean removeUnfinishedLeftovers(TableMetadata metadata)
     {
-        return LogTransaction.removeUnfinishedLeftovers(cfMetaData);
+        return LogTransaction.removeUnfinishedLeftovers(metadata);
     }
 
     /**
@@ -561,7 +621,7 @@ public class LifecycleTransaction extends Transactional.AbstractTransactional im
      * @param filter - A function that receives each file and its type, it should return true to have the file returned
      * @return - the list of files that were scanned and for which the filter returned true
      */
-    public static List<File> getFiles(Path folder, BiFunction<File, Directories.FileType, Boolean> filter, Directories.OnTxnErr onTxnErr)
+    public static List<File> getFiles(Path folder, BiPredicate<File, Directories.FileType> filter, Directories.OnTxnErr onTxnErr)
     {
         return new LogAwareFileLister(folder, filter, onTxnErr).list();
     }

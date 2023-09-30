@@ -17,16 +17,16 @@
  */
 package org.apache.cassandra.streaming;
 
-import java.net.InetAddress;
 import java.util.Collections;
 import java.util.Map;
 import java.util.Set;
-import java.util.UUID;
 
 import com.google.common.collect.ImmutableSet;
 
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.utils.TimeUUID;
 
 public abstract class StreamEvent
 {
@@ -38,9 +38,9 @@ public abstract class StreamEvent
     }
 
     public final Type eventType;
-    public final UUID planId;
+    public final TimeUUID planId;
 
-    protected StreamEvent(Type eventType, UUID planId)
+    protected StreamEvent(Type eventType, TimeUUID planId)
     {
         this.eventType = eventType;
         this.planId = planId;
@@ -48,11 +48,11 @@ public abstract class StreamEvent
 
     public static class SessionCompleteEvent extends StreamEvent
     {
-        public final InetAddress peer;
+        public final InetAddressAndPort peer;
         public final boolean success;
         public final int sessionIndex;
         public final Set<StreamRequest> requests;
-        public final String description;
+        public final StreamOperation streamOperation;
         public final Map<String, Set<Range<Token>>> transferredRangesPerKeyspace;
 
         public SessionCompleteEvent(StreamSession session)
@@ -62,7 +62,7 @@ public abstract class StreamEvent
             this.success = session.isSuccess();
             this.sessionIndex = session.sessionIndex();
             this.requests = ImmutableSet.copyOf(session.requests);
-            this.description = session.description();
+            this.streamOperation = session.streamOperation();
             this.transferredRangesPerKeyspace = Collections.unmodifiableMap(session.transferredRangesPerKeyspace);
         }
     }
@@ -71,7 +71,7 @@ public abstract class StreamEvent
     {
         public final ProgressInfo progress;
 
-        public ProgressEvent(UUID planId, ProgressInfo progress)
+        public ProgressEvent(TimeUUID planId, ProgressInfo progress)
         {
             super(Type.FILE_PROGRESS, planId);
             this.progress = progress;
@@ -87,11 +87,13 @@ public abstract class StreamEvent
     public static class SessionPreparedEvent extends StreamEvent
     {
         public final SessionInfo session;
+        public final StreamSession.PrepareDirection prepareDirection;
 
-        public SessionPreparedEvent(UUID planId, SessionInfo session)
+        public SessionPreparedEvent(TimeUUID planId, SessionInfo session, StreamSession.PrepareDirection prepareDirection)
         {
             super(Type.STREAM_PREPARED, planId);
             this.session = session;
+            this.prepareDirection = prepareDirection;
         }
     }
 }

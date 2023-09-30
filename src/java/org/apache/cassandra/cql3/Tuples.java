@@ -22,24 +22,26 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.stream.Collectors;
-
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import java.util.stream.StreamSupport;
 
 import org.apache.cassandra.cql3.functions.Function;
-import org.apache.cassandra.db.marshal.*;
+import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.db.marshal.ByteBufferAccessor;
+import org.apache.cassandra.db.marshal.ListType;
+import org.apache.cassandra.db.marshal.ReversedType;
+import org.apache.cassandra.db.marshal.TupleType;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.serializers.MarshalException;
 import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.ByteBufferUtil;
+
+import static org.apache.cassandra.cql3.statements.RequestValidations.invalidRequest;
 
 /**
  * Static helper methods and classes for tuples.
  */
 public class Tuples
 {
-    private static final Logger logger = LoggerFactory.getLogger(Tuples.class);
-
     private Tuples() {}
 
     public static ColumnSpecification componentSpecOf(ColumnSpecification column, int component)
@@ -65,7 +67,12 @@ public class Tuples
 
         public Term prepare(String keyspace, ColumnSpecification receiver) throws InvalidRequestException
         {
-            validateAssignableTo(keyspace, receiver);
+            // The parser cannot differentiate between a tuple with one element and a term between parenthesis.
+            // By consequence, we need to wait until we know the target type to determine which one it is.
+            if (elements.size() == 1 && !checkIfTupleType(receiver.type))
+                return elements.get(0).prepare(keyspace, receiver);
+
+            validateTupleAssignableTo(receiver, elements);
 
             List<Term> values = new ArrayList<>(elements.size());
             boolean allTerminal = true;
@@ -102,38 +109,14 @@ public class Tuples
             return allTerminal ? value.bind(QueryOptions.DEFAULT) : value;
         }
 
-        private void validateAssignableTo(String keyspace, ColumnSpecification receiver) throws InvalidRequestException
-        {
-            if (!checkIfTupleType(receiver.type))
-                throw new InvalidRequestException(String.format("Invalid tuple type literal for %s of type %s", receiver.name, receiver.type.asCQL3Type()));
-
-            TupleType tt = getTupleType(receiver.type);
-            for (int i = 0; i < elements.size(); i++)
-            {
-                if (i >= tt.size())
-                {
-                    throw new InvalidRequestException(String.format("Invalid tuple literal for %s: too many elements. Type %s expects %d but got %d",
-                            receiver.name, tt.asCQL3Type(), tt.size(), elements.size()));
-                }
-
-                Term.Raw value = elements.get(i);
-                ColumnSpecification spec = componentSpecOf(receiver, i);
-                if (!value.testAssignment(keyspace, spec).isAssignable())
-                    throw new InvalidRequestException(String.format("Invalid tuple literal for %s: component %d is not of type %s", receiver.name, i, spec.type.asCQL3Type()));
-            }
-        }
-
         public AssignmentTestable.TestResult testAssignment(String keyspace, ColumnSpecification receiver)
         {
-            try
-            {
-                validateAssignableTo(keyspace, receiver);
-                return AssignmentTestable.TestResult.WEAKLY_ASSIGNABLE;
-            }
-            catch (InvalidRequestException e)
-            {
-                return AssignmentTestable.TestResult.NOT_ASSIGNABLE;
-            }
+            // The parser cannot differentiate between a tuple with one element and a term between parenthesis.
+            // By consequence, we need to wait until we know the target type to determine which one it is.
+            if (elements.size() == 1 && !checkIfTupleType(receiver.type))
+                return elements.get(0).testAssignment(keyspace, receiver);
+
+            return testTupleAssignment(receiver, elements);
         }
 
         @Override
@@ -152,7 +135,7 @@ public class Tuples
 
         public String getText()
         {
-            return elements.stream().map(Term.Raw::getText).collect(Collectors.joining(", ", "(", ")"));
+            return tupleToString(elements, Term.Raw::getText);
         }
     }
 
@@ -170,17 +153,17 @@ public class Tuples
 
         public static Value fromSerialized(ByteBuffer bytes, TupleType type)
         {
-            ByteBuffer[] values = type.split(bytes);
+            ByteBuffer[] values = type.split(ByteBufferAccessor.instance, bytes);
             if (values.length > type.size())
             {
                 throw new InvalidRequestException(String.format(
                         "Tuple value contained too many fields (expected %s, got %s)", type.size(), values.length));
             }
 
-            return new Value(type.split(bytes));
+            return new Value(type.split(ByteBufferAccessor.instance, bytes));
         }
 
-        public ByteBuffer get(ProtocolVersion protocolVersion)
+        public ByteBuffer get(ProtocolVersion version)
         {
             return TupleType.buildValue(elements);
         }
@@ -274,21 +257,21 @@ public class Tuples
             this.elements = items;
         }
 
-        public static InValue fromSerialized(ByteBuffer value, ListType type, QueryOptions options) throws InvalidRequestException
+        public static <T> InValue fromSerialized(ByteBuffer value, ListType<T> type) throws InvalidRequestException
         {
             try
             {
                 // Collections have this small hack that validate cannot be called on a serialized object,
                 // but the deserialization does the validation (so we're fine).
-                List<?> l = type.getSerializer().deserializeForNativeProtocol(value, options.getProtocolVersion());
+                List<T> l = type.getSerializer().deserialize(value, ByteBufferAccessor.instance);
 
                 assert type.getElementsType() instanceof TupleType;
                 TupleType tupleType = Tuples.getTupleType(type.getElementsType());
 
                 // type.split(bytes)
                 List<List<ByteBuffer>> elements = new ArrayList<>(l.size());
-                for (Object element : l)
-                    elements.add(Arrays.asList(tupleType.split(type.getElementsType().decompose(element))));
+                for (T element : l)
+                    elements.add(Arrays.asList(tupleType.split(ByteBufferAccessor.instance, type.getElementsType().decompose(element))));
                 return new InValue(elements);
             }
             catch (MarshalException e)
@@ -297,7 +280,7 @@ public class Tuples
             }
         }
 
-        public ByteBuffer get(ProtocolVersion protocolVersion)
+        public ByteBuffer get(ProtocolVersion version)
         {
             throw new UnsupportedOperationException();
         }
@@ -432,33 +415,116 @@ public class Tuples
             ByteBuffer value = options.getValues().get(bindIndex);
             if (value == ByteBufferUtil.UNSET_BYTE_BUFFER)
                 throw new InvalidRequestException(String.format("Invalid unset value for %s", receiver.name));
-            return value == null ? null : InValue.fromSerialized(value, (ListType)receiver.type, options);
+            return value == null ? null : InValue.fromSerialized(value, (ListType<?>) receiver.type);
         }
     }
 
-    public static String tupleToString(List<?> items)
+    /**
+     * Create a <code>String</code> representation of the tuple containing the specified elements.
+     *
+     * @param elements the tuple elements
+     * @return a <code>String</code> representation of the tuple
+     */
+    public static String tupleToString(List<?> elements)
     {
+        return tupleToString(elements, Object::toString);
+    }
 
-        StringBuilder sb = new StringBuilder("(");
-        for (int i = 0; i < items.size(); i++)
+    /**
+     * Create a <code>String</code> representation of the tuple from the specified items associated to
+     * the tuples elements.
+     *
+     * @param items items associated to the tuple elements
+     * @param mapper the mapper used to map the items to the <code>String</code> representation of the tuple elements
+     * @return a <code>String</code> representation of the tuple
+     */
+    public static <T> String tupleToString(Iterable<T> items, java.util.function.Function<T, String> mapper)
+    {
+        return StreamSupport.stream(items.spliterator(), false)
+                            .map(mapper)
+                            .collect(Collectors.joining(", ", "(", ")"));
+    }
+
+    /**
+     * Returns the exact TupleType from the items if it can be known.
+     *
+     * @param items the items mapped to the tuple elements
+     * @param mapper the mapper used to retrieve the element types from the  items
+     * @return the exact TupleType from the items if it can be known or <code>null</code>
+     */
+    public static <T> TupleType getExactTupleTypeIfKnown(List<T> items,
+                                                         java.util.function.Function<T, AbstractType<?>> mapper)
+    {
+        List<AbstractType<?>> types = new ArrayList<>(items.size());
+        for (T item : items)
         {
-            sb.append(items.get(i));
-            if (i < items.size() - 1)
-                sb.append(", ");
+            AbstractType<?> type = mapper.apply(item);
+            if (type == null)
+                return null;
+            types.add(type);
         }
-        sb.append(')');
-        return sb.toString();
+        return new TupleType(types);
+    }
+
+    /**
+     * Checks if the tuple with the specified elements can be assigned to the specified column.
+     *
+     * @param receiver the receiving column
+     * @param elements the tuple elements
+     * @throws InvalidRequestException if the tuple cannot be assigned to the specified column.
+     */
+    public static void validateTupleAssignableTo(ColumnSpecification receiver,
+                                                 List<? extends AssignmentTestable> elements)
+    {
+        if (!checkIfTupleType(receiver.type))
+            throw invalidRequest("Invalid tuple type literal for %s of type %s", receiver.name, receiver.type.asCQL3Type());
+
+        TupleType tt = getTupleType(receiver.type);
+        for (int i = 0; i < elements.size(); i++)
+        {
+            if (i >= tt.size())
+            {
+                throw invalidRequest("Invalid tuple literal for %s: too many elements. Type %s expects %d but got %d",
+                                     receiver.name, tt.asCQL3Type(), tt.size(), elements.size());
+            }
+
+            AssignmentTestable value = elements.get(i);
+            ColumnSpecification spec = componentSpecOf(receiver, i);
+            if (!value.testAssignment(receiver.ksName, spec).isAssignable())
+                throw invalidRequest("Invalid tuple literal for %s: component %d is not of type %s",
+                                     receiver.name, i, spec.type.asCQL3Type());
+        }
+    }
+
+    /**
+     * Tests that the tuple with the specified elements can be assigned to the specified column.
+     *
+     * @param receiver the receiving column
+     * @param elements the tuple elements
+     */
+    public static AssignmentTestable.TestResult testTupleAssignment(ColumnSpecification receiver,
+                                                                    List<? extends AssignmentTestable> elements)
+    {
+        try
+        {
+            validateTupleAssignableTo(receiver, elements);
+            return AssignmentTestable.TestResult.WEAKLY_ASSIGNABLE;
+        }
+        catch (InvalidRequestException e)
+        {
+            return AssignmentTestable.TestResult.NOT_ASSIGNABLE;
+        }
     }
 
     public static boolean checkIfTupleType(AbstractType<?> tuple)
     {
         return (tuple instanceof TupleType) ||
-               (tuple instanceof ReversedType && ((ReversedType) tuple).baseType instanceof TupleType);
+               (tuple instanceof ReversedType && ((ReversedType<?>) tuple).baseType instanceof TupleType);
 
     }
 
     public static TupleType getTupleType(AbstractType<?> tuple)
     {
-        return (tuple instanceof ReversedType ? ((TupleType) ((ReversedType) tuple).baseType) : (TupleType)tuple);
+        return (tuple instanceof ReversedType ? ((TupleType) ((ReversedType<?>) tuple).baseType) : (TupleType)tuple);
     }
 }

@@ -17,14 +17,23 @@
  */
 package org.apache.cassandra.repair.messages;
 
-import java.io.IOException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.io.IVersionedSerializer;
-import org.apache.cassandra.io.util.DataInputPlus;
-import org.apache.cassandra.io.util.DataOutputPlus;
-import org.apache.cassandra.net.MessageOut;
+import org.apache.cassandra.exceptions.RepairException;
+import org.apache.cassandra.exceptions.RequestFailureReason;
+import org.apache.cassandra.gms.Gossiper;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.net.Message;
 import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.net.RequestCallback;
+import org.apache.cassandra.net.Verb;
 import org.apache.cassandra.repair.RepairJobDesc;
+import org.apache.cassandra.streaming.PreviewKind;
+import org.apache.cassandra.utils.CassandraVersion;
+import org.apache.cassandra.utils.TimeUUID;
+
+import static org.apache.cassandra.net.MessageFlag.CALL_BACK_ON_FAILURE;
 
 /**
  * Base class of all repair related request/response messages.
@@ -33,74 +42,57 @@ import org.apache.cassandra.repair.RepairJobDesc;
  */
 public abstract class RepairMessage
 {
-    public static final IVersionedSerializer<RepairMessage> serializer = new RepairMessageSerializer();
-
-    public static interface MessageSerializer<T extends RepairMessage> extends IVersionedSerializer<T> {}
-
-    public static enum Type
-    {
-        VALIDATION_REQUEST(0, ValidationRequest.serializer),
-        VALIDATION_COMPLETE(1, ValidationComplete.serializer),
-        SYNC_REQUEST(2, SyncRequest.serializer),
-        SYNC_COMPLETE(3, SyncComplete.serializer),
-        ANTICOMPACTION_REQUEST(4, AnticompactionRequest.serializer),
-        PREPARE_MESSAGE(5, PrepareMessage.serializer),
-        SNAPSHOT(6, SnapshotMessage.serializer),
-        CLEANUP(7, CleanupMessage.serializer);
-
-        private final byte type;
-        private final MessageSerializer<RepairMessage> serializer;
-
-        private Type(int type, MessageSerializer<RepairMessage> serializer)
-        {
-            this.type = (byte) type;
-            this.serializer = serializer;
-        }
-
-        public static Type fromByte(byte b)
-        {
-            for (Type t : values())
-            {
-               if (t.type == b)
-                   return t;
-            }
-            throw new IllegalArgumentException("Unknown RepairMessage.Type: " + b);
-        }
-    }
-
-    public final Type messageType;
+    private static final CassandraVersion SUPPORTS_TIMEOUTS = new CassandraVersion("4.0.7-SNAPSHOT");
+    private static final Logger logger = LoggerFactory.getLogger(RepairMessage.class);
     public final RepairJobDesc desc;
 
-    protected RepairMessage(Type messageType, RepairJobDesc desc)
+    protected RepairMessage(RepairJobDesc desc)
     {
-        this.messageType = messageType;
         this.desc = desc;
     }
 
-    public MessageOut<RepairMessage> createMessage()
+    public interface RepairFailureCallback
     {
-        return new MessageOut<>(MessagingService.Verb.REPAIR_MESSAGE, this, RepairMessage.serializer);
+        void onFailure(Exception e);
     }
 
-    public static class RepairMessageSerializer implements MessageSerializer<RepairMessage>
+    public static void sendMessageWithFailureCB(RepairMessage request, Verb verb, InetAddressAndPort endpoint, RepairFailureCallback failureCallback)
     {
-        public void serialize(RepairMessage message, DataOutputPlus out, int version) throws IOException
+        RequestCallback<?> callback = new RequestCallback<Object>()
         {
-            out.write(message.messageType.type);
-            message.messageType.serializer.serialize(message, out, version);
-        }
+            @Override
+            public void onResponse(Message<Object> msg)
+            {
+                logger.info("[#{}] {} received by {}", request.desc.parentSessionId, verb, endpoint);
+                // todo: at some point we should make repair messages follow the normal path, actually using this
+            }
 
-        public RepairMessage deserialize(DataInputPlus in, int version) throws IOException
-        {
-            RepairMessage.Type messageType = RepairMessage.Type.fromByte(in.readByte());
-            return messageType.serializer.deserialize(in, version);
-        }
+            @Override
+            public boolean invokeOnFailure()
+            {
+                return true;
+            }
 
-        public long serializedSize(RepairMessage message, int version)
-        {
-            long size = 1; // for messageType byte
-            size += message.messageType.serializer.serializedSize(message, version);
-            return size;
-        }
+            public void onFailure(InetAddressAndPort from, RequestFailureReason failureReason)
+            {
+                logger.error("[#{}] {} failed on {}: {}", request.desc.parentSessionId, verb, from, failureReason);
+
+                if (supportsTimeouts(from, request.desc.parentSessionId))
+                    failureCallback.onFailure(RepairException.error(request.desc, PreviewKind.NONE, String.format("Got %s failure from %s: %s", verb, from, failureReason)));
+            }
+        };
+
+        MessagingService.instance().sendWithCallback(Message.outWithFlag(verb, request, CALL_BACK_ON_FAILURE),
+                                                     endpoint,
+                                                     callback);
+    }
+
+    private static boolean supportsTimeouts(InetAddressAndPort from, TimeUUID parentSessionId)
+    {
+        CassandraVersion remoteVersion = Gossiper.instance.getReleaseVersion(from);
+        if (remoteVersion != null && remoteVersion.compareTo(SUPPORTS_TIMEOUTS) >= 0)
+            return true;
+        logger.warn("[#{}] Not failing repair due to remote host {} not supporting repair message timeouts (version = {})", parentSessionId, from, remoteVersion);
+        return false;
     }
 }

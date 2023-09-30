@@ -17,10 +17,7 @@
  */
 package org.apache.cassandra.cql3;
 
-import static junit.framework.Assert.fail;
-
 import java.io.Closeable;
-import java.util.UUID;
 import java.util.concurrent.ExecutionException;
 
 import org.junit.Assert;
@@ -29,13 +26,17 @@ import org.junit.Test;
 import org.apache.cassandra.Util;
 import org.apache.cassandra.config.Config.DiskFailurePolicy;
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.commitlog.CommitLog;
 import org.apache.cassandra.db.commitlog.CommitLogSegment;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.gms.Gossiper;
 import org.apache.cassandra.io.FSWriteError;
+import org.apache.cassandra.schema.TableId;
 import org.apache.cassandra.utils.JVMStabilityInspector;
 import org.apache.cassandra.utils.KillerForTests;
+
+import static org.junit.Assert.fail;
 
 /**
  * Test that TombstoneOverwhelmingException gets thrown when it should be and doesn't when it shouldn't be.
@@ -115,7 +116,10 @@ public class OutOfSpaceTest extends CQLTester
     {
         try
         {
-            Keyspace.open(KEYSPACE).getColumnFamilyStore(currentTable()).forceFlush().get();
+            Keyspace.open(KEYSPACE)
+                    .getColumnFamilyStore(currentTable())
+                    .forceFlush(ColumnFamilyStore.FlushReason.UNIT_TESTS)
+                    .get();
             fail("FSWriteError expected.");
         }
         catch (ExecutionException e)
@@ -125,9 +129,9 @@ public class OutOfSpaceTest extends CQLTester
         }
 
         // Make sure commit log wasn't discarded.
-        UUID cfid = currentTableMetadata().cfId;
+        TableId tableId = currentTableMetadata().id;
         for (CommitLogSegment segment : CommitLog.instance.segmentManager.getActiveSegments())
-            if (segment.getDirtyCFIDs().contains(cfid))
+            if (segment.getDirtyTableIds().contains(tableId))
                 return;
         fail("Expected commit log to remain dirty for the affected table.");
     }

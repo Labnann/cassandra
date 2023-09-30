@@ -19,12 +19,12 @@
 package org.apache.cassandra.repair.messages;
 
 import java.io.IOException;
-import java.net.InetAddress;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 
+import com.google.common.collect.Lists;
 import org.junit.AfterClass;
 import org.junit.Assert;
 import org.junit.BeforeClass;
@@ -41,11 +41,18 @@ import org.apache.cassandra.io.util.DataInputBuffer;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputBufferFixed;
 import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.net.MessagingService;
-import org.apache.cassandra.repair.NodePair;
+import org.apache.cassandra.repair.SyncNodePair;
+import org.apache.cassandra.streaming.PreviewKind;
 import org.apache.cassandra.repair.RepairJobDesc;
+import org.apache.cassandra.schema.TableId;
 import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.streaming.SessionSummary;
+import org.apache.cassandra.streaming.StreamSummary;
 import org.apache.cassandra.utils.MerkleTrees;
+
+import static org.apache.cassandra.utils.TimeUUID.Generator.nextTimeUUID;
 
 public class RepairMessageSerializationsTest
 {
@@ -79,7 +86,7 @@ public class RepairMessageSerializationsTest
     private RepairJobDesc buildRepairJobDesc()
     {
         List<Range<Token>> tokenRanges = buildTokenRanges();
-        return new RepairJobDesc(UUID.randomUUID(), UUID.randomUUID(), "serializationsTestKeyspace", "repairMessages", tokenRanges);
+        return new RepairJobDesc(nextTimeUUID(), nextTimeUUID(), "serializationsTestKeyspace", "repairMessages", tokenRanges);
     }
 
     private List<Range<Token>> buildTokenRanges()
@@ -112,7 +119,7 @@ public class RepairMessageSerializationsTest
     @Test
     public void validationCompleteMessage_NoMerkleTree() throws IOException
     {
-        ValidationComplete deserialized = validationCompleteMessage(null);
+        ValidationResponse deserialized = validationCompleteMessage(null);
         Assert.assertNull(deserialized.trees);
     }
 
@@ -121,54 +128,53 @@ public class RepairMessageSerializationsTest
     {
         MerkleTrees trees = new MerkleTrees(Murmur3Partitioner.instance);
         trees.addMerkleTree(256, new Range<>(new LongToken(1000), new LongToken(1001)));
-        ValidationComplete deserialized = validationCompleteMessage(trees);
+        ValidationResponse deserialized = validationCompleteMessage(trees);
 
         // a simple check to make sure we got some merkle trees back.
         Assert.assertEquals(trees.size(), deserialized.trees.size());
     }
 
-    private ValidationComplete validationCompleteMessage(MerkleTrees trees) throws IOException
+    private ValidationResponse validationCompleteMessage(MerkleTrees trees) throws IOException
     {
         RepairJobDesc jobDesc = buildRepairJobDesc();
-        ValidationComplete msg = trees == null ?
-                                 new ValidationComplete(jobDesc) :
-                                 new ValidationComplete(jobDesc, trees);
-        ValidationComplete deserialized = serializeRoundTrip(msg, ValidationComplete.serializer);
+        ValidationResponse msg = trees == null ?
+                                 new ValidationResponse(jobDesc) :
+                                 new ValidationResponse(jobDesc, trees);
+        ValidationResponse deserialized = serializeRoundTrip(msg, ValidationResponse.serializer);
         return deserialized;
     }
 
     @Test
     public void syncRequestMessage() throws IOException
     {
-        InetAddress initiator = InetAddress.getByName("127.0.0.1");
-        InetAddress src = InetAddress.getByName("127.0.0.2");
-        InetAddress dst = InetAddress.getByName("127.0.0.3");
+        InetAddressAndPort initiator = InetAddressAndPort.getByName("127.0.0.1");
+        InetAddressAndPort src = InetAddressAndPort.getByName("127.0.0.2");
+        InetAddressAndPort dst = InetAddressAndPort.getByName("127.0.0.3");
 
-        SyncRequest msg = new SyncRequest(buildRepairJobDesc(), initiator, src, dst, buildTokenRanges());
+        SyncRequest msg = new SyncRequest(buildRepairJobDesc(), initiator, src, dst, buildTokenRanges(), PreviewKind.NONE, false);
         serializeRoundTrip(msg, SyncRequest.serializer);
     }
 
     @Test
     public void syncCompleteMessage() throws IOException
     {
-        InetAddress src = InetAddress.getByName("127.0.0.2");
-        InetAddress dst = InetAddress.getByName("127.0.0.3");
-        SyncComplete msg = new SyncComplete(buildRepairJobDesc(), new NodePair(src, dst), true);
-        serializeRoundTrip(msg, SyncComplete.serializer);
-    }
-
-    @Test
-    public void antiCompactionRequestMessage() throws IOException
-    {
-        AnticompactionRequest msg = new AnticompactionRequest(UUID.randomUUID(), buildTokenRanges());
-        serializeRoundTrip(msg, AnticompactionRequest.serializer);
+        InetAddressAndPort src = InetAddressAndPort.getByName("127.0.0.2");
+        InetAddressAndPort dst = InetAddressAndPort.getByName("127.0.0.3");
+        List<SessionSummary> summaries = new ArrayList<>();
+        summaries.add(new SessionSummary(src, dst,
+                                         Lists.newArrayList(new StreamSummary(TableId.fromUUID(UUID.randomUUID()), 5, 100)),
+                                         Lists.newArrayList(new StreamSummary(TableId.fromUUID(UUID.randomUUID()), 500, 10))
+        ));
+        SyncResponse msg = new SyncResponse(buildRepairJobDesc(), new SyncNodePair(src, dst), true, summaries);
+        serializeRoundTrip(msg, SyncResponse.serializer);
     }
 
     @Test
     public void prepareMessage() throws IOException
     {
-        PrepareMessage msg = new PrepareMessage(UUID.randomUUID(), new ArrayList<UUID>() {{add(UUID.randomUUID());}},
-                                                buildTokenRanges(), true, 100000L, false);
+        PrepareMessage msg = new PrepareMessage(nextTimeUUID(), new ArrayList<TableId>() {{add(TableId.generate());}},
+                                                buildTokenRanges(), true, 100000L, false,
+                                                PreviewKind.NONE);
         serializeRoundTrip(msg, PrepareMessage.serializer);
     }
 
@@ -182,7 +188,7 @@ public class RepairMessageSerializationsTest
     @Test
     public void cleanupMessage() throws IOException
     {
-        CleanupMessage msg = new CleanupMessage(UUID.randomUUID());
+        CleanupMessage msg = new CleanupMessage(nextTimeUUID());
         serializeRoundTrip(msg, CleanupMessage.serializer);
     }
 }

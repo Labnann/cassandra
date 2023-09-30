@@ -17,18 +17,48 @@
  */
 package org.apache.cassandra.cql3.functions;
 
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.Set;
+
 import com.google.common.base.Objects;
 
-import org.apache.cassandra.config.SchemaConstants;
+import org.apache.cassandra.cql3.CqlBuilder;
+import org.apache.cassandra.schema.SchemaConstants;
 
 public final class FunctionName
 {
+    private static final Set<Character> DISALLOWED_CHARACTERS = Collections.unmodifiableSet(
+        new HashSet<>(Arrays.asList('/', '[', ']')));
+
+    // We special case the token function because that's the only function which name is a reserved keyword
+    private static final FunctionName TOKEN_FUNCTION_NAME = FunctionName.nativeFunction("token");
+
     public final String keyspace;
     public final String name;
 
     public static FunctionName nativeFunction(String name)
     {
         return new FunctionName(SchemaConstants.SYSTEM_KEYSPACE_NAME, name);
+    }
+
+    /**
+     * Validate the function name, e.g. contains no disallowed characters
+     * @param name
+     * @return true if name is valid; otherwise, false
+     */
+    public static boolean isNameValid(String name)
+    {
+        for (int i = 0; i < name.length(); i++)
+        {
+            char c = name.charAt(i);
+            if (DISALLOWED_CHARACTERS.contains(c))
+            {
+                return false;
+            }
+        }
+        return true;
     }
 
     public FunctionName(String keyspace, String name)
@@ -78,5 +108,22 @@ public final class FunctionName
     public String toString()
     {
         return keyspace == null ? name : keyspace + "." + name;
+    }
+
+    public void appendCqlTo(CqlBuilder builder)
+    {
+        if (equalsNativeFunction(TOKEN_FUNCTION_NAME))
+        {
+            builder.append(name);
+        }
+        else
+        {
+            if (keyspace != null)
+            {
+                builder.appendQuotingIfNeeded(keyspace)
+                       .append('.');
+            }
+            builder.appendQuotingIfNeeded(name);
+        }
     }
 }

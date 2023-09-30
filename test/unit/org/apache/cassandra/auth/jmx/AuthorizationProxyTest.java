@@ -20,8 +20,9 @@ package org.apache.cassandra.auth.jmx;
 
 import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.BooleanSupplier;
 import java.util.function.Function;
-import java.util.function.Supplier;
+import java.util.function.Predicate;
 import java.util.stream.Collectors;
 import javax.management.MalformedObjectNameException;
 import javax.management.ObjectName;
@@ -343,7 +344,7 @@ public class AuthorizationProxyTest
     }
 
     @Test
-    public void rejectInvocationOfBlacklistedMethods() throws Throwable
+    public void rejectInvocationOfRestrictedMethods() throws Throwable
     {
         String[] methods = { "createMBean",
                              "deserialize",
@@ -441,7 +442,7 @@ public class AuthorizationProxyTest
         for (String method : methods)
             assertEquals(withPermission, proxy.authorize(subject(role1.getRoleName()), method, new Object[]{ null }));
 
-        // non-whitelisted methods should be rejected regardless.
+        // non-allowed methods should be rejected regardless.
         // This isn't exactly comprehensive, but it's better than nothing
         String[] notAllowed = { "fooMethod", "barMethod", "bazMethod" };
         for (String method : notAllowed)
@@ -495,9 +496,9 @@ public class AuthorizationProxyTest
     {
         Function<RoleResource, Set<PermissionDetails>> getPermissions;
         Function<ObjectName, Set<ObjectName>> queryNames;
-        Function<RoleResource, Boolean> isSuperuser;
-        Supplier<Boolean> isAuthzRequired;
-        Supplier<Boolean> isAuthSetupComplete = () -> true;
+        Predicate<RoleResource> isSuperuser;
+        BooleanSupplier isAuthzRequired;
+        BooleanSupplier isAuthSetupComplete = () -> true;
 
         AuthorizationProxy build()
         {
@@ -532,19 +533,19 @@ public class AuthorizationProxyTest
             return this;
         }
 
-        ProxyBuilder isSuperuser(Function<RoleResource, Boolean> f)
+        ProxyBuilder isSuperuser(Predicate<RoleResource> f)
         {
             isSuperuser = f;
             return this;
         }
 
-        ProxyBuilder isAuthzRequired(Supplier<Boolean> s)
+        ProxyBuilder isAuthzRequired(BooleanSupplier s)
         {
             isAuthzRequired = s;
             return this;
         }
 
-        ProxyBuilder isAuthSetupComplete(Supplier<Boolean> s)
+        ProxyBuilder isAuthSetupComplete(BooleanSupplier s)
         {
             isAuthSetupComplete = s;
             return this;
@@ -562,17 +563,17 @@ public class AuthorizationProxyTest
                 this.queryNames = f;
             }
 
-            void setIsSuperuser(Function<RoleResource, Boolean> f)
+            void setIsSuperuser(Predicate<RoleResource> f)
             {
                 this.isSuperuser = f;
             }
 
-            void setIsAuthzRequired(Supplier<Boolean> s)
+            void setIsAuthzRequired(BooleanSupplier s)
             {
                 this.isAuthzRequired = s;
             }
 
-            void setIsAuthSetupComplete(Supplier<Boolean> s)
+            void setIsAuthSetupComplete(BooleanSupplier s)
             {
                 this.isAuthSetupComplete = s;
             }

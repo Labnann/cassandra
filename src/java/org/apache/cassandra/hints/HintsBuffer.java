@@ -23,14 +23,16 @@ import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.zip.CRC32;
 
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.io.util.DataOutputBuffer;
 import org.apache.cassandra.io.util.DataOutputBufferFixed;
 import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.utils.AbstractIterator;
+import org.apache.cassandra.utils.Clock;
 import org.apache.cassandra.utils.concurrent.OpOrder;
 
 import static org.apache.cassandra.utils.FBUtilities.updateChecksum;
@@ -52,21 +54,22 @@ final class HintsBuffer
 {
     // hint entry overhead in bytes (int length, int length checksum, int body checksum)
     static final int ENTRY_OVERHEAD_SIZE = 12;
-    static final int CLOSED = -1;
 
     private final ByteBuffer slab; // the underlying backing ByteBuffer for all the serialized hints
-    private final AtomicInteger position; // the position in the slab that we currently allocate from
+    private final AtomicLong position; // the position in the slab that we currently allocate from
 
     private final ConcurrentMap<UUID, Queue<Integer>> offsets;
     private final OpOrder appendOrder;
+    private final ConcurrentMap<UUID, Long> earliestHintByHost; // Stores time of the earliest hint in the buffer for each host
 
     private HintsBuffer(ByteBuffer slab)
     {
         this.slab = slab;
 
-        position = new AtomicInteger();
+        position = new AtomicLong();
         offsets = new ConcurrentHashMap<>();
         appendOrder = new OpOrder();
+        earliestHintByHost = new ConcurrentHashMap<>();
     }
 
     static HintsBuffer create(int slabSize)
@@ -76,7 +79,7 @@ final class HintsBuffer
 
     boolean isClosed()
     {
-        return position.get() == CLOSED;
+        return position.get() < 0;
     }
 
     int capacity()
@@ -86,8 +89,8 @@ final class HintsBuffer
 
     int remaining()
     {
-        int pos = position.get();
-        return pos == CLOSED ? 0 : capacity() - pos;
+        long pos = position.get();
+        return (int) (pos < 0 ? 0 : Math.max(0, capacity() - pos));
     }
 
     HintsBuffer recycle()
@@ -142,6 +145,21 @@ final class HintsBuffer
         };
     }
 
+    /**
+     * Retrieve the time of the earliest hint in the buffer for a specific node
+     * @param hostId UUID of the node
+     * @return timestamp for the earliest hint in the buffer, or {@link Global#currentTimeMillis()}
+     */
+    long getEarliestHintTime(UUID hostId)
+    {
+        return earliestHintByHost.getOrDefault(hostId, Clock.Global.currentTimeMillis());
+    }
+
+    void clearEarliestHintForHostId(UUID hostId)
+    {
+        earliestHintByHost.remove(hostId);
+    }
+
     @SuppressWarnings("resource")
     Allocation allocate(int hintSize)
     {
@@ -177,25 +195,21 @@ final class HintsBuffer
         return new Allocation(offset, totalSize, opGroup);
     }
 
+    // allocate bytes in the slab, or return negative if not enough space
     private int allocateBytes(int totalSize)
     {
-        while (true)
+        long prev = position.getAndAdd(totalSize);
+
+        if (prev < 0) // the slab has been 'closed'
+            return -1;
+
+        if ((prev + totalSize) > slab.capacity())
         {
-            int prev = position.get();
-            int next = prev + totalSize;
-
-            if (prev == CLOSED) // the slab has been 'closed'
-                return CLOSED;
-
-            if (next > slab.capacity())
-            {
-                position.set(CLOSED); // mark the slab as no longer allocating if we've exceeded its capacity
-                return CLOSED;
-            }
-
-            if (position.compareAndSet(prev, next))
-                return prev;
+            position.set(Long.MIN_VALUE); // mark the slab as no longer allocating if we've exceeded its capacity
+            return -1;
         }
+
+        return (int)prev;
     }
 
     private void put(UUID hostId, int offset)
@@ -227,8 +241,15 @@ final class HintsBuffer
         void write(Iterable<UUID> hostIds, Hint hint)
         {
             write(hint);
+            long ts = Clock.Global.currentTimeMillis();
             for (UUID hostId : hostIds)
+            {
+                // We only need the time of the first hint in the buffer
+                if (DatabaseDescriptor.hintWindowPersistentEnabled())
+                    earliestHintByHost.putIfAbsent(hostId, ts);
+
                 put(hostId, offset);
+            }
         }
 
         public void close()

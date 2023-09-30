@@ -1,239 +1,151 @@
 /*
-* Licensed to the Apache Software Foundation (ASF) under one
-* or more contributor license agreements.  See the NOTICE file
-* distributed with this work for additional information
-* regarding copyright ownership.  The ASF licenses this file
-* to you under the Apache License, Version 2.0 (the
-* "License"); you may not use this file except in compliance
-* with the License.  You may obtain a copy of the License at
-*
-*    http://www.apache.org/licenses/LICENSE-2.0
-*
-* Unless required by applicable law or agreed to in writing,
-* software distributed under the License is distributed on an
-* "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-* KIND, either express or implied.  See the License for the
-* specific language governing permissions and limitations
-* under the License.
-*/
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package org.apache.cassandra.service;
 
-import java.net.InetAddress;
-import java.util.List;
+import java.net.UnknownHostException;
+import java.util.UUID;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
 
+import com.google.common.util.concurrent.Uninterruptibles;
+import org.junit.Assert;
 import org.junit.BeforeClass;
 import org.junit.Test;
+import org.junit.runner.RunWith;
 
-import org.apache.cassandra.db.PartitionPosition;
+import org.apache.cassandra.ServerTestUtils;
+import org.apache.cassandra.config.Config;
 import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.dht.*;
-import org.apache.cassandra.locator.TokenMetadata;
+import org.apache.cassandra.gms.EndpointState;
+import org.apache.cassandra.gms.Gossiper;
+import org.apache.cassandra.gms.HeartBeatState;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.locator.Replica;
+import org.jboss.byteman.contrib.bmunit.BMRule;
+import org.jboss.byteman.contrib.bmunit.BMUnitRunner;
 
-import static org.apache.cassandra.Util.rp;
-import static org.apache.cassandra.Util.token;
-import static org.junit.Assert.assertEquals;
+import static org.apache.cassandra.locator.ReplicaUtils.full;
+import static org.assertj.core.api.Assertions.assertThat;
 
+@RunWith(BMUnitRunner.class)
 public class StorageProxyTest
 {
-    private static Range<PartitionPosition> range(PartitionPosition left, PartitionPosition right)
-    {
-        return new Range<PartitionPosition>(left, right);
-    }
-
-    private static Bounds<PartitionPosition> bounds(PartitionPosition left, PartitionPosition right)
-    {
-        return new Bounds<PartitionPosition>(left, right);
-    }
-
-    private static ExcludingBounds<PartitionPosition> exBounds(PartitionPosition left, PartitionPosition right)
-    {
-        return new ExcludingBounds<PartitionPosition>(left, right);
-    }
-
-    private static IncludingExcludingBounds<PartitionPosition> incExBounds(PartitionPosition left, PartitionPosition right)
-    {
-        return new IncludingExcludingBounds<PartitionPosition>(left, right);
-    }
-
-    private static PartitionPosition startOf(String key)
-    {
-        return token(key).minKeyBound();
-    }
-
-    private static PartitionPosition endOf(String key)
-    {
-        return token(key).maxKeyBound();
-    }
-
-    private static Range<Token> tokenRange(String left, String right)
-    {
-        return new Range<Token>(token(left), token(right));
-    }
-
-    private static Bounds<Token> tokenBounds(String left, String right)
-    {
-        return new Bounds<Token>(token(left), token(right));
-    }
-
     @BeforeClass
-    public static void beforeClass() throws Throwable
+    public static void initDD()
     {
         DatabaseDescriptor.daemonInitialization();
-        DatabaseDescriptor.getHintsDirectory().mkdir();
-        TokenMetadata tmd = StorageService.instance.getTokenMetadata();
-        tmd.updateNormalToken(token("1"), InetAddress.getByName("127.0.0.1"));
-        tmd.updateNormalToken(token("6"), InetAddress.getByName("127.0.0.6"));
-    }
-
-    // test getRestrictedRanges for token
-    private void testGRR(AbstractBounds<Token> queryRange, AbstractBounds<Token>... expected)
-    {
-        // Testing for tokens
-        List<AbstractBounds<Token>> restricted = StorageProxy.getRestrictedRanges(queryRange);
-        assertEquals(restricted.toString(), expected.length, restricted.size());
-        for (int i = 0; i < expected.length; i++)
-            assertEquals("Mismatch for index " + i + ": " + restricted, expected[i], restricted.get(i));
-    }
-
-    // test getRestrictedRanges for keys
-    private void testGRRKeys(AbstractBounds<PartitionPosition> queryRange, AbstractBounds<PartitionPosition>... expected)
-    {
-        // Testing for keys
-        List<AbstractBounds<PartitionPosition>> restrictedKeys = StorageProxy.getRestrictedRanges(queryRange);
-        assertEquals(restrictedKeys.toString(), expected.length, restrictedKeys.size());
-        for (int i = 0; i < expected.length; i++)
-            assertEquals("Mismatch for index " + i + ": " + restrictedKeys, expected[i], restrictedKeys.get(i));
-
+        ServerTestUtils.mkdirs();
     }
 
     @Test
-    public void testGRR() throws Throwable
+    public void testSetGetPaxosVariant()
     {
-        // no splits
-        testGRR(tokenRange("2", "5"), tokenRange("2", "5"));
-        testGRR(tokenBounds("2", "5"), tokenBounds("2", "5"));
-        // single split
-        testGRR(tokenRange("2", "7"), tokenRange("2", "6"), tokenRange("6", "7"));
-        testGRR(tokenBounds("2", "7"), tokenBounds("2", "6"), tokenRange("6", "7"));
-        // single split starting from min
-        testGRR(tokenRange("", "2"), tokenRange("", "1"), tokenRange("1", "2"));
-        testGRR(tokenBounds("", "2"), tokenBounds("", "1"), tokenRange("1", "2"));
-        // single split ending with max
-        testGRR(tokenRange("5", ""), tokenRange("5", "6"), tokenRange("6", ""));
-        testGRR(tokenBounds("5", ""), tokenBounds("5", "6"), tokenRange("6", ""));
-        // two splits
-        testGRR(tokenRange("0", "7"), tokenRange("0", "1"), tokenRange("1", "6"), tokenRange("6", "7"));
-        testGRR(tokenBounds("0", "7"), tokenBounds("0", "1"), tokenRange("1", "6"), tokenRange("6", "7"));
-
-
-        // Keys
-        // no splits
-        testGRRKeys(range(rp("2"), rp("5")), range(rp("2"), rp("5")));
-        testGRRKeys(bounds(rp("2"), rp("5")), bounds(rp("2"), rp("5")));
-        testGRRKeys(exBounds(rp("2"), rp("5")), exBounds(rp("2"), rp("5")));
-        // single split testGRRKeys(range("2", "7"), range(rp("2"), endOf("6")), range(endOf("6"), rp("7")));
-        testGRRKeys(bounds(rp("2"), rp("7")), bounds(rp("2"), endOf("6")), range(endOf("6"), rp("7")));
-        testGRRKeys(exBounds(rp("2"), rp("7")), range(rp("2"), endOf("6")), exBounds(endOf("6"), rp("7")));
-        testGRRKeys(incExBounds(rp("2"), rp("7")), bounds(rp("2"), endOf("6")), exBounds(endOf("6"), rp("7")));
-        // single split starting from min
-        testGRRKeys(range(rp(""), rp("2")), range(rp(""), endOf("1")), range(endOf("1"), rp("2")));
-        testGRRKeys(bounds(rp(""), rp("2")), bounds(rp(""), endOf("1")), range(endOf("1"), rp("2")));
-        testGRRKeys(exBounds(rp(""), rp("2")), range(rp(""), endOf("1")), exBounds(endOf("1"), rp("2")));
-        testGRRKeys(incExBounds(rp(""), rp("2")), bounds(rp(""), endOf("1")), exBounds(endOf("1"), rp("2")));
-        // single split ending with max
-        testGRRKeys(range(rp("5"), rp("")), range(rp("5"), endOf("6")), range(endOf("6"), rp("")));
-        testGRRKeys(bounds(rp("5"), rp("")), bounds(rp("5"), endOf("6")), range(endOf("6"), rp("")));
-        testGRRKeys(exBounds(rp("5"), rp("")), range(rp("5"), endOf("6")), exBounds(endOf("6"), rp("")));
-        testGRRKeys(incExBounds(rp("5"), rp("")), bounds(rp("5"), endOf("6")), exBounds(endOf("6"), rp("")));
-        // two splits
-        testGRRKeys(range(rp("0"), rp("7")), range(rp("0"), endOf("1")), range(endOf("1"), endOf("6")), range(endOf("6"), rp("7")));
-        testGRRKeys(bounds(rp("0"), rp("7")), bounds(rp("0"), endOf("1")), range(endOf("1"), endOf("6")), range(endOf("6"), rp("7")));
-        testGRRKeys(exBounds(rp("0"), rp("7")), range(rp("0"), endOf("1")), range(endOf("1"), endOf("6")), exBounds(endOf("6"), rp("7")));
-        testGRRKeys(incExBounds(rp("0"), rp("7")), bounds(rp("0"), endOf("1")), range(endOf("1"), endOf("6")), exBounds(endOf("6"), rp("7")));
+        Assert.assertEquals(Config.PaxosVariant.v1, DatabaseDescriptor.getPaxosVariant());
+        Assert.assertEquals("v1", StorageProxy.instance.getPaxosVariant());
+        StorageProxy.instance.setPaxosVariant("v2");
+        Assert.assertEquals("v2", StorageProxy.instance.getPaxosVariant());
+        Assert.assertEquals(Config.PaxosVariant.v2, DatabaseDescriptor.getPaxosVariant());
+        DatabaseDescriptor.setPaxosVariant(Config.PaxosVariant.v1);
+        Assert.assertEquals(Config.PaxosVariant.v1, DatabaseDescriptor.getPaxosVariant());
+        Assert.assertEquals(Config.PaxosVariant.v1, DatabaseDescriptor.getPaxosVariant());
     }
 
     @Test
-    public void testGRRExact() throws Throwable
+    public void testShouldHint() throws Exception
     {
-        // min
-        testGRR(tokenRange("1", "5"), tokenRange("1", "5"));
-        testGRR(tokenBounds("1", "5"), tokenBounds("1", "1"), tokenRange("1", "5"));
-        // max
-        testGRR(tokenRange("2", "6"), tokenRange("2", "6"));
-        testGRR(tokenBounds("2", "6"), tokenBounds("2", "6"));
-        // both
-        testGRR(tokenRange("1", "6"), tokenRange("1", "6"));
-        testGRR(tokenBounds("1", "6"), tokenBounds("1", "1"), tokenRange("1", "6"));
-
-
-        // Keys
-        // min
-        testGRRKeys(range(endOf("1"), endOf("5")), range(endOf("1"), endOf("5")));
-        testGRRKeys(range(rp("1"), endOf("5")), range(rp("1"), endOf("1")), range(endOf("1"), endOf("5")));
-        testGRRKeys(bounds(startOf("1"), endOf("5")), bounds(startOf("1"), endOf("1")), range(endOf("1"), endOf("5")));
-        testGRRKeys(exBounds(endOf("1"), rp("5")), exBounds(endOf("1"), rp("5")));
-        testGRRKeys(exBounds(rp("1"), rp("5")), range(rp("1"), endOf("1")), exBounds(endOf("1"), rp("5")));
-        testGRRKeys(exBounds(startOf("1"), endOf("5")), range(startOf("1"), endOf("1")), exBounds(endOf("1"), endOf("5")));
-        testGRRKeys(incExBounds(rp("1"), rp("5")), bounds(rp("1"), endOf("1")), exBounds(endOf("1"), rp("5")));
-        // max
-        testGRRKeys(range(endOf("2"), endOf("6")), range(endOf("2"), endOf("6")));
-        testGRRKeys(bounds(startOf("2"), endOf("6")), bounds(startOf("2"), endOf("6")));
-        testGRRKeys(exBounds(rp("2"), rp("6")), exBounds(rp("2"), rp("6")));
-        testGRRKeys(incExBounds(rp("2"), rp("6")), incExBounds(rp("2"), rp("6")));
-        // bothKeys
-        testGRRKeys(range(rp("1"), rp("6")), range(rp("1"), endOf("1")), range(endOf("1"), rp("6")));
-        testGRRKeys(bounds(rp("1"), rp("6")), bounds(rp("1"), endOf("1")), range(endOf("1"), rp("6")));
-        testGRRKeys(exBounds(rp("1"), rp("6")), range(rp("1"), endOf("1")), exBounds(endOf("1"), rp("6")));
-        testGRRKeys(incExBounds(rp("1"), rp("6")), bounds(rp("1"), endOf("1")), exBounds(endOf("1"), rp("6")));
+        // HAPPY PATH with all defaults
+        shouldHintTest(replica -> {
+            assertThat(StorageProxy.shouldHint(replica)).isTrue();
+            assertThat(StorageProxy.shouldHint(replica, /* tryEnablePersistentWindow */ false)).isTrue();
+        });
     }
 
     @Test
-    public void testGRRWrapped() throws Throwable
+    public void testShouldHintOnWindowExpiry() throws Exception
     {
-        // one token in wrapped range
-        testGRR(tokenRange("7", "0"), tokenRange("7", ""), tokenRange("", "0"));
-        // two tokens in wrapped range
-        testGRR(tokenRange("5", "0"), tokenRange("5", "6"), tokenRange("6", ""), tokenRange("", "0"));
-        testGRR(tokenRange("7", "2"), tokenRange("7", ""), tokenRange("", "1"), tokenRange("1", "2"));
-        // full wraps
-        testGRR(tokenRange("0", "0"), tokenRange("0", "1"), tokenRange("1", "6"), tokenRange("6", ""), tokenRange("", "0"));
-        testGRR(tokenRange("", ""), tokenRange("", "1"), tokenRange("1", "6"), tokenRange("6", ""));
-        // wrap on member tokens
-        testGRR(tokenRange("6", "6"), tokenRange("6", ""), tokenRange("", "1"), tokenRange("1", "6"));
-        testGRR(tokenRange("6", "1"), tokenRange("6", ""), tokenRange("", "1"));
-        // end wrapped
-        testGRR(tokenRange("5", ""), tokenRange("5", "6"), tokenRange("6", ""));
+        shouldHintTest(replica -> {
+            // wait for 5 ms, we will shorten the hints window later
+            Uninterruptibles.sleepUninterruptibly(5, TimeUnit.MILLISECONDS);
 
-        // Keys
-        // one token in wrapped range
-        testGRRKeys(range(rp("7"), rp("0")), range(rp("7"), rp("")), range(rp(""), rp("0")));
-        // two tokens in wrapped range
-        testGRRKeys(range(rp("5"), rp("0")), range(rp("5"), endOf("6")), range(endOf("6"), rp("")), range(rp(""), rp("0")));
-        testGRRKeys(range(rp("7"), rp("2")), range(rp("7"), rp("")), range(rp(""), endOf("1")), range(endOf("1"), rp("2")));
-        // full wraps
-        testGRRKeys(range(rp("0"), rp("0")), range(rp("0"), endOf("1")), range(endOf("1"), endOf("6")), range(endOf("6"), rp("")), range(rp(""), rp("0")));
-        testGRRKeys(range(rp(""), rp("")), range(rp(""), endOf("1")), range(endOf("1"), endOf("6")), range(endOf("6"), rp("")));
-        // wrap on member tokens
-        testGRRKeys(range(rp("6"), rp("6")), range(rp("6"), endOf("6")), range(endOf("6"), rp("")), range(rp(""), endOf("1")), range(endOf("1"), rp("6")));
-        testGRRKeys(range(rp("6"), rp("1")), range(rp("6"), endOf("6")), range(endOf("6"), rp("")), range(rp(""), rp("1")));
-        // end wrapped
-        testGRRKeys(range(rp("5"), rp("")), range(rp("5"), endOf("6")), range(endOf("6"), rp("")));
+            final int originalHintWindow = DatabaseDescriptor.getMaxHintWindow();
+            try
+            {
+                DatabaseDescriptor.setMaxHintWindow(1); // 1 ms. It should not hint
+                assertThat(StorageProxy.shouldHint(replica)).isFalse();
+            }
+            finally
+            {
+                DatabaseDescriptor.setMaxHintWindow(originalHintWindow);
+            }
+        });
     }
 
     @Test
-    public void testGRRExactBounds() throws Throwable
+    @BMRule(name = "Hints size exceeded the limit",
+            targetClass="org.apache.cassandra.hints.HintsService",
+            targetMethod="getTotalHintsSize",
+            action="return 2097152;") // 2MB
+    public void testShouldHintOnExceedingSize() throws Exception
     {
-        // equal tokens are special cased as non-wrapping for bounds
-        testGRR(tokenBounds("0", "0"), tokenBounds("0", "0"));
-        // completely empty bounds match everything
-        testGRR(tokenBounds("", ""), tokenBounds("", "1"), tokenRange("1", "6"), tokenRange("6", ""));
+        shouldHintTest(replica -> {
+            final int originalHintsSizeLimit = DatabaseDescriptor.getMaxHintsSizePerHostInMiB();
+            try
+            {
+                DatabaseDescriptor.setMaxHintsSizePerHostInMiB(1);
+                assertThat(StorageProxy.shouldHint(replica)).isFalse();
+            }
+            finally
+            {
+                DatabaseDescriptor.setMaxHintsSizePerHostInMiB(originalHintsSizeLimit);
+            }
+        });
+    }
 
-        // Keys
-        // equal tokens are special cased as non-wrapping for bounds
-        testGRRKeys(bounds(rp("0"), rp("0")), bounds(rp("0"), rp("0")));
-        // completely empty bounds match everything
-        testGRRKeys(bounds(rp(""), rp("")), bounds(rp(""), endOf("1")), range(endOf("1"), endOf("6")), range(endOf("6"), rp("")));
-        testGRRKeys(exBounds(rp(""), rp("")), range(rp(""), endOf("1")), range(endOf("1"), endOf("6")), exBounds(endOf("6"), rp("")));
-        testGRRKeys(incExBounds(rp(""), rp("")), bounds(rp(""), endOf("1")), range(endOf("1"), endOf("6")), exBounds(endOf("6"), rp("")));
+
+    /**
+     * Ensure that the timer backing the JMX endpoint to transiently enable blocking read repairs both enables
+     * and disables the way we'd expect.
+     */
+    @Test
+    public void testTransientLoggingTimer()
+    {
+        StorageProxy.instance.logBlockingReadRepairAttemptsForNSeconds(2);
+        Assert.assertTrue(StorageProxy.instance.isLoggingReadRepairs());
+        Uninterruptibles.sleepUninterruptibly(5, TimeUnit.SECONDS);
+        Assert.assertFalse(StorageProxy.instance.isLoggingReadRepairs());
+    }
+
+    private void shouldHintTest(Consumer<Replica> test) throws UnknownHostException
+    {
+        InetAddressAndPort testEp = InetAddressAndPort.getByName("192.168.1.1");
+        Replica replica = full(testEp);
+        StorageService.instance.getTokenMetadata().updateHostId(UUID.randomUUID(), testEp);
+        EndpointState state = new EndpointState(new HeartBeatState(0, 0));
+        Gossiper.runInGossipStageBlocking(() -> Gossiper.instance.markDead(replica.endpoint(), state));
+
+        try
+        {
+            test.accept(replica);
+        }
+        finally
+        {
+            StorageService.instance.getTokenMetadata().removeEndpoint(testEp);
+        }
     }
 }

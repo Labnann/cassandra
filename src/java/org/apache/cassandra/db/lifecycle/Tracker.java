@@ -17,8 +17,11 @@
  */
 package org.apache.cassandra.db.lifecycle;
 
-import java.io.File;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -26,21 +29,34 @@ import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Function;
 import com.google.common.base.Predicate;
 import com.google.common.base.Predicates;
-import com.google.common.collect.*;
-
-import org.apache.cassandra.db.ColumnFamilyStore;
-import org.apache.cassandra.db.Directories;
-import org.apache.cassandra.db.Memtable;
-import org.apache.cassandra.db.commitlog.CommitLogPosition;
+import com.google.common.collect.Iterables;
+import com.google.common.collect.Sets;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.Directories;
+import org.apache.cassandra.db.commitlog.CommitLogPosition;
 import org.apache.cassandra.db.compaction.OperationType;
+import org.apache.cassandra.db.memtable.Memtable;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.sstable.metadata.StatsMetadata;
+import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.metrics.StorageMetrics;
-import org.apache.cassandra.notifications.*;
+import org.apache.cassandra.notifications.INotification;
+import org.apache.cassandra.notifications.INotificationConsumer;
+import org.apache.cassandra.notifications.InitialSSTableAddedNotification;
+import org.apache.cassandra.notifications.MemtableDiscardedNotification;
+import org.apache.cassandra.notifications.MemtableRenewedNotification;
+import org.apache.cassandra.notifications.MemtableSwitchedNotification;
+import org.apache.cassandra.notifications.SSTableAddedNotification;
+import org.apache.cassandra.notifications.SSTableDeletingNotification;
+import org.apache.cassandra.notifications.SSTableListChangedNotification;
+import org.apache.cassandra.notifications.SSTableMetadataChanged;
+import org.apache.cassandra.notifications.SSTableRepairStatusChanged;
+import org.apache.cassandra.notifications.TruncationNotification;
 import org.apache.cassandra.utils.Pair;
 import org.apache.cassandra.utils.Throwables;
 import org.apache.cassandra.utils.concurrent.OpOrder;
@@ -50,7 +66,11 @@ import static com.google.common.collect.ImmutableSet.copyOf;
 import static com.google.common.collect.Iterables.filter;
 import static java.util.Collections.singleton;
 import static java.util.Collections.singletonList;
-import static org.apache.cassandra.db.lifecycle.Helpers.*;
+import static org.apache.cassandra.db.lifecycle.Helpers.abortObsoletion;
+import static org.apache.cassandra.db.lifecycle.Helpers.markObsolete;
+import static org.apache.cassandra.db.lifecycle.Helpers.notIn;
+import static org.apache.cassandra.db.lifecycle.Helpers.prepareForObsoletion;
+import static org.apache.cassandra.db.lifecycle.Helpers.setupOnline;
 import static org.apache.cassandra.db.lifecycle.View.permitCompacting;
 import static org.apache.cassandra.db.lifecycle.View.updateCompacting;
 import static org.apache.cassandra.db.lifecycle.View.updateLiveSet;
@@ -73,15 +93,21 @@ public class Tracker
     public final boolean loadsstables;
 
     /**
+     * @param columnFamilyStore
      * @param memtable Initial Memtable. Can be null.
      * @param loadsstables true to indicate to load SSTables (TODO: remove as this is only accessed from 2i)
      */
-    public Tracker(Memtable memtable, boolean loadsstables)
+    public Tracker(ColumnFamilyStore columnFamilyStore, Memtable memtable, boolean loadsstables)
     {
-        this.cfstore = memtable != null ? memtable.cfs : null;
+        this.cfstore = columnFamilyStore;
         this.view = new AtomicReference<>();
         this.loadsstables = loadsstables;
         this.reset(memtable);
+    }
+
+    public static Tracker newDummyTracker()
+    {
+        return new Tracker(null, null, false);
     }
 
     public LifecycleTransaction tryModify(SSTableReader sstable, OperationType operationType)
@@ -92,7 +118,7 @@ public class Tracker
     /**
      * @return a Transaction over the provided sstables if we are able to mark the given @param sstables as compacted, before anyone else
      */
-    public LifecycleTransaction tryModify(Iterable<SSTableReader> sstables, OperationType operationType)
+    public LifecycleTransaction tryModify(Iterable<? extends SSTableReader> sstables, OperationType operationType)
     {
         if (Iterables.isEmpty(sstables))
             return new LifecycleTransaction(this, operationType, sstables);
@@ -106,7 +132,7 @@ public class Tracker
 
     Pair<View, View> apply(Function<View, View> function)
     {
-        return apply(Predicates.<View>alwaysTrue(), function);
+        return apply(Predicates.alwaysTrue(), function);
     }
 
     Throwable apply(Function<View, View> function, Throwable accumulate)
@@ -145,27 +171,34 @@ public class Tracker
             return accumulate;
 
         long add = 0;
+        long addUncompressed = 0;
+
         for (SSTableReader sstable : newSSTables)
         {
             if (logger.isTraceEnabled())
-                logger.trace("adding {} to list of files tracked for {}.{}", sstable.descriptor, cfstore.keyspace.getName(), cfstore.name);
+                logger.trace("adding {} to list of files tracked for {}.{}", sstable.descriptor, cfstore.getKeyspaceName(), cfstore.name);
             try
             {
                 add += sstable.bytesOnDisk();
+                addUncompressed += sstable.logicalBytesOnDisk();
             }
             catch (Throwable t)
             {
                 accumulate = merge(accumulate, t);
             }
         }
+
         long subtract = 0;
+        long subtractUncompressed = 0;
+
         for (SSTableReader sstable : oldSSTables)
         {
             if (logger.isTraceEnabled())
-                logger.trace("removing {} from list of files tracked for {}.{}", sstable.descriptor, cfstore.keyspace.getName(), cfstore.name);
+                logger.trace("removing {} from list of files tracked for {}.{}", sstable.descriptor, cfstore.getKeyspaceName(), cfstore.name);
             try
             {
                 subtract += sstable.bytesOnDisk();
+                subtractUncompressed += sstable.logicalBytesOnDisk();
             }
             catch (Throwable t)
             {
@@ -174,29 +207,57 @@ public class Tracker
         }
 
         StorageMetrics.load.inc(add - subtract);
+        StorageMetrics.uncompressedLoad.inc(addUncompressed - subtractUncompressed);
+
         cfstore.metric.liveDiskSpaceUsed.inc(add - subtract);
+        cfstore.metric.uncompressedLiveDiskSpaceUsed.inc(addUncompressed - subtractUncompressed);
 
         // we don't subtract from total until the sstable is deleted, see TransactionLogs.SSTableTidier
         cfstore.metric.totalDiskSpaceUsed.inc(add);
         return accumulate;
     }
 
+    public void updateLiveDiskSpaceUsed(long adjustment)
+    {
+        cfstore.metric.liveDiskSpaceUsed.inc(adjustment);
+        cfstore.metric.totalDiskSpaceUsed.inc(adjustment);
+    }
+
     // SETUP / CLEANUP
 
     public void addInitialSSTables(Iterable<SSTableReader> sstables)
     {
-        if (!isDummy())
-            setupOnline(sstables);
-        apply(updateLiveSet(emptySet(), sstables));
+        addSSTablesInternal(sstables, true, false, true);
+    }
+
+    public void addInitialSSTablesWithoutUpdatingSize(Iterable<SSTableReader> sstables)
+    {
+        addSSTablesInternal(sstables, true, false, false);
+    }
+
+    public void updateInitialSSTableSize(Iterable<SSTableReader> sstables)
+    {
         maybeFail(updateSizeTracking(emptySet(), sstables, null));
-        // no notifications or backup necessary
     }
 
     public void addSSTables(Iterable<SSTableReader> sstables)
     {
-        addInitialSSTables(sstables);
-        maybeIncrementallyBackup(sstables);
-        notifyAdded(sstables);
+        addSSTablesInternal(sstables, false, true, true);
+    }
+
+    private void addSSTablesInternal(Iterable<SSTableReader> sstables,
+                                     boolean isInitialSSTables,
+                                     boolean maybeIncrementallyBackup,
+                                     boolean updateSize)
+    {
+        if (!isDummy())
+            setupOnline(sstables);
+        apply(updateLiveSet(emptySet(), sstables));
+        if(updateSize)
+            maybeFail(updateSizeTracking(emptySet(), sstables, null));
+        if (maybeIncrementallyBackup)
+            maybeIncrementallyBackup(sstables);
+        notifyAdded(sstables, isInitialSSTables);
     }
 
     /** (Re)initializes the tracker, purging all references. */
@@ -224,7 +285,7 @@ public class Tracker
 
     public Throwable dropSSTables(Throwable accumulate)
     {
-        return dropSSTables(Predicates.<SSTableReader>alwaysTrue(), OperationType.UNKNOWN, accumulate);
+        return dropSSTables(Predicates.alwaysTrue(), OperationType.UNKNOWN, accumulate);
     }
 
     /**
@@ -255,7 +316,7 @@ public class Tracker
                     accumulate = updateSizeTracking(removed, emptySet(), accumulate);
                     accumulate = release(selfRefs(removed), accumulate);
                     // notifySSTablesChanged -> LeveledManifest.promote doesn't like a no-op "promotion"
-                    accumulate = notifySSTablesChanged(removed, Collections.<SSTableReader>emptySet(), txnLogs.type(), accumulate);
+                    accumulate = notifySSTablesChanged(removed, Collections.emptySet(), txnLogs.type(), accumulate);
                 }
             }
             catch (Throwable t)
@@ -279,13 +340,7 @@ public class Tracker
      */
     public void removeUnreadableSSTables(final File directory)
     {
-        maybeFail(dropSSTables(new Predicate<SSTableReader>()
-        {
-            public boolean apply(SSTableReader reader)
-            {
-                return reader.descriptor.directory.equals(directory);
-            }
-        }, OperationType.UNKNOWN, null));
+        maybeFail(dropSSTables(reader -> reader.descriptor.directory.equals(directory), OperationType.UNKNOWN, null));
     }
 
 
@@ -356,10 +411,11 @@ public class Tracker
         Throwable fail;
         fail = updateSizeTracking(emptySet(), sstables, null);
 
-        notifyDiscarded(memtable);
-
         // TODO: if we're invalidated, should we notifyadded AND removed, or just skip both?
-        fail = notifyAdded(sstables, fail);
+        fail = notifyAdded(sstables, false, memtable, fail);
+
+        // make sure index sees flushed index files before dicarding memtable index
+        notifyDiscarded(memtable);
 
         if (!isDummy() && !cfstore.isValid())
             dropSSTables();
@@ -388,7 +444,7 @@ public class Tracker
 
     public void maybeIncrementallyBackup(final Iterable<SSTableReader> sstables)
     {
-        if (!DatabaseDescriptor.isIncrementalBackupsEnabled())
+        if (!cfstore.isTableIncrementalBackupsEnabled())
             return;
 
         for (SSTableReader sstable : sstables)
@@ -417,9 +473,14 @@ public class Tracker
         return accumulate;
     }
 
-    Throwable notifyAdded(Iterable<SSTableReader> added, Throwable accumulate)
+    Throwable notifyAdded(Iterable<SSTableReader> added, boolean isInitialSSTables, Memtable memtable, Throwable accumulate)
     {
-        INotification notification = new SSTableAddedNotification(added);
+        INotification notification;
+        if (!isInitialSSTables)
+            notification = new SSTableAddedNotification(added, memtable);
+        else
+            notification = new InitialSSTableAddedNotification(added);
+
         for (INotificationConsumer subscriber : subscribers)
         {
             try
@@ -434,9 +495,9 @@ public class Tracker
         return accumulate;
     }
 
-    public void notifyAdded(Iterable<SSTableReader> added)
+    void notifyAdded(Iterable<SSTableReader> added, boolean isInitialSSTables)
     {
-        maybeFail(notifyAdded(added, null));
+        maybeFail(notifyAdded(added, isInitialSSTables, null, null));
     }
 
     public void notifySSTableRepairedStatusChanged(Collection<SSTableReader> repairStatusesChanged)
@@ -444,6 +505,14 @@ public class Tracker
         INotification notification = new SSTableRepairStatusChanged(repairStatusesChanged);
         for (INotificationConsumer subscriber : subscribers)
             subscriber.handleNotification(notification, this);
+    }
+
+    public void notifySSTableMetadataChanged(SSTableReader levelChanged, StatsMetadata oldMetadata)
+    {
+        INotification notification = new SSTableMetadataChanged(levelChanged, oldMetadata);
+        for (INotificationConsumer subscriber : subscribers)
+            subscriber.handleNotification(notification, this);
+
     }
 
     public void notifyDeleting(SSTableReader deleting)
@@ -509,8 +578,6 @@ public class Tracker
     @VisibleForTesting
     public void removeUnsafe(Set<SSTableReader> toRemove)
     {
-        Pair<View, View> result = apply(view -> {
-            return updateLiveSet(toRemove, emptySet()).apply(view);
-        });
+        Pair<View, View> result = apply(view -> updateLiveSet(toRemove, emptySet()).apply(view));
     }
 }

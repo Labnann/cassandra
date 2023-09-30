@@ -22,20 +22,22 @@ import java.nio.ByteBuffer;
 import java.util.*;
 
 import com.google.common.collect.ImmutableList;
-import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.config.ColumnDefinition;
+
 import org.apache.cassandra.db.filter.ColumnFilter;
-import org.apache.cassandra.db.rows.*;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.UTF8Type;
-import org.apache.cassandra.db.marshal.TypeParser;
+import org.apache.cassandra.db.rows.EncodingStats;
+import org.apache.cassandra.exceptions.UnknownColumnException;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.sstable.format.Version;
-import org.apache.cassandra.io.sstable.metadata.MetadataType;
-import org.apache.cassandra.io.sstable.metadata.MetadataComponent;
 import org.apache.cassandra.io.sstable.metadata.IMetadataComponentSerializer;
+import org.apache.cassandra.io.sstable.metadata.MetadataComponent;
+import org.apache.cassandra.io.sstable.metadata.MetadataType;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.schema.ColumnMetadata;
+import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.serializers.AbstractTypeSerializer;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.service.StorageService;
 
@@ -48,7 +50,7 @@ public class SerializationHeader
     private final AbstractType<?> keyType;
     private final List<AbstractType<?>> clusteringTypes;
 
-    private final PartitionColumns columns;
+    private final RegularAndStaticColumns columns;
     private final EncodingStats stats;
 
     private final Map<ByteBuffer, AbstractType<?>> typeMap;
@@ -56,7 +58,7 @@ public class SerializationHeader
     private SerializationHeader(boolean isForSSTable,
                                 AbstractType<?> keyType,
                                 List<AbstractType<?>> clusteringTypes,
-                                PartitionColumns columns,
+                                RegularAndStaticColumns columns,
                                 EncodingStats stats,
                                 Map<ByteBuffer, AbstractType<?>> typeMap)
     {
@@ -68,12 +70,12 @@ public class SerializationHeader
         this.typeMap = typeMap;
     }
 
-    public static SerializationHeader makeWithoutStats(CFMetaData metadata)
+    public static SerializationHeader makeWithoutStats(TableMetadata metadata)
     {
-        return new SerializationHeader(true, metadata, metadata.partitionColumns(), EncodingStats.NO_STATS);
+        return new SerializationHeader(true, metadata, metadata.regularAndStaticColumns(), EncodingStats.NO_STATS);
     }
 
-    public static SerializationHeader make(CFMetaData metadata, Collection<SSTableReader> sstables)
+    public static SerializationHeader make(TableMetadata metadata, Collection<SSTableReader> sstables)
     {
         // The serialization header has to be computed before the start of compaction (since it's used to write)
         // the result. This means that when compacting multiple sources, we won't have perfectly accurate stats
@@ -86,17 +88,14 @@ public class SerializationHeader
         // our stats merging on the compacted files headers, which as we just said can be somewhat inaccurate,
         // but rather on their stats stored in StatsMetadata that are fully accurate.
         EncodingStats.Collector stats = new EncodingStats.Collector();
-        PartitionColumns.Builder columns = PartitionColumns.builder();
-        // We need to order the SSTables by descending generation to be sure that we use latest column definitions.
+        RegularAndStaticColumns.Builder columns = RegularAndStaticColumns.builder();
+        // We need to order the SSTables by descending generation to be sure that we use latest column metadata.
         for (SSTableReader sstable : orderByDescendingGeneration(sstables))
         {
             stats.updateTimestamp(sstable.getMinTimestamp());
             stats.updateLocalDeletionTime(sstable.getMinLocalDeletionTime());
             stats.updateTTL(sstable.getMinTTL());
-            if (sstable.header == null)
-                columns.addAll(metadata.partitionColumns());
-            else
-                columns.addAll(sstable.header.columns());
+            columns.addAll(sstable.header.columns());
         }
         return new SerializationHeader(true, metadata, columns.build(), stats.get());
     }
@@ -107,24 +106,24 @@ public class SerializationHeader
             return sstables;
 
         List<SSTableReader> readers = new ArrayList<>(sstables);
-        readers.sort(SSTableReader.generationReverseComparator);
+        readers.sort(SSTableReader.idReverseComparator);
         return readers;
     }
 
     public SerializationHeader(boolean isForSSTable,
-                               CFMetaData metadata,
-                               PartitionColumns columns,
+                               TableMetadata metadata,
+                               RegularAndStaticColumns columns,
                                EncodingStats stats)
     {
         this(isForSSTable,
-             metadata.getKeyValidator(),
+             metadata.partitionKeyType,
              metadata.comparator.subtypes(),
              columns,
              stats,
              null);
     }
 
-    public PartitionColumns columns()
+    public RegularAndStaticColumns columns()
     {
         return columns;
     }
@@ -159,7 +158,7 @@ public class SerializationHeader
         return isStatic ? columns.statics : columns.regulars;
     }
 
-    public AbstractType<?> getType(ColumnDefinition column)
+    public AbstractType<?> getType(ColumnMetadata column)
     {
         return typeMap == null ? column.type : typeMap.get(column.name.bytes);
     }
@@ -169,14 +168,14 @@ public class SerializationHeader
         out.writeUnsignedVInt(timestamp - stats.minTimestamp);
     }
 
-    public void writeLocalDeletionTime(int localDeletionTime, DataOutputPlus out) throws IOException
+    public void writeLocalDeletionTime(long localDeletionTime, DataOutputPlus out) throws IOException
     {
-        out.writeUnsignedVInt(localDeletionTime - stats.minLocalDeletionTime);
+        out.writeUnsignedVInt32((int) (localDeletionTime - stats.minLocalDeletionTime));
     }
 
     public void writeTTL(int ttl, DataOutputPlus out) throws IOException
     {
-        out.writeUnsignedVInt(ttl - stats.minTTL);
+        out.writeUnsignedVInt32(ttl - stats.minTTL);
     }
 
     public void writeDeletionTime(DeletionTime dt, DataOutputPlus out) throws IOException
@@ -191,23 +190,23 @@ public class SerializationHeader
         return in.readUnsignedVInt() + stats.minTimestamp;
     }
 
-    public int readLocalDeletionTime(DataInputPlus in) throws IOException
+    public long readLocalDeletionTime(DataInputPlus in) throws IOException
     {
         StorageService.instance.totalReadBytes+=4;////
-        return (int)in.readUnsignedVInt() + stats.minLocalDeletionTime;
+        return in.readUnsignedVInt32() + stats.minLocalDeletionTime;
     }
 
     public int readTTL(DataInputPlus in) throws IOException
     {
         StorageService.instance.totalReadBytes+=4;////
-        return (int)in.readUnsignedVInt() + stats.minTTL;
+        return in.readUnsignedVInt32() + stats.minTTL;
     }
 
     public DeletionTime readDeletionTime(DataInputPlus in) throws IOException
     {
         long markedAt = readTimestamp(in);
-        int localDeletionTime = readLocalDeletionTime(in);
-        return new DeletionTime(markedAt, localDeletionTime);
+        long localDeletionTime = readLocalDeletionTime(in);
+        return DeletionTime.build(markedAt, localDeletionTime);
     }
 
     public long timestampSerializedSize(long timestamp)
@@ -215,7 +214,7 @@ public class SerializationHeader
         return TypeSizes.sizeofUnsignedVInt(timestamp - stats.minTimestamp);
     }
 
-    public long localDeletionTimeSerializedSize(int localDeletionTime)
+    public long localDeletionTimeSerializedSize(long localDeletionTime)
     {
         return TypeSizes.sizeofUnsignedVInt(localDeletionTime - stats.minLocalDeletionTime);
     }
@@ -256,9 +255,9 @@ public class SerializationHeader
     {
         Map<ByteBuffer, AbstractType<?>> staticColumns = new LinkedHashMap<>();
         Map<ByteBuffer, AbstractType<?>> regularColumns = new LinkedHashMap<>();
-        for (ColumnDefinition column : columns.statics)
+        for (ColumnMetadata column : columns.statics)
             staticColumns.put(column.name.bytes, column.type);
-        for (ColumnDefinition column : columns.regulars)
+        for (ColumnMetadata column : columns.regulars)
             regularColumns.put(column.name.bytes, column.type);
         return new Component(keyType, clusteringTypes, staticColumns, regularColumns, stats);
     }
@@ -270,7 +269,7 @@ public class SerializationHeader
     }
 
     /**
-     * We need the CFMetadata to properly deserialize a SerializationHeader but it's clunky to pass that to
+     * We need the TableMetadata to properly deserialize a SerializationHeader but it's clunky to pass that to
      * a SSTable component, so we use this temporary object to delay the actual need for the metadata.
      */
     public static class Component extends MetadataComponent
@@ -299,11 +298,11 @@ public class SerializationHeader
             return MetadataType.HEADER;
         }
 
-        public SerializationHeader toHeader(CFMetaData metadata)
+        public SerializationHeader toHeader(TableMetadata metadata) throws UnknownColumnException
         {
             Map<ByteBuffer, AbstractType<?>> typeMap = new HashMap<>(staticColumns.size() + regularColumns.size());
 
-            PartitionColumns.Builder builder = PartitionColumns.builder();
+            RegularAndStaticColumns.Builder builder = RegularAndStaticColumns.builder();
             for (Map<ByteBuffer, AbstractType<?>> map : ImmutableList.of(staticColumns, regularColumns))
             {
                 boolean isStatic = map == staticColumns;
@@ -314,7 +313,7 @@ public class SerializationHeader
                     if (other != null && !other.equals(e.getValue()))
                         throw new IllegalStateException("Column " + name + " occurs as both regular and static with types " + other + "and " + e.getValue());
 
-                    ColumnDefinition column = metadata.getColumnDefinition(name);
+                    ColumnMetadata column = metadata.getColumn(name);
                     if (column == null || column.isStatic() != isStatic)
                     {
                         // TODO: this imply we don't read data for a column we don't yet know about, which imply this is theoretically
@@ -325,9 +324,9 @@ public class SerializationHeader
                         // If we don't find the definition, it could be we have data for a dropped column, and we shouldn't
                         // fail deserialization because of that. So we grab a "fake" ColumnDefinition that ensure proper
                         // deserialization. The column will be ignore later on anyway.
-                        column = metadata.getDroppedColumnDefinition(name, isStatic);
+                        column = metadata.getDroppedColumn(name, isStatic);
                         if (column == null)
-                            throw new RuntimeException("Unknown column " + UTF8Type.instance.getString(name) + " during deserialization");
+                            throw new UnknownColumnException("Unknown column " + UTF8Type.instance.getString(name) + " during deserialization");
                     }
                     builder.add(column);
                 }
@@ -391,6 +390,8 @@ public class SerializationHeader
 
     public static class Serializer implements IMetadataComponentSerializer<Component>
     {
+        private final AbstractTypeSerializer typeSerializer = new AbstractTypeSerializer();
+
         public void serializeForMessaging(SerializationHeader header, ColumnFilter selection, DataOutputPlus out, boolean hasStatic) throws IOException
         {
             EncodingStats.serializer.serialize(header.stats, out);
@@ -409,11 +410,11 @@ public class SerializationHeader
             }
         }
 
-        public SerializationHeader deserializeForMessaging(DataInputPlus in, CFMetaData metadata, ColumnFilter selection, boolean hasStatic) throws IOException
+        public SerializationHeader deserializeForMessaging(DataInputPlus in, TableMetadata metadata, ColumnFilter selection, boolean hasStatic) throws IOException
         {
             EncodingStats stats = EncodingStats.serializer.deserialize(in);
 
-            AbstractType<?> keyType = metadata.getKeyValidator();
+            AbstractType<?> keyType = metadata.partitionKeyType;
             List<AbstractType<?>> clusteringTypes = metadata.comparator.subtypes();
 
             Columns statics, regulars;
@@ -428,7 +429,7 @@ public class SerializationHeader
                 regulars = Columns.serializer.deserializeSubset(selection.fetchedColumns().regulars, in);
             }
 
-            return new SerializationHeader(false, keyType, clusteringTypes, new PartitionColumns(statics, regulars), stats, null);
+            return new SerializationHeader(false, keyType, clusteringTypes, new RegularAndStaticColumns(statics, regulars), stats, null);
         }
 
         public long serializedSizeForMessaging(SerializationHeader header, ColumnFilter selection, boolean hasStatic)
@@ -455,10 +456,8 @@ public class SerializationHeader
         {
             EncodingStats.serializer.serialize(header.stats, out);
 
-            writeType(header.keyType, out);
-            out.writeUnsignedVInt(header.clusteringTypes.size());
-            for (AbstractType<?> type : header.clusteringTypes)
-                writeType(type, out);
+            typeSerializer.serialize(header.keyType, out);
+            typeSerializer.serializeList(header.clusteringTypes, out);
 
             writeColumnsWithTypes(header.staticColumns, out);
             writeColumnsWithTypes(header.regularColumns, out);
@@ -469,17 +468,11 @@ public class SerializationHeader
         {
             EncodingStats stats = EncodingStats.serializer.deserialize(in);
 
-            AbstractType<?> keyType = readType(in);
-            int size = (int)in.readUnsignedVInt();
-            List<AbstractType<?>> clusteringTypes = new ArrayList<>(size);
-            for (int i = 0; i < size; i++)
-                clusteringTypes.add(readType(in));
+            AbstractType<?> keyType = typeSerializer.deserialize(in);
+            List<AbstractType<?>> clusteringTypes = typeSerializer.deserializeList(in);
 
-            Map<ByteBuffer, AbstractType<?>> staticColumns = new LinkedHashMap<>();
-            Map<ByteBuffer, AbstractType<?>> regularColumns = new LinkedHashMap<>();
-
-            readColumnsWithType(in, staticColumns);
-            readColumnsWithType(in, regularColumns);
+            Map<ByteBuffer, AbstractType<?>> staticColumns = readColumnsWithType(in);
+            Map<ByteBuffer, AbstractType<?>> regularColumns = readColumnsWithType(in);
 
             return new Component(keyType, clusteringTypes, staticColumns, regularColumns, stats);
         }
@@ -489,10 +482,8 @@ public class SerializationHeader
         {
             int size = EncodingStats.serializer.serializedSize(header.stats);
 
-            size += sizeofType(header.keyType);
-            size += TypeSizes.sizeofUnsignedVInt(header.clusteringTypes.size());
-            for (AbstractType<?> type : header.clusteringTypes)
-                size += sizeofType(type);
+            size += typeSerializer.serializedSize(header.keyType);
+            size += typeSerializer.serializedListSize(header.clusteringTypes);
 
             size += sizeofColumnsWithTypes(header.staticColumns);
             size += sizeofColumnsWithTypes(header.regularColumns);
@@ -501,11 +492,11 @@ public class SerializationHeader
 
         private void writeColumnsWithTypes(Map<ByteBuffer, AbstractType<?>> columns, DataOutputPlus out) throws IOException
         {
-            out.writeUnsignedVInt(columns.size());
+            out.writeUnsignedVInt32(columns.size());
             for (Map.Entry<ByteBuffer, AbstractType<?>> entry : columns.entrySet())
             {
                 ByteBufferUtil.writeWithVIntLength(entry.getKey(), out);
-                writeType(entry.getValue(), out);
+                typeSerializer.serialize(entry.getValue(), out);
             }
         }
 
@@ -515,36 +506,21 @@ public class SerializationHeader
             for (Map.Entry<ByteBuffer, AbstractType<?>> entry : columns.entrySet())
             {
                 size += ByteBufferUtil.serializedSizeWithVIntLength(entry.getKey());
-                size += sizeofType(entry.getValue());
+                size += typeSerializer.serializedSize(entry.getValue());
             }
             return size;
         }
 
-        private void readColumnsWithType(DataInputPlus in, Map<ByteBuffer, AbstractType<?>> typeMap) throws IOException
+        private Map<ByteBuffer, AbstractType<?>> readColumnsWithType(DataInputPlus in) throws IOException
         {
-            int length = (int)in.readUnsignedVInt();
+            int length =  in.readUnsignedVInt32();
+            Map<ByteBuffer, AbstractType<?>> typeMap = new LinkedHashMap<>(length);
             for (int i = 0; i < length; i++)
             {
                 ByteBuffer name = ByteBufferUtil.readWithVIntLength(in);
-                typeMap.put(name, readType(in));
+                typeMap.put(name, typeSerializer.deserialize(in));
             }
-        }
-
-        private void writeType(AbstractType<?> type, DataOutputPlus out) throws IOException
-        {
-            // TODO: we should have a terser serializaion format. Not a big deal though
-            ByteBufferUtil.writeWithVIntLength(UTF8Type.instance.decompose(type.toString()), out);
-        }
-
-        private AbstractType<?> readType(DataInputPlus in) throws IOException
-        {
-            ByteBuffer raw = ByteBufferUtil.readWithVIntLength(in);
-            return TypeParser.parse(UTF8Type.instance.compose(raw));
-        }
-
-        private int sizeofType(AbstractType<?> type)
-        {
-            return ByteBufferUtil.serializedSizeWithVIntLength(UTF8Type.instance.decompose(type.toString()));
+            return typeMap;
         }
     }
 }

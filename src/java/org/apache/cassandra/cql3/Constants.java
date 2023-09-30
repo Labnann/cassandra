@@ -17,28 +17,122 @@
  */
 package org.apache.cassandra.cql3;
 
+import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import org.apache.cassandra.config.ColumnDefinition;
-import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.Clustering;
+import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.marshal.*;
+import org.apache.cassandra.db.rows.Cell;
+import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.serializers.MarshalException;
 import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.FastByteOperations;
 
 /**
  * Static helper methods and classes for constants.
  */
 public abstract class Constants
 {
-    private static final Logger logger = LoggerFactory.getLogger(Constants.class);
-
     public enum Type
     {
-        STRING, INTEGER, UUID, FLOAT, BOOLEAN, HEX, DURATION;
+        STRING
+        {
+            @Override
+            public AbstractType<?> getPreferedTypeFor(String text)
+            {
+                 if (StandardCharsets.US_ASCII.newEncoder().canEncode(text))
+                 {
+                     return AsciiType.instance;
+                 }
+
+                 return UTF8Type.instance;
+            }
+        },
+        INTEGER
+        {
+            @Override
+            public AbstractType<?> getPreferedTypeFor(String text)
+            {
+                // We only try to determine the smallest possible type between int, long and BigInteger
+                BigInteger b = new BigInteger(text);
+
+                if (b.equals(BigInteger.valueOf(b.intValue())))
+                    return Int32Type.instance;
+
+                if (b.equals(BigInteger.valueOf(b.longValue())))
+                    return LongType.instance;
+
+                return IntegerType.instance;
+            }
+        },
+        UUID
+        {
+            @Override
+            public AbstractType<?> getPreferedTypeFor(String text)
+            {
+                return java.util.UUID.fromString(text).version() == 1
+                       ? TimeUUIDType.instance
+                       : UUIDType.instance;
+            }
+        },
+        FLOAT
+        {
+            @Override
+            public AbstractType<?> getPreferedTypeFor(String text)
+            {
+                if ("NaN".equals(text) || "-NaN".equals(text) || "Infinity".equals(text) || "-Infinity".equals(text))
+                    return DoubleType.instance;
+
+                // We only try to determine the smallest possible type between double and BigDecimal
+                BigDecimal b = new BigDecimal(text);
+
+                if (b.compareTo(BigDecimal.valueOf(b.doubleValue())) == 0)
+                    return DoubleType.instance;
+
+                return DecimalType.instance;
+            }
+        },
+        BOOLEAN
+        {
+            @Override
+            public AbstractType<?> getPreferedTypeFor(String text)
+            {
+                return BooleanType.instance;
+            }
+        },
+        HEX
+        {
+            @Override
+            public AbstractType<?> getPreferedTypeFor(String text)
+            {
+                return ByteType.instance;
+            }
+        },
+        DURATION
+        {
+            @Override
+            public AbstractType<?> getPreferedTypeFor(String text)
+            {
+                return DurationType.instance;
+            }
+        };
+
+        /**
+         * Returns the exact type for the specified text
+         *
+         * @param text the text for which the type must be determined
+         * @return the exact type or {@code null} if it is not known.
+         */
+        public AbstractType<?> getPreferedTypeFor(String text)
+        {
+            return null;
+        }
     }
 
     private static class UnsetLiteral extends Term.Raw
@@ -119,12 +213,14 @@ public abstract class Constants
     {
         private final Type type;
         private final String text;
+        private final AbstractType<?> preferedType;
 
         private Literal(Type type, String text)
         {
             assert type != null && text != null;
             this.type = type;
             this.text = text;
+            this.preferedType = type.getPreferedTypeFor(text);
         }
 
         public static Literal string(String text)
@@ -204,6 +300,11 @@ public abstract class Constants
                 return AssignmentTestable.TestResult.WEAKLY_ASSIGNABLE;
 
             CQL3Type.Native nt = (CQL3Type.Native)receiverType;
+
+            // If the receiver type match the prefered type we can straight away return an exact match
+            if (nt.getType().equals(preferedType))
+                return AssignmentTestable.TestResult.EXACT_MATCH;
+
             switch (type)
             {
                 case STRING:
@@ -290,6 +391,12 @@ public abstract class Constants
             return null;
         }
 
+        @Override
+        public AbstractType<?> getCompatibleTypeIfKnown(String keyspace)
+        {
+            return preferedType;
+        }
+
         public String getRawText()
         {
             return text;
@@ -313,7 +420,7 @@ public abstract class Constants
             this.bytes = bytes;
         }
 
-        public ByteBuffer get(ProtocolVersion protocolVersion)
+        public ByteBuffer get(ProtocolVersion version)
         {
             return bytes;
         }
@@ -333,8 +440,7 @@ public abstract class Constants
 
     public static class Marker extends AbstractMarker
     {
-        // Constructor is public only for the SuperColumn tables support
-        public Marker(int bindIndex, ColumnSpecification receiver)
+        protected Marker(int bindIndex, ColumnSpecification receiver)
         {
             super(bindIndex, receiver);
             assert !receiver.type.isCollection();
@@ -369,7 +475,7 @@ public abstract class Constants
 
     public static class Setter extends Operation
     {
-        public Setter(ColumnDefinition column, Term t)
+        public Setter(ColumnMetadata column, Term t)
         {
             super(column, t);
         }
@@ -386,27 +492,63 @@ public abstract class Constants
 
     public static class Adder extends Operation
     {
-        public Adder(ColumnDefinition column, Term t)
+        public Adder(ColumnMetadata column, Term t)
         {
             super(column, t);
         }
 
+        public boolean requiresRead()
+        {
+            return !(column.type instanceof CounterColumnType);
+        }
+
         public void execute(DecoratedKey partitionKey, UpdateParameters params) throws InvalidRequestException
         {
-            ByteBuffer bytes = t.bindAndGet(params.options);
-            if (bytes == null)
-                throw new InvalidRequestException("Invalid null value for counter increment");
-            if (bytes == ByteBufferUtil.UNSET_BYTE_BUFFER)
-                return;
+            if (column.type instanceof CounterColumnType)
+            {
+                ByteBuffer bytes = t.bindAndGet(params.options);
+                if (bytes == null)
+                    throw new InvalidRequestException("Invalid null value for counter increment");
+                if (bytes == ByteBufferUtil.UNSET_BYTE_BUFFER)
+                    return;
 
-            long increment = ByteBufferUtil.toLong(bytes);
-            params.addCounter(column, increment);
+                long increment = ByteBufferUtil.toLong(bytes);
+                params.addCounter(column, increment);
+            }
+            else if (column.type instanceof NumberType<?>)
+            {
+                @SuppressWarnings("unchecked") NumberType<Number> type = (NumberType<Number>) column.type;
+                ByteBuffer increment = t.bindAndGet(params.options);
+                ByteBuffer current = getCurrentCellBuffer(partitionKey, params);
+                if (current == null)
+                    return;
+                ByteBuffer newValue = type.add(type.compose(current), type.compose(increment));
+                params.addCell(column, newValue);
+            }
+            else if (column.type instanceof StringType)
+            {
+                ByteBuffer append = t.bindAndGet(params.options);
+                ByteBuffer current = getCurrentCellBuffer(partitionKey, params);
+                if (current == null)
+                    return;
+                ByteBuffer newValue = ByteBuffer.allocate(current.remaining() + append.remaining());
+                FastByteOperations.copy(current, current.position(), newValue, newValue.position(), current.remaining());
+                FastByteOperations.copy(append, append.position(), newValue, newValue.position() + current.remaining(), append.remaining());
+                params.addCell(column, newValue);
+            }
+        }
+
+        private ByteBuffer getCurrentCellBuffer(DecoratedKey key, UpdateParameters params)
+        {
+            Row currentRow = params.getPrefetchedRow(key, column.isStatic() ? Clustering.STATIC_CLUSTERING : params.currentClustering());
+            Cell<?> currentCell = currentRow == null ? null : currentRow.getCell(column);
+            return currentCell == null ? null : currentCell.buffer();
         }
     }
 
     public static class Substracter extends Operation
     {
-        public Substracter(ColumnDefinition column, Term t)
+        public Substracter(ColumnMetadata column, Term t)
         {
             super(column, t);
         }
@@ -431,7 +573,7 @@ public abstract class Constants
     // duplicating this further
     public static class Deleter extends Operation
     {
-        public Deleter(ColumnDefinition column)
+        public Deleter(ColumnMetadata column)
         {
             super(column, null);
         }

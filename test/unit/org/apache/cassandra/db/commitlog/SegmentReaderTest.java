@@ -17,10 +17,8 @@
  */
 package org.apache.cassandra.db.commitlog;
 
-import java.io.File;
-import java.io.FileOutputStream;
+import org.apache.cassandra.io.util.*;
 import java.io.IOException;
-import java.io.RandomAccessFile;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.util.Collections;
@@ -41,8 +39,7 @@ import org.apache.cassandra.io.compress.DeflateCompressor;
 import org.apache.cassandra.io.compress.ICompressor;
 import org.apache.cassandra.io.compress.LZ4Compressor;
 import org.apache.cassandra.io.compress.SnappyCompressor;
-import org.apache.cassandra.io.util.FileDataInput;
-import org.apache.cassandra.io.util.RandomAccessReader;
+import org.apache.cassandra.io.compress.ZstdCompressor;
 import org.apache.cassandra.security.CipherFactory;
 import org.apache.cassandra.security.EncryptionUtils;
 import org.apache.cassandra.security.EncryptionContext;
@@ -77,6 +74,12 @@ public class SegmentReaderTest
         compressedSegmenter(DeflateCompressor.create(null));
     }
 
+    @Test
+    public void compressedSegmenter_Zstd() throws IOException
+    {
+        compressedSegmenter(ZstdCompressor.create(Collections.emptyMap()));
+    }
+
     private void compressedSegmenter(ICompressor compressor) throws IOException
     {
         int rawSize = (1 << 15) - 137;
@@ -93,9 +96,9 @@ public class SegmentReaderTest
         compressor.compress(plainTextBuffer, compBuffer);
         compBuffer.flip();
 
-        File compressedFile = File.createTempFile("compressed-segment-", ".log");
+        File compressedFile = FileUtils.createTempFile("compressed-segment-", ".log");
         compressedFile.deleteOnExit();
-        FileOutputStream fos = new FileOutputStream(compressedFile);
+        FileOutputStreamPlus fos = new FileOutputStreamPlus(compressedFile);
         fos.getChannel().write(compBuffer);
         fos.close();
 
@@ -180,9 +183,9 @@ public class SegmentReaderTest
 
         ByteBuffer compressedBuffer = EncryptionUtils.compress(plainTextBuffer, null, true, context.getCompressor());
         Cipher cipher = cipherFactory.getEncryptor(context.getTransparentDataEncryptionOptions().cipher, context.getTransparentDataEncryptionOptions().key_alias);
-        File encryptedFile = File.createTempFile("encrypted-segment-", ".log");
+        File encryptedFile = FileUtils.createTempFile("encrypted-segment-", ".log");
         encryptedFile.deleteOnExit();
-        FileChannel channel = new RandomAccessFile(encryptedFile, "rw").getChannel();
+        FileChannel channel = encryptedFile.newReadWriteChannel();
         channel.write(ByteBufferUtil.bytes(plainTextLength));
         EncryptionUtils.encryptAndWrite(compressedBuffer, channel, true, cipher);
         channel.close();

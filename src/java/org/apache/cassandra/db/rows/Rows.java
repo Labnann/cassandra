@@ -22,12 +22,11 @@ import java.util.*;
 import com.google.common.collect.Iterators;
 import com.google.common.collect.PeekingIterator;
 
-import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.schema.ColumnMetadata;
+import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.partitions.PartitionStatisticsCollector;
 import org.apache.cassandra.utils.MergeIterator;
-import org.apache.cassandra.utils.WrappedInt;
 
 /**
  * Static utilities to work on Row objects.
@@ -37,28 +36,6 @@ public abstract class Rows
     private Rows() {}
 
     public static final Row EMPTY_STATIC_ROW = BTreeRow.emptyRow(Clustering.STATIC_CLUSTERING);
-
-    public static Row.Builder copy(Row row, Row.Builder builder)
-    {
-        builder.newRow(row.clustering());
-        builder.addPrimaryKeyLivenessInfo(row.primaryKeyLivenessInfo());
-        builder.addRowDeletion(row.deletion());
-        for (ColumnData cd : row)
-        {
-            if (cd.column().isSimple())
-            {
-                builder.addCell((Cell)cd);
-            }
-            else
-            {
-                ComplexColumnData complexData = (ComplexColumnData)cd;
-                builder.addComplexDeletion(complexData.column(), complexData.complexDeletion());
-                for (Cell cell : complexData)
-                    builder.addCell(cell);
-            }
-        }
-        return builder;
-    }
 
     /**
      * Creates a new simple row builder.
@@ -70,9 +47,49 @@ public abstract class Rows
      * only argument.
      * @return a newly created builder.
      */
-    public static Row.SimpleBuilder simpleBuilder(CFMetaData metadata, Object... clusteringValues)
+    public static Row.SimpleBuilder simpleBuilder(TableMetadata metadata, Object... clusteringValues)
     {
         return new SimpleBuilders.RowBuilder(metadata, clusteringValues);
+    }
+
+    private static class StatsAccumulation
+    {
+        private static final long COLUMN_INCR = 1L << 32;
+        private static final long CELL_INCR = 1L;
+
+        private static long accumulateOnCell(PartitionStatisticsCollector collector, Cell<?> cell, long l)
+        {
+            Cells.collectStats(cell, collector);
+            return l + CELL_INCR;
+        }
+
+        private static long accumulateOnColumnData(PartitionStatisticsCollector collector, ColumnData cd, long l)
+        {
+            if (cd.column().isSimple())
+            {
+                l = accumulateOnCell(collector, (Cell<?>) cd, l) + COLUMN_INCR;
+            }
+            else
+            {
+                ComplexColumnData complexData = (ComplexColumnData)cd;
+                collector.update(complexData.complexDeletion());
+                int startingCells = unpackCellCount(l);
+                l = complexData.accumulate(StatsAccumulation::accumulateOnCell, collector, l);
+                if (unpackCellCount(l) > startingCells)
+                    l += COLUMN_INCR;
+            }
+            return l;
+        }
+
+        private static int unpackCellCount(long v)
+        {
+            return (int) (v & 0xFFFFFFFFL);
+        }
+
+        private static int unpackColumnCount(long v)
+        {
+            return (int) (v >>> 32);
+        }
     }
 
     /**
@@ -89,35 +106,10 @@ public abstract class Rows
         collector.update(row.primaryKeyLivenessInfo());
         collector.update(row.deletion().time());
 
-        //we have to wrap these for the lambda
-        final WrappedInt columnCount = new WrappedInt(0);
-        final WrappedInt cellCount = new WrappedInt(0);
+        long result = row.accumulate(StatsAccumulation::accumulateOnColumnData, collector, 0);
 
-        row.apply(cd -> {
-            if (cd.column().isSimple())
-            {
-                columnCount.increment();
-                cellCount.increment();
-                Cells.collectStats((Cell) cd, collector);
-            }
-            else
-            {
-                ComplexColumnData complexData = (ComplexColumnData)cd;
-                collector.update(complexData.complexDeletion());
-                if (complexData.hasCells())
-                {
-                    columnCount.increment();
-                    for (Cell cell : complexData)
-                    {
-                        cellCount.increment();
-                        Cells.collectStats(cell, collector);
-                    }
-                }
-            }
-        }, false);
-
-        collector.updateColumnSetPerRow(columnCount.get());
-        return cellCount.get();
+        collector.updateColumnSetPerRow(StatsAccumulation.unpackColumnCount(result));
+        return StatsAccumulation.unpackCellCount(result);
     }
 
     /**
@@ -131,9 +123,10 @@ public abstract class Rows
      * @param merged the result of merging {@code inputs}.
      * @param inputs the inputs whose merge yielded {@code merged}.
      */
+    @SuppressWarnings("resource")
     public static void diff(RowDiffListener diffListener, Row merged, Row...inputs)
     {
-        Clustering clustering = merged.clustering();
+        Clustering<?> clustering = merged.clustering();
         LivenessInfo mergedInfo = merged.primaryKeyLivenessInfo().isEmpty() ? null : merged.primaryKeyLivenessInfo();
         Row.Deletion mergedDeletion = merged.deletion().isLive() ? null : merged.deletion();
         for (int i = 0; i < inputs.length; i++)
@@ -172,10 +165,10 @@ public abstract class Rows
                     ColumnData input = inputDatas[i];
                     if (mergedData != null || input != null)
                     {
-                        ColumnDefinition column = (mergedData != null ? mergedData : input).column;
+                        ColumnMetadata column = (mergedData != null ? mergedData : input).column;
                         if (column.isSimple())
                         {
-                            diffListener.onCell(i, clustering, (Cell) mergedData, (Cell) input);
+                            diffListener.onCell(i, clustering, (Cell<?>) mergedData, (Cell<?>) input);
                         }
                         else
                         {
@@ -186,7 +179,7 @@ public abstract class Rows
                                 // Everything in inputData has been shadowed
                                 if (!inputData.complexDeletion().isLive())
                                     diffListener.onComplexDeletion(i, clustering, column, null, inputData.complexDeletion());
-                                for (Cell inputCell : inputData)
+                                for (Cell<?> inputCell : inputData)
                                     diffListener.onCell(i, clustering, null, inputCell);
                             }
                             else if (inputData == null)
@@ -194,7 +187,7 @@ public abstract class Rows
                                 // Everything in inputData is new
                                 if (!mergedData.complexDeletion().isLive())
                                     diffListener.onComplexDeletion(i, clustering, column, mergedData.complexDeletion(), null);
-                                for (Cell mergedCell : mergedData)
+                                for (Cell<?> mergedCell : mergedData)
                                     diffListener.onCell(i, clustering, mergedCell, null);
                             }
                             else
@@ -203,8 +196,8 @@ public abstract class Rows
                                 if (!mergedData.complexDeletion().isLive() || !inputData.complexDeletion().isLive())
                                     diffListener.onComplexDeletion(i, clustering, column, mergedData.complexDeletion(), inputData.complexDeletion());
 
-                                PeekingIterator<Cell> mergedCells = Iterators.peekingIterator(mergedData.iterator());
-                                PeekingIterator<Cell> inputCells = Iterators.peekingIterator(inputData.iterator());
+                                PeekingIterator<Cell<?>> mergedCells = Iterators.peekingIterator(mergedData.iterator());
+                                PeekingIterator<Cell<?>> inputCells = Iterators.peekingIterator(inputData.iterator());
                                 while (mergedCells.hasNext() && inputCells.hasNext())
                                 {
                                     int cmp = column.cellPathComparator().compare(mergedCells.peek().path(), inputCells.peek().path());
@@ -238,95 +231,28 @@ public abstract class Rows
             iter.next();
     }
 
-    public static Row merge(Row row1, Row row2, int nowInSec)
+    public static Row merge(Row existing, Row update)
     {
-        Row.Builder builder = BTreeRow.sortedBuilder();
-        merge(row1, row2, builder, nowInSec);
-        return builder.build();
+        return merge(existing, update, ColumnData.noOp);
     }
 
     /**
-     * Merges two rows into the given builder, mainly for merging memtable rows. In addition to reconciling the cells
-     * in each row, the liveness info, and deletion times for the row and complex columns are also merged.
+     * Merges two rows. In addition to reconciling the cells in each row, the liveness info, and deletion times for
+     * the row and complex columns are also merged.
      * <p>
      * Note that this method assumes that the provided rows can meaningfully be reconciled together. That is,
      * that the rows share the same clustering value, and belong to the same partition.
      *
      * @param existing
      * @param update
-     * @param builder the row build to which the result of the reconciliation is written.
-     * @param nowInSec the current time in seconds (which plays a role during reconciliation
-     * because deleted cells always have precedence on timestamp equality and deciding if a
-     * cell is a live or not depends on the current time due to expiring cells).
      *
-     * @return the smallest timestamp delta between corresponding rows from existing and update. A
-     * timestamp delta being computed as the difference between the cells and DeletionTimes from {@code existing}
-     * and those in {@code existing}.
+     * @return the row resulting from the merge.
      */
-    public static long merge(Row existing,
-                             Row update,
-                             Row.Builder builder,
-                             int nowInSec)
+    public static Row merge(Row existing, Row update, ColumnData.PostReconciliationFunction onReconcile)
     {
-        Clustering clustering = existing.clustering();
-        builder.newRow(clustering);
-
-        LivenessInfo existingInfo = existing.primaryKeyLivenessInfo();
-        LivenessInfo updateInfo = update.primaryKeyLivenessInfo();
-        LivenessInfo mergedInfo = existingInfo.supersedes(updateInfo) ? existingInfo : updateInfo;
-
-        long timeDelta = Math.abs(existingInfo.timestamp() - mergedInfo.timestamp());
-
-        Row.Deletion rowDeletion = existing.deletion().supersedes(update.deletion()) ? existing.deletion() : update.deletion();
-
-        if (rowDeletion.deletes(mergedInfo))
-            mergedInfo = LivenessInfo.EMPTY;
-        else if (rowDeletion.isShadowedBy(mergedInfo))
-            rowDeletion = Row.Deletion.LIVE;
-
-        builder.addPrimaryKeyLivenessInfo(mergedInfo);
-        builder.addRowDeletion(rowDeletion);
-
-        DeletionTime deletion = rowDeletion.time();
-
-        Iterator<ColumnData> a = existing.iterator();
-        Iterator<ColumnData> b = update.iterator();
-        ColumnData nexta = a.hasNext() ? a.next() : null, nextb = b.hasNext() ? b.next() : null;
-        while (nexta != null | nextb != null)
-        {
-            int comparison = nexta == null ? 1 : nextb == null ? -1 : nexta.column.compareTo(nextb.column);
-            ColumnData cura = comparison <= 0 ? nexta : null;
-            ColumnData curb = comparison >= 0 ? nextb : null;
-            ColumnDefinition column = getColumnDefinition(cura, curb);
-
-            if (column.isSimple())
-            {
-                timeDelta = Math.min(timeDelta, Cells.reconcile((Cell) cura, (Cell) curb, deletion, builder, nowInSec));
-            }
-            else
-            {
-                ComplexColumnData existingData = (ComplexColumnData) cura;
-                ComplexColumnData updateData = (ComplexColumnData) curb;
-
-                DeletionTime existingDt = existingData == null ? DeletionTime.LIVE : existingData.complexDeletion();
-                DeletionTime updateDt = updateData == null ? DeletionTime.LIVE : updateData.complexDeletion();
-                DeletionTime maxDt = existingDt.supersedes(updateDt) ? existingDt : updateDt;
-                if (maxDt.supersedes(deletion))
-                    builder.addComplexDeletion(column, maxDt);
-                else
-                    maxDt = deletion;
-
-                Iterator<Cell> existingCells = existingData == null ? null : existingData.iterator();
-                Iterator<Cell> updateCells = updateData == null ? null : updateData.iterator();
-                timeDelta = Math.min(timeDelta, Cells.reconcileComplex(column, existingCells, updateCells, maxDt, builder, nowInSec));
-            }
-
-            if (cura != null)
-                nexta = a.hasNext() ? a.next() : null;
-            if (curb != null)
-                nextb = b.hasNext() ? b.next() : null;
-        }
-        return timeDelta;
+        assert existing instanceof BTreeRow;
+        assert update instanceof BTreeRow;
+        return BTreeRow.merge((BTreeRow) existing, (BTreeRow) update, onReconcile);
     }
 
     /**
@@ -337,14 +263,11 @@ public abstract class Rows
      * @param existing source row
      * @param update shadowing row
      * @param rangeDeletion extra {@code DeletionTime} from covering tombstone
-     * @param nowInSec the current time in seconds (which plays a role during reconciliation
-     * because deleted cells always have precedence on timestamp equality and deciding if a
-     * cell is a live or not depends on the current time due to expiring cells).
      */
-    public static Row removeShadowedCells(Row existing, Row update, DeletionTime rangeDeletion, int nowInSec)
+    public static Row removeShadowedCells(Row existing, Row update, DeletionTime rangeDeletion)
     {
         Row.Builder builder = BTreeRow.sortedBuilder();
-        Clustering clustering = existing.clustering();
+        Clustering<?> clustering = existing.clustering();
         builder.newRow(clustering);
 
         DeletionTime deletion = update.deletion().time();
@@ -367,11 +290,11 @@ public abstract class Rows
             if (comparison <= 0)
             {
                 ColumnData cura = nexta;
-                ColumnDefinition column = cura.column;
+                ColumnMetadata column = cura.column;
                 ColumnData curb = comparison == 0 ? nextb : null;
                 if (column.isSimple())
                 {
-                    Cells.addNonShadowed((Cell) cura, (Cell) curb, deletion, builder, nowInSec);
+                    Cells.addNonShadowed((Cell<?>) cura, (Cell<?>) curb, deletion, builder);
                 }
                 else
                 {
@@ -388,9 +311,9 @@ public abstract class Rows
                         maxDt = existingDt;
                     }
 
-                    Iterator<Cell> existingCells = existingData.iterator();
-                    Iterator<Cell> updateCells = updateData == null ? null : updateData.iterator();
-                    Cells.addNonShadowedComplex(column, existingCells, updateCells, maxDt, builder, nowInSec);
+                    Iterator<Cell<?>> existingCells = existingData.iterator();
+                    Iterator<Cell<?>> updateCells = updateData == null ? null : updateData.iterator();
+                    Cells.addNonShadowedComplex(column, existingCells, updateCells, maxDt, builder);
                 }
                 nexta = a.hasNext() ? a.next() : null;
                 if (curb != null)
@@ -403,23 +326,5 @@ public abstract class Rows
         }
         Row row = builder.build();
         return row != null && !row.isEmpty() ? row : null;
-    }
-
-    /**
-     * Returns the {@code ColumnDefinition} to use for merging the columns.
-     * If the 2 column definitions are different the latest one will be returned.
-     */
-    private static ColumnDefinition getColumnDefinition(ColumnData cura, ColumnData curb)
-    {
-        if (cura == null)
-            return curb.column;
-
-        if (curb == null)
-            return cura.column;
-
-        if (AbstractTypeVersionComparator.INSTANCE.compare(cura.column.type, curb.column.type) >= 0)
-            return cura.column;
-
-        return curb.column;
     }
 }

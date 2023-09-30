@@ -17,7 +17,7 @@
  */
 package org.apache.cassandra.tools.nodetool;
 
-import io.airlift.command.Command;
+import io.airlift.airline.Command;
 
 import java.util.List;
 
@@ -33,13 +33,13 @@ public class FailureDetectorInfo extends NodeToolCmd
     @Override
     public void execute(NodeProbe probe)
     {
-        TabularData data = probe.getFailureDetectorPhilValues();
-        System.out.printf("%10s,%16s%n", "Endpoint", "Phi");
+        TabularData data = probe.getFailureDetectorPhilValues(printPort);
+        probe.output().out.printf("%10s,%16s%n", "Endpoint", "Phi");
         for (Object o : data.keySet())
         {
             @SuppressWarnings({ "rawtypes", "unchecked" })
             CompositeData datum = data.get(((List) o).toArray(new Object[((List) o).size()]));
-            System.out.printf("%10s,%16.8f%n",datum.get("Endpoint"), datum.get("PHI"));
+            probe.output().out.printf("%10s,%16.8f%n", datum.get("Endpoint"), datum.get("PHI"));
         }
     }
 }

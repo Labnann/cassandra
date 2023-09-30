@@ -25,8 +25,9 @@ import com.google.common.collect.ImmutableRangeSet;
 import com.google.common.collect.Range;
 import com.google.common.collect.RangeSet;
 
-import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.index.Index;
+import org.apache.cassandra.schema.ColumnMetadata;
+import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.cql3.QueryOptions;
 import org.apache.cassandra.cql3.functions.Function;
 import org.apache.cassandra.cql3.statements.Bound;
@@ -34,7 +35,8 @@ import org.apache.cassandra.db.filter.RowFilter;
 import org.apache.cassandra.dht.IPartitioner;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.exceptions.InvalidRequestException;
-import org.apache.cassandra.index.SecondaryIndexManager;
+import org.apache.cassandra.index.IndexRegistry;
+import org.apache.cassandra.service.ClientState;
 
 import static org.apache.cassandra.cql3.statements.Bound.END;
 import static org.apache.cassandra.cql3.statements.Bound.START;
@@ -78,7 +80,7 @@ final class TokenFilter implements PartitionKeyRestrictions
     }
 
     @Override
-    public Set<Restriction> getRestrictions(ColumnDefinition columnDef)
+    public Set<Restriction> getRestrictions(ColumnMetadata columnDef)
     {
         Set<Restriction> set = new HashSet<>();
         set.addAll(restrictions.getRestrictions(columnDef));
@@ -102,9 +104,9 @@ final class TokenFilter implements PartitionKeyRestrictions
     }
 
     @Override
-    public List<ByteBuffer> values(QueryOptions options) throws InvalidRequestException
+    public List<ByteBuffer> values(QueryOptions options, ClientState state) throws InvalidRequestException
     {
-        return filter(restrictions.values(options), options);
+        return filter(restrictions.values(options, state), options, state);
     }
 
     @Override
@@ -139,13 +141,14 @@ final class TokenFilter implements PartitionKeyRestrictions
      *
      * @param values the values returned by the decorated restriction
      * @param options the query options
+     * @param state the client state
      * @return the values matching the token restriction
      * @throws InvalidRequestException if the request is invalid
      */
-    private List<ByteBuffer> filter(List<ByteBuffer> values, QueryOptions options) throws InvalidRequestException
+    private List<ByteBuffer> filter(List<ByteBuffer> values, QueryOptions options, ClientState state) throws InvalidRequestException
     {
         RangeSet<Token> rangeSet = tokenRestriction.hasSlice() ? toRangeSet(tokenRestriction, options)
-                                                               : toRangeSet(tokenRestriction.values(options));
+                                                               : toRangeSet(tokenRestriction.values(options, state));
 
         return filterWithRangeSet(rangeSet, values);
     }
@@ -248,19 +251,19 @@ final class TokenFilter implements PartitionKeyRestrictions
     }
 
     @Override
-    public ColumnDefinition getFirstColumn()
+    public ColumnMetadata getFirstColumn()
     {
         return restrictions.getFirstColumn();
     }
 
     @Override
-    public ColumnDefinition getLastColumn()
+    public ColumnMetadata getLastColumn()
     {
         return restrictions.getLastColumn();
     }
 
     @Override
-    public List<ColumnDefinition> getColumnDefs()
+    public List<ColumnMetadata> getColumnDefs()
     {
         return restrictions.getColumnDefs();
     }
@@ -272,15 +275,21 @@ final class TokenFilter implements PartitionKeyRestrictions
     }
 
     @Override
-    public boolean hasSupportingIndex(SecondaryIndexManager indexManager)
+    public boolean hasSupportingIndex(IndexRegistry indexRegistry)
     {
-        return restrictions.hasSupportingIndex(indexManager);
+        return restrictions.hasSupportingIndex(indexRegistry);
     }
 
     @Override
-    public void addRowFilterTo(RowFilter filter, SecondaryIndexManager indexManager, QueryOptions options)
+    public void addToRowFilter(RowFilter filter, IndexRegistry indexRegistry, QueryOptions options)
     {
-        restrictions.addRowFilterTo(filter, indexManager, options);
+        restrictions.addToRowFilter(filter, indexRegistry, options);
+    }
+
+    @Override
+    public boolean needsFiltering(Index.Group indexGroup)
+    {
+        return restrictions.needsFiltering(indexGroup);
     }
 
     @Override
@@ -296,15 +305,15 @@ final class TokenFilter implements PartitionKeyRestrictions
     }
 
     @Override
-    public boolean needFiltering(CFMetaData cfm)
+    public boolean needFiltering(TableMetadata table)
     {
-        return restrictions.needFiltering(cfm);
+        return restrictions.needFiltering(table);
     }
 
     @Override
-    public boolean hasUnrestrictedPartitionKeyComponents(CFMetaData cfm)
+    public boolean hasUnrestrictedPartitionKeyComponents(TableMetadata table)
     {
-        return restrictions.hasUnrestrictedPartitionKeyComponents(cfm);
+        return restrictions.hasUnrestrictedPartitionKeyComponents(table);
     }
 
     @Override

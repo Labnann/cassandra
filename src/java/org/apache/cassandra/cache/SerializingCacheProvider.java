@@ -30,11 +30,11 @@ public class SerializingCacheProvider implements CacheProvider<RowCacheKey, IRow
 {
     public ICache<RowCacheKey, IRowCacheEntry> create()
     {
-        return SerializingCache.create(DatabaseDescriptor.getRowCacheSizeInMB() * 1024 * 1024, new RowCacheSerializer());
+        return SerializingCache.create(DatabaseDescriptor.getRowCacheSizeInMiB() * 1024 * 1024, new RowCacheSerializer());
     }
 
-    // Package protected for tests
-    static class RowCacheSerializer implements ISerializer<IRowCacheEntry>
+    // Package Public: used by external Row Cache plugins
+    public static class RowCacheSerializer implements ISerializer<IRowCacheEntry>
     {
         public void serialize(IRowCacheEntry entry, DataOutputPlus out) throws IOException
         {

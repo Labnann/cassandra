@@ -21,24 +21,29 @@ import java.util.UUID;
 
 import com.google.common.collect.Iterators;
 
-import org.apache.cassandra.db.Mutation;
+import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.partitions.AbstractBTreePartition;
 import org.apache.cassandra.db.partitions.PartitionUpdate;
+import org.apache.cassandra.gms.IFailureDetectionEventListener;
+import org.apache.cassandra.gms.IFailureDetector;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.net.Message;
+import org.apache.cassandra.net.MockMessagingService;
+import org.apache.cassandra.net.MockMessagingSpy;
+import org.apache.cassandra.net.NoPayload;
+import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.utils.Clock;
 
-import static junit.framework.Assert.assertEquals;
-import static junit.framework.Assert.assertTrue;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
+import static org.apache.cassandra.Util.dk;
+import static org.apache.cassandra.net.MockMessagingService.verb;
+import static org.apache.cassandra.net.Verb.HINT_REQ;
+import static org.apache.cassandra.net.Verb.HINT_RSP;
 
 final class HintsTestUtil
 {
-    static void assertMutationsEqual(Mutation expected, Mutation actual)
-    {
-        assertEquals(expected.key(), actual.key());
-        assertEquals(expected.getPartitionUpdates().size(), actual.getPartitionUpdates().size());
-
-        for (UUID id : expected.getColumnFamilyIds())
-            assertPartitionsEqual(expected.getPartitionUpdate(id), actual.getPartitionUpdate(id));
-    }
-
     static void assertPartitionsEqual(AbstractBTreePartition expected, AbstractBTreePartition actual)
     {
         assertEquals(expected.partitionKey(), actual.partitionKey());
@@ -51,10 +56,79 @@ final class HintsTestUtil
     {
         assertEquals(expected.mutation.getKeyspaceName(), actual.mutation.getKeyspaceName());
         assertEquals(expected.mutation.key(), actual.mutation.key());
-        assertEquals(expected.mutation.getColumnFamilyIds(), actual.mutation.getColumnFamilyIds());
+        assertEquals(expected.mutation.getTableIds(), actual.mutation.getTableIds());
         for (PartitionUpdate partitionUpdate : expected.mutation.getPartitionUpdates())
-            assertPartitionsEqual(partitionUpdate, actual.mutation.getPartitionUpdate(partitionUpdate.metadata().cfId));
+            assertPartitionsEqual(partitionUpdate, actual.mutation.getPartitionUpdate(partitionUpdate.metadata()));
         assertEquals(expected.creationTime, actual.creationTime);
         assertEquals(expected.gcgs, actual.gcgs);
+    }
+
+    static MockMessagingSpy sendHintsAndResponses(TableMetadata metadata, int noOfHints, int noOfResponses)
+    {
+        // create spy for hint messages, but only create responses for noOfResponses hints
+        Message<NoPayload> message = Message.internalResponse(HINT_RSP, NoPayload.noPayload);
+
+        MockMessagingSpy spy;
+        if (noOfResponses != -1)
+        {
+            spy = MockMessagingService.when(verb(HINT_REQ)).respondN(message, noOfResponses);
+        }
+        else
+        {
+            spy = MockMessagingService.when(verb(HINT_REQ)).respond(message);
+        }
+
+        // create and write noOfHints using service
+        UUID hostId = StorageService.instance.getLocalHostUUID();
+        for (int i = 0; i < noOfHints; i++)
+        {
+            long now = Clock.Global.currentTimeMillis();
+            DecoratedKey dkey = dk(String.valueOf(i));
+            PartitionUpdate.SimpleBuilder builder = PartitionUpdate.simpleBuilder(metadata, dkey).timestamp(now);
+            builder.row("column0").add("val", "value0");
+            Hint hint = Hint.create(builder.buildAsMutation(), now);
+            HintsService.instance.write(hostId, hint);
+        }
+        return spy;
+    }
+
+    static class MockFailureDetector implements IFailureDetector
+    {
+        boolean isAlive = true;
+
+        public boolean isAlive(InetAddressAndPort ep)
+        {
+            return isAlive;
+        }
+
+        public void interpret(InetAddressAndPort ep)
+        {
+            throw new UnsupportedOperationException();
+        }
+
+        public void report(InetAddressAndPort ep)
+        {
+            throw new UnsupportedOperationException();
+        }
+
+        public void registerFailureDetectionEventListener(IFailureDetectionEventListener listener)
+        {
+            throw new UnsupportedOperationException();
+        }
+
+        public void unregisterFailureDetectionEventListener(IFailureDetectionEventListener listener)
+        {
+            throw new UnsupportedOperationException();
+        }
+
+        public void remove(InetAddressAndPort ep)
+        {
+            throw new UnsupportedOperationException();
+        }
+
+        public void forceConviction(InetAddressAndPort ep)
+        {
+            throw new UnsupportedOperationException();
+        }
     }
 }

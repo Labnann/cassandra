@@ -25,10 +25,19 @@ import org.apache.cassandra.cql3.CQLTester;
 public class DropTest extends CQLTester
 {
     @Test
+    public void testDropTableWithNameCapitalPAndColumnDuration() throws Throwable
+    {
+        // CASSANDRA-17919
+        createTable(KEYSPACE, "CREATE TABLE %s (a INT PRIMARY KEY, b DURATION);", "P");
+        execute("DROP TABLE %s");
+        assertRowsIgnoringOrder(execute(String.format("SELECT * FROM system_schema.dropped_columns WHERE keyspace_name = '%s' AND table_name = 'P'", keyspace())));
+    }
+
+    @Test
     public void testNonExistingOnes() throws Throwable
     {
-        assertInvalidMessage("Cannot drop non existing table", "DROP TABLE " + KEYSPACE + ".table_does_not_exist");
-        assertInvalidMessage("Cannot drop table in unknown keyspace", "DROP TABLE keyspace_does_not_exist.table_does_not_exist");
+        assertInvalidMessage(String.format("Table '%s.table_does_not_exist' doesn't exist", KEYSPACE),  "DROP TABLE " + KEYSPACE + ".table_does_not_exist");
+        assertInvalidMessage("Table 'keyspace_does_not_exist.table_does_not_exist' doesn't exist", "DROP TABLE keyspace_does_not_exist.table_does_not_exist");
 
         execute("DROP TABLE IF EXISTS " + KEYSPACE + ".table_does_not_exist");
         execute("DROP TABLE IF EXISTS keyspace_does_not_exist.table_does_not_exist");

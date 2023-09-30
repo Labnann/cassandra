@@ -18,7 +18,6 @@
  */
 package org.apache.cassandra.utils;
 
-import java.io.DataInputStream;
 import java.io.IOException;
 
 import org.junit.Assert;
@@ -30,45 +29,41 @@ import org.apache.cassandra.Util;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.marshal.Int32Type;
-import org.apache.cassandra.io.util.DataInputPlus.DataInputStreamPlus;
-import org.apache.cassandra.io.util.DataOutputStreamPlus;
-import org.apache.cassandra.dht.IPartitioner;
 import org.apache.cassandra.dht.Murmur3Partitioner;
-
-import java.io.File;
-import java.io.FileInputStream;
+import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.io.util.DataOutputStreamPlus;
+import org.apache.cassandra.io.util.File;
+import org.apache.cassandra.io.util.FileInputStreamPlus;
+import org.apache.cassandra.utils.obs.OffHeapBitSet;
 
 public class SerializationsTest extends AbstractSerializationsTester
 {
+    // Helper function to serialize old Bloomfilter format, should be removed once the old format is not supported
+    public static void serializeOldBfFormat(BloomFilter bf, DataOutputPlus out) throws IOException
+    {
+        out.writeInt(bf.hashCount);
+        Assert.assertTrue(bf.bitset instanceof OffHeapBitSet);
+        ((OffHeapBitSet) bf.bitset).serializeOldBfFormat(out);
+    }
+
     @BeforeClass
     public static void initDD()
     {
         DatabaseDescriptor.daemonInitialization();
     }
 
-    private static void testBloomFilterWrite(boolean offheap, boolean oldBfHashOrder) throws IOException
+    private static void testBloomFilterWrite1000(boolean oldBfFormat) throws IOException
     {
-        IPartitioner partitioner = Util.testPartitioner();
-        try (IFilter bf = FilterFactory.getFilter(1000000, 0.0001, offheap, oldBfHashOrder))
-        {
-            for (int i = 0; i < 100; i++)
-                bf.add(partitioner.decorateKey(partitioner.getTokenFactory().toByteArray(partitioner.getRandomToken())));
-            try (DataOutputStreamPlus out = getOutput(oldBfHashOrder ? "2.1" : "3.0", "utils.BloomFilter.bin"))
-            {
-                FilterFactory.serialize(bf, out);
-            }
-        }
-    }
-
-    private static void testBloomFilterWrite1000(boolean offheap, boolean oldBfHashOrder) throws IOException
-    {
-        try (IFilter bf = FilterFactory.getFilter(1000000, 0.0001, offheap, oldBfHashOrder))
+        try (IFilter bf = FilterFactory.getFilter(1000000, 0.0001))
         {
             for (int i = 0; i < 1000; i++)
                 bf.add(Util.dk(Int32Type.instance.decompose(i)));
-            try (DataOutputStreamPlus out = getOutput(oldBfHashOrder ? "2.1" : "3.0", "utils.BloomFilter1000.bin"))
+            try (DataOutputStreamPlus out = getOutput(oldBfFormat ? "3.0" : "4.0", "utils.BloomFilter1000.bin"))
             {
-                FilterFactory.serialize(bf, out);
+                if (oldBfFormat)
+                    serializeOldBfFormat((BloomFilter) bf, out);
+                else
+                    BloomFilterSerializer.forVersion(false).serialize((BloomFilter) bf, out);
             }
         }
     }
@@ -78,12 +73,12 @@ public class SerializationsTest extends AbstractSerializationsTester
     {
         if (EXECUTE_WRITES)
         {
-            testBloomFilterWrite1000(true, false);
-            testBloomFilterWrite1000(true, true);
+            testBloomFilterWrite1000(false);
+            testBloomFilterWrite1000(true);
         }
 
-        try (DataInputStream in = getInput("3.0", "utils.BloomFilter1000.bin");
-             IFilter filter = FilterFactory.deserialize(in, true, false))
+        try (FileInputStreamPlus in = getInput("4.0", "utils.BloomFilter1000.bin");
+             IFilter filter = BloomFilterSerializer.forVersion(false).deserialize(in))
         {
             boolean present;
             for (int i = 0 ; i < 1000 ; i++)
@@ -98,8 +93,8 @@ public class SerializationsTest extends AbstractSerializationsTester
             }
         }
 
-        try (DataInputStream in = getInput("2.1", "utils.BloomFilter1000.bin");
-             IFilter filter = FilterFactory.deserialize(in, true, true))
+        try (FileInputStreamPlus in = getInput("3.0", "utils.BloomFilter1000.bin");
+             IFilter filter = BloomFilterSerializer.forVersion(true).deserialize(in))
         {
             boolean present;
             for (int i = 0 ; i < 1000 ; i++)
@@ -113,44 +108,20 @@ public class SerializationsTest extends AbstractSerializationsTester
                 Assert.assertFalse(present);
             }
         }
-
-        // eh - reading version version 'ka' (2.1) with 3.0 BloomFilter
-        int falsePositive = 0;
-        int falseNegative = 0;
-        try (DataInputStream in = getInput("2.1", "utils.BloomFilter1000.bin");
-             IFilter filter = FilterFactory.deserialize(in, true, false))
-        {
-            boolean present;
-            for (int i = 0 ; i < 1000 ; i++)
-            {
-                present = filter.isPresent(Util.dk(Int32Type.instance.decompose(i)));
-                if (!present)
-                    falseNegative ++;
-            }
-            for (int i = 1000 ; i < 2000 ; i++)
-            {
-                present = filter.isPresent(Util.dk(Int32Type.instance.decompose(i)));
-                if (present)
-                    falsePositive ++;
-            }
-        }
-        Assert.assertEquals(1000, falseNegative);
-        Assert.assertEquals(0, falsePositive);
     }
 
     @Test
     public void testBloomFilterTable() throws Exception
     {
-        testBloomFilterTable("test/data/bloom-filter/ka/foo/foo-atable-ka-1-Filter.db", true);
-        testBloomFilterTable("test/data/bloom-filter/la/foo/la-1-big-Filter.db", false);
+        testBloomFilterTable("test/data/bloom-filter/la/foo/la-1-big-Filter.db", true);
     }
 
-    private static void testBloomFilterTable(String file, boolean oldBfHashOrder) throws Exception
+    private void testBloomFilterTable(String file, boolean oldBfFormat) throws Exception
     {
         Murmur3Partitioner partitioner = new Murmur3Partitioner();
 
-        try (DataInputStream in = new DataInputStream(new FileInputStream(new File(file)));
-             IFilter filter = FilterFactory.deserialize(in, true, oldBfHashOrder))
+        try (FileInputStreamPlus in = new File(file).newInputStream();
+             IFilter filter = BloomFilterSerializer.forVersion(oldBfFormat).deserialize(in))
         {
             for (int i = 1; i <= 10; i++)
             {
@@ -173,31 +144,6 @@ public class SerializationsTest extends AbstractSerializationsTester
         }
     }
 
-    @Test
-    public void testBloomFilterReadMURMUR3() throws IOException
-    {
-        if (EXECUTE_WRITES)
-            testBloomFilterWrite(true, true);
-
-        try (DataInputStream in = getInput("3.0", "utils.BloomFilter.bin");
-             IFilter filter = FilterFactory.deserialize(in, true, true))
-        {
-            Assert.assertNotNull(filter);
-        }
-    }
-
-    @Test
-    public void testBloomFilterReadMURMUR3pre30() throws IOException
-    {
-        if (EXECUTE_WRITES)
-            testBloomFilterWrite(true, false);
-
-        try (DataInputStream in = getInput("2.1", "utils.BloomFilter.bin");
-             IFilter filter = FilterFactory.deserialize(in, true, false))
-        {
-            Assert.assertNotNull(filter);
-        }
-    }
 
     private static void testEstimatedHistogramWrite() throws IOException
     {
@@ -210,7 +156,7 @@ public class SerializationsTest extends AbstractSerializationsTester
             offsets[i] = i;
             data[i] = 10 * i;
         }
-        data[offsets.length] = 100000;
+        data[offsets.length] = 100000; // write into the overflow bucket
         EstimatedHistogram hist2 = new EstimatedHistogram(offsets, data);
 
         try (DataOutputStreamPlus out = getOutput("utils.EstimatedHistogram.bin"))
@@ -227,7 +173,7 @@ public class SerializationsTest extends AbstractSerializationsTester
         if (EXECUTE_WRITES)
             testEstimatedHistogramWrite();
 
-        try (DataInputStreamPlus in = getInput("utils.EstimatedHistogram.bin"))
+        try (FileInputStreamPlus in = getInput("utils.EstimatedHistogram.bin"))
         {
             Assert.assertNotNull(EstimatedHistogram.serializer.deserialize(in));
             Assert.assertNotNull(EstimatedHistogram.serializer.deserialize(in));

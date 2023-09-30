@@ -21,13 +21,13 @@ import java.io.IOException;
 import java.util.*;
 
 import org.apache.cassandra.db.DecoratedKey;
-import org.apache.cassandra.index.sasi.utils.AbstractIterator;
 import org.apache.cassandra.index.sasi.utils.CombinedValue;
 import org.apache.cassandra.index.sasi.utils.MappedBuffer;
 import org.apache.cassandra.index.sasi.utils.RangeIterator;
+import org.apache.cassandra.utils.AbstractGuavaIterator;
 import org.apache.cassandra.utils.MergeIterator;
 
-import com.carrotsearch.hppc.LongOpenHashSet;
+import com.carrotsearch.hppc.LongHashSet;
 import com.carrotsearch.hppc.LongSet;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Function;
@@ -410,7 +410,7 @@ public class TokenTree
 
         public LongSet getOffsets()
         {
-            LongSet offsets = new LongOpenHashSet(4);
+            LongSet offsets = new LongHashSet(4);
             for (TokenInfo i : info)
             {
                 for (long offset : i.fetchOffsets())
@@ -503,7 +503,7 @@ public class TokenTree
         }
     }
 
-    private static class KeyIterator extends AbstractIterator<DecoratedKey>
+    private static class KeyIterator extends AbstractGuavaIterator<DecoratedKey>
     {
         private final Function<Long, DecoratedKey> keyFetcher;
         private final long[] offsets;

@@ -20,10 +20,12 @@ package org.apache.cassandra.db;
 
 import java.util.Collections;
 import java.util.List;
+import java.util.Objects;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableList;
 
+import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.service.StorageService;
 
@@ -33,20 +35,22 @@ public class DiskBoundaries
     public final ImmutableList<PartitionPosition> positions;
     final long ringVersion;
     final int directoriesVersion;
+    private final ColumnFamilyStore cfs;
     private volatile boolean isInvalid = false;
 
-    public DiskBoundaries(Directories.DataDirectory[] directories, int diskVersion)
+    public DiskBoundaries(ColumnFamilyStore cfs, Directories.DataDirectory[] directories, int diskVersion)
     {
-        this(directories, null, -1, diskVersion);
+        this(cfs, directories, null, -1, diskVersion);
     }
 
     @VisibleForTesting
-    public DiskBoundaries(Directories.DataDirectory[] directories, List<PartitionPosition> positions, long ringVersion, int diskVersion)
+    public DiskBoundaries(ColumnFamilyStore cfs, Directories.DataDirectory[] directories, List<PartitionPosition> positions, long ringVersion, int diskVersion)
     {
         this.directories = directories == null ? null : ImmutableList.copyOf(directories);
         this.positions = positions == null ? null : ImmutableList.copyOf(positions);
         this.ringVersion = ringVersion;
         this.directoriesVersion = diskVersion;
+        this.cfs = cfs;
     }
 
     public boolean equals(Object o)
@@ -88,7 +92,7 @@ public class DiskBoundaries
     {
         if (isInvalid)
             return true;
-        int currentDiskVersion = BlacklistedDirectories.getDirectoriesVersion();
+        int currentDiskVersion = DisallowedDirectories.getDirectoriesVersion();
         long currentRingVersion = StorageService.instance.getTokenMetadata().getRingVersion();
         return currentDiskVersion != directoriesVersion || (ringVersion != -1 && currentRingVersion != ringVersion);
     }
@@ -102,10 +106,10 @@ public class DiskBoundaries
     {
         if (positions == null)
         {
-            return getBoundariesFromSSTableDirectory(sstable);
+            return getBoundariesFromSSTableDirectory(sstable.descriptor);
         }
 
-        int pos = Collections.binarySearch(positions, sstable.first);
+        int pos = Collections.binarySearch(positions, sstable.getFirst());
         assert pos < 0; // boundaries are .minkeybound and .maxkeybound so they should never be equal
         return -pos - 1;
     }
@@ -113,12 +117,13 @@ public class DiskBoundaries
     /**
      * Try to figure out location based on sstable directory
      */
-    private int getBoundariesFromSSTableDirectory(SSTableReader sstable)
+    public int getBoundariesFromSSTableDirectory(Descriptor descriptor)
     {
+        Directories.DataDirectory actualDirectory = cfs.getDirectories().getDataDirectoryForFile(descriptor);
         for (int i = 0; i < directories.size(); i++)
         {
             Directories.DataDirectory directory = directories.get(i);
-            if (sstable.descriptor.directory.getAbsolutePath().startsWith(directory.location.getAbsolutePath()))
+            if (actualDirectory != null && actualDirectory.equals(directory))
                 return i;
         }
         return 0;
@@ -127,5 +132,43 @@ public class DiskBoundaries
     public Directories.DataDirectory getCorrectDiskForSSTable(SSTableReader sstable)
     {
         return directories.get(getDiskIndex(sstable));
+    }
+
+    public Directories.DataDirectory getCorrectDiskForKey(DecoratedKey key)
+    {
+        if (positions == null)
+            return null;
+
+        return directories.get(getDiskIndex(key));
+    }
+
+    public boolean isInCorrectLocation(SSTableReader sstable, Directories.DataDirectory currentLocation)
+    {
+        int diskIndex = getDiskIndex(sstable);
+        PartitionPosition diskLast = positions.get(diskIndex);
+        return directories.get(diskIndex).equals(currentLocation) && sstable.getLast().compareTo(diskLast) <= 0;
+    }
+
+    private int getDiskIndex(DecoratedKey key)
+    {
+        int pos = Collections.binarySearch(positions, key);
+        assert pos < 0;
+        return -pos - 1;
+    }
+
+    public List<Directories.DataDirectory> getDisksInBounds(DecoratedKey first, DecoratedKey last)
+    {
+        if (positions == null || first == null || last == null)
+            return directories;
+        int firstIndex = getDiskIndex(first);
+        int lastIndex = getDiskIndex(last);
+        return directories.subList(firstIndex, lastIndex + 1);
+    }
+
+    public boolean isEquivalentTo(DiskBoundaries oldBoundaries)
+    {
+        return oldBoundaries != null &&
+               Objects.equals(positions, oldBoundaries.positions) &&
+               Objects.equals(directories, oldBoundaries.directories);
     }
 }

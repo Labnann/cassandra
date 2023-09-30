@@ -18,7 +18,7 @@
 
 package org.apache.cassandra.tools.nodetool;
 
-import io.airlift.command.Command;
+import io.airlift.airline.Command;
 import org.apache.cassandra.tools.NodeProbe;
 import org.apache.cassandra.tools.NodeTool.NodeToolCmd;
 
@@ -27,7 +27,7 @@ public class GetConcurrentCompactors extends NodeToolCmd
 {
     protected void execute(NodeProbe probe)
     {
-        System.out.println("Current concurrent compactors in the system is: \n" +
-                           probe.getConcurrentCompactors());
+        probe.output().out.println("Current concurrent compactors in the system is: \n" +
+                            probe.getConcurrentCompactors());
     }
 }

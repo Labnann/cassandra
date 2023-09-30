@@ -19,6 +19,8 @@ package org.apache.cassandra.db;
 
 import java.nio.ByteBuffer;
 
+import org.apache.cassandra.utils.ObjectSizes;
+
 /**
  * The clustering column values for a row.
  * <p>
@@ -27,14 +29,34 @@ import java.nio.ByteBuffer;
  * prefix used by rows.
  * <p>
  * Note however that while it's size must be equal to the table clustering size, a clustering can have
- * {@code null} values, and this mostly for thrift backward compatibility (in practice, if a value is null,
- * all of the following ones will be too because that's what thrift allows, but it's never assumed by the
- * code so we could start generally allowing nulls for clustering columns if we wanted to).
+ * {@code null} values (this is currently only allowed in COMPACT table for historical reasons, but we
+ * could imagine lifting that limitation if we decide it make sense from a CQL point of view).
  */
-public class BufferClustering extends AbstractBufferClusteringPrefix implements Clustering
+public class BufferClustering extends AbstractBufferClusteringPrefix implements Clustering<ByteBuffer>
 {
-    BufferClustering(ByteBuffer... values)
+    private static final long EMPTY_SIZE = ObjectSizes.measure(new BufferClustering(EMPTY_VALUES_ARRAY));
+
+    public BufferClustering(ByteBuffer... values)
     {
         super(Kind.CLUSTERING, values);
+    }
+
+    public long unsharedHeapSize()
+    {
+        if (this == Clustering.EMPTY || this == Clustering.STATIC_CLUSTERING)
+            return 0;
+        return EMPTY_SIZE + ObjectSizes.sizeOnHeapOf(values);
+    }
+
+    public long unsharedHeapSizeExcludingData()
+    {
+        if (this == Clustering.EMPTY || this == Clustering.STATIC_CLUSTERING)
+            return 0;
+        return EMPTY_SIZE + ObjectSizes.sizeOnHeapExcludingDataOf(values);
+    }
+
+    public static BufferClustering make(ByteBuffer... values)
+    {
+        return new BufferClustering(values);
     }
 }

@@ -17,35 +17,29 @@
  */
 package org.apache.cassandra.transport;
 
-import java.util.ArrayList;
-import java.io.IOException;
+import java.lang.reflect.Field;
+import java.lang.reflect.Modifier;
 import java.nio.ByteBuffer;
 import java.util.EnumSet;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
-import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentLinkedQueue;
-import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
+
+import com.google.common.annotations.VisibleForTesting;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.*;
-import io.netty.handler.codec.MessageToMessageDecoder;
-import io.netty.handler.codec.MessageToMessageEncoder;
 
-import com.google.common.base.Predicate;
-import com.google.common.collect.ImmutableSet;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.service.ClientWarn;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.tracing.Tracing;
 import org.apache.cassandra.transport.messages.*;
 import org.apache.cassandra.service.QueryState;
-import org.apache.cassandra.utils.JVMStabilityInspector;
+import org.apache.cassandra.utils.ReflectionUtils;
+import org.apache.cassandra.utils.TimeUUID;
+
+import static org.apache.cassandra.utils.TimeUUID.Generator.nextTimeUUID;
 
 /**
  * A message from the CQL binary protocol.
@@ -53,17 +47,6 @@ import org.apache.cassandra.utils.JVMStabilityInspector;
 public abstract class Message
 {
     protected static final Logger logger = LoggerFactory.getLogger(Message.class);
-
-    /**
-     * When we encounter an unexpected IOException we look for these {@link Throwable#getMessage() messages}
-     * (because we have no better way to distinguish) and log them at DEBUG rather than INFO, since they
-     * are generally caused by unclean client disconnects rather than an actual problem.
-     */
-    private static final Set<String> ioExceptionsAtDebugLevel = ImmutableSet.<String>builder().
-            add("Connection reset by peer").
-            add("Broken pipe").
-            add("Connection timed out").
-            build();
 
     public interface Codec<M extends Message> extends CBCodec<M> {}
 
@@ -88,7 +71,7 @@ public abstract class Message
         STARTUP        (1,  Direction.REQUEST,  StartupMessage.codec),
         READY          (2,  Direction.RESPONSE, ReadyMessage.codec),
         AUTHENTICATE   (3,  Direction.RESPONSE, AuthenticateMessage.codec),
-        CREDENTIALS    (4,  Direction.REQUEST,  CredentialsMessage.codec),
+        CREDENTIALS    (4,  Direction.REQUEST,  UnsupportedMessageCodec.instance),
         OPTIONS        (5,  Direction.REQUEST,  OptionsMessage.codec),
         SUPPORTED      (6,  Direction.RESPONSE, SupportedMessage.codec),
         QUERY          (7,  Direction.REQUEST,  QueryMessage.codec),
@@ -143,12 +126,25 @@ public abstract class Message
                                                           t));
             return t;
         }
+
+        @VisibleForTesting
+        public Codec<?> unsafeSetCodec(Codec<?> codec) throws NoSuchFieldException, IllegalAccessException
+        {
+            Codec<?> original = this.codec;
+            Field field = Type.class.getDeclaredField("codec");
+            field.setAccessible(true);
+            Field modifiers = ReflectionUtils.getModifiersField();
+            modifiers.setAccessible(true);
+            modifiers.setInt(field, field.getModifiers() & ~Modifier.FINAL);
+            field.set(this, codec);
+            return original;
+        }
     }
 
     public final Type type;
     protected Connection connection;
     private int streamId;
-    private Frame sourceFrame;
+    private Envelope source;
     private Map<String, ByteBuffer> customPayload;
     protected ProtocolVersion forcedProtocolVersion = null;
 
@@ -178,14 +174,14 @@ public abstract class Message
         return streamId;
     }
 
-    public void setSourceFrame(Frame sourceFrame)
+    public void setSource(Envelope source)
     {
-        this.sourceFrame = sourceFrame;
+        this.source = source;
     }
 
-    public Frame getSourceFrame()
+    public Envelope getSource()
     {
-        return sourceFrame;
+        return source;
     }
 
     public Map<String, ByteBuffer> getCustomPayload()
@@ -198,9 +194,15 @@ public abstract class Message
         this.customPayload = customPayload;
     }
 
+    @Override
+    public String toString()
+    {
+        return String.format("(%s:%s:%s)", type, streamId, connection == null ? "null" :  connection.getVersion().asInt());
+    }
+
     public static abstract class Request extends Message
     {
-        protected boolean tracingRequested;
+        private boolean tracingRequested;
 
         protected Request(Type type)
         {
@@ -210,14 +212,67 @@ public abstract class Message
                 throw new IllegalArgumentException();
         }
 
-        public abstract Response execute(QueryState queryState, long queryStartNanoTime);
-
-        public void setTracingRequested()
+        /**
+         * @return true if the execution of this {@link Request} should be recorded in a tracing session
+         */
+        protected boolean isTraceable()
         {
-            this.tracingRequested = true;
+            return false;
         }
 
-        public boolean isTracingRequested()
+        /**
+         * @return true if warnings should be tracked and aborts enforced for resource limits on this {@link Request}
+         */
+        protected boolean isTrackable()
+        {
+            return false;
+        }
+
+        protected abstract Response execute(QueryState queryState, long queryStartNanoTime, boolean traceRequest);
+
+        public final Response execute(QueryState queryState, long queryStartNanoTime)
+        {
+            boolean shouldTrace = false;
+            TimeUUID tracingSessionId = null;
+
+            if (isTraceable())
+            {
+                if (isTracingRequested())
+                {
+                    shouldTrace = true;
+                    tracingSessionId = nextTimeUUID();
+                    Tracing.instance.newSession(tracingSessionId, getCustomPayload());
+                }
+                else if (StorageService.instance.shouldTraceProbablistically())
+                {
+                    shouldTrace = true;
+                    Tracing.instance.newSession(getCustomPayload());
+                }
+            }
+
+            Response response;
+            try
+            {
+                response = execute(queryState, queryStartNanoTime, shouldTrace);
+            }
+            finally
+            {
+                if (shouldTrace)
+                    Tracing.instance.stopSession();
+            }
+
+            if (isTraceable() && isTracingRequested())
+                response.setTracingId(tracingSessionId);
+
+            return response;
+        }
+
+        void setTracingRequested()
+        {
+            tracingRequested = true;
+        }
+
+        boolean isTracingRequested()
         {
             return tracingRequested;
         }
@@ -225,7 +280,7 @@ public abstract class Message
 
     public static abstract class Response extends Message
     {
-        protected UUID tracingId;
+        protected TimeUUID tracingId;
         protected List<String> warnings;
 
         protected Response(Type type)
@@ -236,13 +291,13 @@ public abstract class Message
                 throw new IllegalArgumentException();
         }
 
-        public Message setTracingId(UUID tracingId)
+        Message setTracingId(TimeUUID tracingId)
         {
             this.tracingId = tracingId;
             return this;
         }
 
-        public UUID getTracingId()
+        TimeUUID getTracingId()
         {
             return tracingId;
         }
@@ -259,442 +314,180 @@ public abstract class Message
         }
     }
 
-    @ChannelHandler.Sharable
-    public static class ProtocolDecoder extends MessageToMessageDecoder<Frame>
+    public Envelope encode(ProtocolVersion version)
     {
-        public void decode(ChannelHandlerContext ctx, Frame frame, List results)
+        EnumSet<Envelope.Header.Flag> flags = EnumSet.noneOf(Envelope.Header.Flag.class);
+        @SuppressWarnings("unchecked")
+        Codec<Message> codec = (Codec<Message>)this.type.codec;
+        try
         {
-            boolean isRequest = frame.header.type.direction == Direction.REQUEST;
-            boolean isTracing = frame.header.flags.contains(Frame.Header.Flag.TRACING);
-            boolean isCustomPayload = frame.header.flags.contains(Frame.Header.Flag.CUSTOM_PAYLOAD);
-            boolean hasWarning = frame.header.flags.contains(Frame.Header.Flag.WARNING);
-
-            UUID tracingId = isRequest || !isTracing ? null : CBUtil.readUUID(frame.body);
-            List<String> warnings = isRequest || !hasWarning ? null : CBUtil.readStringList(frame.body);
-            Map<String, ByteBuffer> customPayload = !isCustomPayload ? null : CBUtil.readBytesMap(frame.body);
-
-            try
+            int messageSize = codec.encodedSize(this, version);
+            ByteBuf body;
+            if (this instanceof Response)
             {
-                if (isCustomPayload && frame.header.version.isSmallerThan(ProtocolVersion.V4))
-                    throw new ProtocolException("Received frame with CUSTOM_PAYLOAD flag for native protocol version < 4");
-
-                Message message = frame.header.type.codec.decode(frame.body, frame.header.version);
-                message.setStreamId(frame.header.streamId);
-                message.setSourceFrame(frame);
-                message.setCustomPayload(customPayload);
-
-                if (isRequest)
+                Response message = (Response)this;
+                TimeUUID tracingId = message.getTracingId();
+                Map<String, ByteBuffer> customPayload = message.getCustomPayload();
+                if (tracingId != null)
+                    messageSize += TimeUUID.sizeInBytes();
+                List<String> warnings = message.getWarnings();
+                if (warnings != null)
                 {
-                    assert message instanceof Request;
-                    Request req = (Request)message;
-                    Connection connection = ctx.channel().attr(Connection.attributeKey).get();
-                    req.attach(connection);
-                    if (isTracing)
-                        req.setTracingRequested();
-                }
-                else
-                {
-                    assert message instanceof Response;
-                    if (isTracing)
-                        ((Response)message).setTracingId(tracingId);
-                    if (hasWarning)
-                        ((Response)message).setWarnings(warnings);
-                }
-
-                results.add(message);
-            }
-            catch (Throwable ex)
-            {
-                frame.release();
-                // Remember the streamId
-                throw ErrorMessage.wrap(ex, frame.header.streamId);
-            }
-        }
-    }
-
-    @ChannelHandler.Sharable
-    public static class ProtocolEncoder extends MessageToMessageEncoder<Message>
-    {
-        public void encode(ChannelHandlerContext ctx, Message message, List results)
-        {
-            Connection connection = ctx.channel().attr(Connection.attributeKey).get();
-            // The only case the connection can be null is when we send the initial STARTUP message (client side thus)
-            ProtocolVersion version = connection == null ? ProtocolVersion.CURRENT : connection.getVersion();
-            EnumSet<Frame.Header.Flag> flags = EnumSet.noneOf(Frame.Header.Flag.class);
-
-            Codec<Message> codec = (Codec<Message>)message.type.codec;
-            try
-            {
-                int messageSize = codec.encodedSize(message, version);
-                ByteBuf body;
-                if (message instanceof Response)
-                {
-                    UUID tracingId = ((Response)message).getTracingId();
-                    Map<String, ByteBuffer> customPayload = message.getCustomPayload();
-                    if (tracingId != null)
-                        messageSize += CBUtil.sizeOfUUID(tracingId);
-                    List<String> warnings = ((Response)message).getWarnings();
-                    if (warnings != null)
+                    // if cassandra populates warnings for <= v3 protocol, this is a bug
+                    if (version.isSmallerThan(ProtocolVersion.V4))
                     {
-                        if (version.isSmallerThan(ProtocolVersion.V4))
-                            throw new ProtocolException("Must not send frame with WARNING flag for native protocol version < 4");
+                        logger.warn("Warnings present in message with version less than v4 (it is {}); warnings={}", version, warnings);
+                        warnings = null;
+                    }
+                    else
+                    {
                         messageSize += CBUtil.sizeOfStringList(warnings);
                     }
-                    if (customPayload != null)
-                    {
-                        if (version.isSmallerThan(ProtocolVersion.V4))
-                            throw new ProtocolException("Must not send frame with CUSTOM_PAYLOAD flag for native protocol version < 4");
-                        messageSize += CBUtil.sizeOfBytesMap(customPayload);
-                    }
-                    body = CBUtil.allocator.buffer(messageSize);
-                    if (tracingId != null)
-                    {
-                        CBUtil.writeUUID(tracingId, body);
-                        flags.add(Frame.Header.Flag.TRACING);
-                    }
-                    if (warnings != null)
-                    {
-                        CBUtil.writeStringList(warnings, body);
-                        flags.add(Frame.Header.Flag.WARNING);
-                    }
-                    if (customPayload != null)
-                    {
-                        CBUtil.writeBytesMap(customPayload, body);
-                        flags.add(Frame.Header.Flag.CUSTOM_PAYLOAD);
-                    }
                 }
-                else
+                if (customPayload != null)
                 {
-                    assert message instanceof Request;
-                    if (((Request)message).isTracingRequested())
-                        flags.add(Frame.Header.Flag.TRACING);
-                    Map<String, ByteBuffer> payload = message.getCustomPayload();
-                    if (payload != null)
-                        messageSize += CBUtil.sizeOfBytesMap(payload);
-                    body = CBUtil.allocator.buffer(messageSize);
-                    if (payload != null)
-                    {
-                        CBUtil.writeBytesMap(payload, body);
-                        flags.add(Frame.Header.Flag.CUSTOM_PAYLOAD);
-                    }
+                    if (version.isSmallerThan(ProtocolVersion.V4))
+                        throw new ProtocolException("Must not send frame with CUSTOM_PAYLOAD flag for native protocol version < 4");
+                    messageSize += CBUtil.sizeOfBytesMap(customPayload);
                 }
-
-                try
+                body = CBUtil.allocator.buffer(messageSize);
+                if (tracingId != null)
                 {
-                    codec.encode(message, body, version);
+                    CBUtil.writeUUID(tracingId, body);
+                    flags.add(Envelope.Header.Flag.TRACING);
                 }
-                catch (Throwable e)
+                if (warnings != null)
                 {
-                    body.release();
-                    throw e;
+                    CBUtil.writeStringList(warnings, body);
+                    flags.add(Envelope.Header.Flag.WARNING);
                 }
-
-                // if the driver attempted to connect with a protocol version lower than the minimum supported
-                // version, respond with a protocol error message with the correct frame header for that version
-                ProtocolVersion responseVersion = message.forcedProtocolVersion == null
-                                    ? version
-                                    : message.forcedProtocolVersion;
-
-                if (responseVersion.isBeta())
-                    flags.add(Frame.Header.Flag.USE_BETA);
-
-                results.add(Frame.create(message.type, message.getStreamId(), responseVersion, flags, body));
-            }
-            catch (Throwable e)
-            {
-                throw ErrorMessage.wrap(e, message.getStreamId());
-            }
-        }
-    }
-
-    @ChannelHandler.Sharable
-    public static class Dispatcher extends SimpleChannelInboundHandler<Request>
-    {
-        private static class FlushItem
-        {
-            final ChannelHandlerContext ctx;
-            final Object response;
-            final Frame sourceFrame;
-            private FlushItem(ChannelHandlerContext ctx, Object response, Frame sourceFrame)
-            {
-                this.ctx = ctx;
-                this.sourceFrame = sourceFrame;
-                this.response = response;
-            }
-        }
-
-        private static abstract class Flusher implements Runnable
-        {
-            final EventLoop eventLoop;
-            final ConcurrentLinkedQueue<FlushItem> queued = new ConcurrentLinkedQueue<>();
-            final AtomicBoolean scheduled = new AtomicBoolean(false);
-            final HashSet<ChannelHandlerContext> channels = new HashSet<>();
-            final List<FlushItem> flushed = new ArrayList<>();
-
-            void start()
-            {
-                if (!scheduled.get() && scheduled.compareAndSet(false, true))
+                if (customPayload != null)
                 {
-                    this.eventLoop.execute(this);
-                }
-            }
-
-            public Flusher(EventLoop eventLoop)
-            {
-                this.eventLoop = eventLoop;
-            }
-        }
-
-        private static final class LegacyFlusher extends Flusher
-        {
-            int runsSinceFlush = 0;
-            int runsWithNoWork = 0;
-
-            private LegacyFlusher(EventLoop eventLoop)
-            {
-                super(eventLoop);
-            }
-
-            public void run()
-            {
-
-                boolean doneWork = false;
-                FlushItem flush;
-                while ( null != (flush = queued.poll()) )
-                {
-                    channels.add(flush.ctx);
-                    flush.ctx.write(flush.response, flush.ctx.voidPromise());
-                    flushed.add(flush);
-                    doneWork = true;
-                }
-
-                runsSinceFlush++;
-
-                if (!doneWork || runsSinceFlush > 2 || flushed.size() > 50)
-                {
-                    for (ChannelHandlerContext channel : channels)
-                        channel.flush();
-                    for (FlushItem item : flushed)
-                        item.sourceFrame.release();
-
-                    channels.clear();
-                    flushed.clear();
-                    runsSinceFlush = 0;
-                }
-
-                if (doneWork)
-                {
-                    runsWithNoWork = 0;
-                }
-                else
-                {
-                    // either reschedule or cancel
-                    if (++runsWithNoWork > 5)
-                    {
-                        scheduled.set(false);
-                        if (queued.isEmpty() || !scheduled.compareAndSet(false, true))
-                            return;
-                    }
-                }
-
-                eventLoop.schedule(this, 10000, TimeUnit.NANOSECONDS);
-            }
-        }
-
-        private static final class ImmediateFlusher extends Flusher
-        {
-            private ImmediateFlusher(EventLoop eventLoop)
-            {
-                super(eventLoop);
-            }
-
-            public void run()
-            {
-                boolean doneWork = false;
-                FlushItem flush;
-                scheduled.set(false);
-
-                while (null != (flush = queued.poll()))
-                {
-                    channels.add(flush.ctx);
-                    flush.ctx.write(flush.response, flush.ctx.voidPromise());
-                    flushed.add(flush);
-                    doneWork = true;
-                }
-
-                if (doneWork)
-                {
-                    for (ChannelHandlerContext channel : channels)
-                        channel.flush();
-                    for (FlushItem item : flushed)
-                        item.sourceFrame.release();
-
-                    channels.clear();
-                    flushed.clear();
-                }
-            }
-        }
-
-        private static final ConcurrentMap<EventLoop, Flusher> flusherLookup = new ConcurrentHashMap<>();
-
-        private final boolean useLegacyFlusher;
-
-        public Dispatcher(boolean useLegacyFlusher)
-        {
-            super(false);
-            this.useLegacyFlusher = useLegacyFlusher;
-        }
-
-        @Override
-        public void channelRead0(ChannelHandlerContext ctx, Request request)
-        {
-
-            final Response response;
-            final ServerConnection connection;
-            long queryStartNanoTime = System.nanoTime();
-
-            try
-            {
-                assert request.connection() instanceof ServerConnection;
-                connection = (ServerConnection)request.connection();
-                if (connection.getVersion().isGreaterOrEqualTo(ProtocolVersion.V4))
-                    ClientWarn.instance.captureWarnings();
-
-                QueryState qstate = connection.validateNewMessage(request.type, connection.getVersion(), request.getStreamId());
-
-                logger.trace("Received: {}, v={}", request, connection.getVersion());
-                response = request.execute(qstate, queryStartNanoTime);
-                response.setStreamId(request.getStreamId());
-                response.setWarnings(ClientWarn.instance.getWarnings());
-                response.attach(connection);
-                connection.applyStateTransition(request.type, response.type);
-            }
-            catch (Throwable t)
-            {
-                JVMStabilityInspector.inspectThrowable(t);
-                UnexpectedChannelExceptionHandler handler = new UnexpectedChannelExceptionHandler(ctx.channel(), true);
-                flush(new FlushItem(ctx, ErrorMessage.fromException(t, handler).setStreamId(request.getStreamId()), request.getSourceFrame()));
-                return;
-            }
-            finally
-            {
-                ClientWarn.instance.resetWarnings();
-            }
-
-            logger.trace("Responding: {}, v={}", response, connection.getVersion());
-            flush(new FlushItem(ctx, response, request.getSourceFrame()));
-        }
-
-        private void flush(FlushItem item)
-        {
-            EventLoop loop = item.ctx.channel().eventLoop();
-            Flusher flusher = flusherLookup.get(loop);
-            if (flusher == null)
-            {
-                Flusher created = useLegacyFlusher ? new LegacyFlusher(loop) : new ImmediateFlusher(loop);
-                Flusher alt = flusherLookup.putIfAbsent(loop, flusher = created);
-                if (alt != null)
-                    flusher = alt;
-            }
-
-            flusher.queued.add(item);
-            flusher.start();
-        }
-    }
-
-    @ChannelHandler.Sharable
-    public static final class ExceptionHandler extends ChannelInboundHandlerAdapter
-    {
-
-        @Override
-        public void exceptionCaught(final ChannelHandlerContext ctx, Throwable cause)
-        {
-            // Provide error message to client in case channel is still open
-            UnexpectedChannelExceptionHandler handler = new UnexpectedChannelExceptionHandler(ctx.channel(), false);
-            ErrorMessage errorMessage = ErrorMessage.fromException(cause, handler);
-            if (ctx.channel().isOpen())
-            {
-                ChannelFuture future = ctx.writeAndFlush(errorMessage);
-                // On protocol exception, close the channel as soon as the message have been sent
-                if (cause instanceof ProtocolException)
-                {
-                    future.addListener(new ChannelFutureListener()
-                    {
-                        public void operationComplete(ChannelFuture future)
-                        {
-                            ctx.close();
-                        }
-                    });
-                }
-            }
-        }
-    }
-
-    /**
-     * Include the channel info in the logged information for unexpected errors, and (if {@link #alwaysLogAtError} is
-     * false then choose the log level based on the type of exception (some are clearly client issues and shouldn't be
-     * logged at server ERROR level)
-     */
-    static final class UnexpectedChannelExceptionHandler implements Predicate<Throwable>
-    {
-        private final Channel channel;
-        private final boolean alwaysLogAtError;
-
-        UnexpectedChannelExceptionHandler(Channel channel, boolean alwaysLogAtError)
-        {
-            this.channel = channel;
-            this.alwaysLogAtError = alwaysLogAtError;
-        }
-
-        @Override
-        public boolean apply(Throwable exception)
-        {
-            String message;
-            try
-            {
-                message = "Unexpected exception during request; channel = " + channel;
-            }
-            catch (Exception ignore)
-            {
-                // We don't want to make things worse if String.valueOf() throws an exception
-                message = "Unexpected exception during request; channel = <unprintable>";
-            }
-
-            if (!alwaysLogAtError && exception instanceof IOException)
-            {
-                String errorMessage = exception.getMessage();
-                boolean logAtTrace = false;
-
-                for (String ioException : ioExceptionsAtDebugLevel)
-                {
-                    // exceptions thrown from the netty epoll transport add the name of the function that failed
-                    // to the exception string (which is simply wrapping a JDK exception), so we can't do a simple/naive comparison
-                    if (errorMessage.contains(ioException))
-                    {
-                        logAtTrace = true;
-                        break;
-                    }
-                }
-
-                if (logAtTrace)
-                {
-                    // Likely unclean client disconnects
-                    logger.trace(message, exception);
-                }
-                else
-                {
-                    // Generally unhandled IO exceptions are network issues, not actual ERRORS
-                    logger.info(message, exception);
+                    CBUtil.writeBytesMap(customPayload, body);
+                    flags.add(Envelope.Header.Flag.CUSTOM_PAYLOAD);
                 }
             }
             else
             {
-                // Anything else is probably a bug in server of client binary protocol handling
-                logger.error(message, exception);
+                assert this instanceof Request;
+                if (((Request)this).isTracingRequested())
+                    flags.add(Envelope.Header.Flag.TRACING);
+                Map<String, ByteBuffer> payload = getCustomPayload();
+                if (payload != null)
+                    messageSize += CBUtil.sizeOfBytesMap(payload);
+                body = CBUtil.allocator.buffer(messageSize);
+                if (payload != null)
+                {
+                    CBUtil.writeBytesMap(payload, body);
+                    flags.add(Envelope.Header.Flag.CUSTOM_PAYLOAD);
+                }
             }
 
-            // We handled the exception.
-            return true;
+            try
+            {
+                codec.encode(this, body, version);
+            }
+            catch (Throwable e)
+            {
+                body.release();
+                throw e;
+            }
+
+            // if the driver attempted to connect with a protocol version lower than the minimum supported
+            // version, respond with a protocol error message with the correct message header for that version
+            ProtocolVersion responseVersion = forcedProtocolVersion == null
+                                              ? version
+                                              : forcedProtocolVersion;
+
+            if (responseVersion.isBeta())
+                flags.add(Envelope.Header.Flag.USE_BETA);
+
+            return Envelope.create(type, getStreamId(), responseVersion, flags, body);
         }
+        catch (Throwable e)
+        {
+            throw ErrorMessage.wrap(e, getStreamId());
+        }
+    }
+
+    abstract static class Decoder<M extends Message>
+    {
+        static Message decodeMessage(Channel channel, Envelope inbound)
+        {
+            boolean isRequest = inbound.header.type.direction == Direction.REQUEST;
+            boolean isTracing = inbound.header.flags.contains(Envelope.Header.Flag.TRACING);
+            boolean isCustomPayload = inbound.header.flags.contains(Envelope.Header.Flag.CUSTOM_PAYLOAD);
+            boolean hasWarning = inbound.header.flags.contains(Envelope.Header.Flag.WARNING);
+
+            TimeUUID tracingId = isRequest || !isTracing ? null : CBUtil.readTimeUUID(inbound.body);
+            List<String> warnings = isRequest || !hasWarning ? null : CBUtil.readStringList(inbound.body);
+            Map<String, ByteBuffer> customPayload = !isCustomPayload ? null : CBUtil.readBytesMap(inbound.body);
+
+            if (isCustomPayload && inbound.header.version.isSmallerThan(ProtocolVersion.V4))
+                throw new ProtocolException("Received frame with CUSTOM_PAYLOAD flag for native protocol version < 4");
+
+            Message message = inbound.header.type.codec.decode(inbound.body, inbound.header.version);
+            message.setStreamId(inbound.header.streamId);
+            message.setSource(inbound);
+            message.setCustomPayload(customPayload);
+
+            if (isRequest)
+            {
+                assert message instanceof Request;
+                Request req = (Request) message;
+                Connection connection = channel.attr(Connection.attributeKey).get();
+                req.attach(connection);
+                if (isTracing)
+                    req.setTracingRequested();
+            }
+            else
+            {
+                assert message instanceof Response;
+                if (isTracing)
+                    ((Response) message).setTracingId(tracingId);
+                if (hasWarning)
+                    ((Response) message).setWarnings(warnings);
+            }
+            return message;
+        }
+
+        abstract M decode(Channel channel, Envelope inbound);
+
+        private static class RequestDecoder extends Decoder<Request>
+        {
+            Request decode(Channel channel, Envelope request)
+            {
+                if (request.header.type.direction != Direction.REQUEST)
+                    throw new ProtocolException(String.format("Unexpected RESPONSE message %s, expecting REQUEST",
+                                                              request.header.type));
+
+                return (Request) decodeMessage(channel, request);
+            }
+        }
+
+        private static class ResponseDecoder extends Decoder<Response>
+        {
+            Response decode(Channel channel, Envelope response)
+            {
+                if (response.header.type.direction != Direction.RESPONSE)
+                    throw new ProtocolException(String.format("Unexpected REQUEST message %s, expecting RESPONSE",
+                                                              response.header.type));
+
+                return (Response) decodeMessage(channel, response);
+            }
+        }
+    }
+
+    private static final Decoder.RequestDecoder REQUEST_DECODER = new Decoder.RequestDecoder();
+    private static final Decoder.ResponseDecoder RESPONSE_DECODER = new Decoder.ResponseDecoder();
+
+    static Decoder<Message.Request> requestDecoder()
+    {
+        return REQUEST_DECODER;
+    }
+
+    static Decoder<Message.Response> responseDecoder()
+    {
+        return RESPONSE_DECODER;
     }
 }

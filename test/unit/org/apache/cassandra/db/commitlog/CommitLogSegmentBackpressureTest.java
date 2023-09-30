@@ -66,12 +66,12 @@ public class CommitLogSegmentBackpressureTest
     @Test
     @BMRules(rules = {@BMRule(name = "Acquire Semaphore before sync",
                               targetClass = "AbstractCommitLogService$SyncRunnable",
-                              targetMethod = "sync",
+                              targetMethod = "run",
                               targetLocation = "AT INVOKE org.apache.cassandra.db.commitlog.CommitLog.sync(boolean)",
                               action = "org.apache.cassandra.db.commitlog.CommitLogSegmentBackpressureTest.allowSync.acquire()"),
                       @BMRule(name = "Release Semaphore after sync",
                               targetClass = "AbstractCommitLogService$SyncRunnable",
-                              targetMethod = "sync",
+                              targetMethod = "run",
                               targetLocation = "AFTER INVOKE org.apache.cassandra.db.commitlog.CommitLog.sync(boolean)",
                               action = "org.apache.cassandra.db.commitlog.CommitLogSegmentBackpressureTest.allowSync.release()")})
     public void testCompressedCommitLogBackpressure() throws Throwable
@@ -95,7 +95,7 @@ public class CommitLogSegmentBackpressureTest
 
         ColumnFamilyStore cfs1 = Keyspace.open(KEYSPACE1).getColumnFamilyStore(STANDARD1);
 
-        final Mutation m = new RowUpdateBuilder(cfs1.metadata, 0, "k").clustering("bytes")
+        final Mutation m = new RowUpdateBuilder(cfs1.metadata(), 0, "k").clustering("bytes")
                                                                       .add("val", ByteBuffer.wrap(entropy))
                                                                       .build();
 

@@ -21,20 +21,19 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.Comparator;
 
-import com.google.common.annotations.VisibleForTesting;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.config.ColumnDefinition;
-import org.apache.cassandra.cql3.Attributes;
-import org.apache.cassandra.config.*;
-import org.apache.cassandra.db.*;
-import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.DeletionPurger;
+import org.apache.cassandra.db.LivenessInfo;
+import org.apache.cassandra.db.SerializationHeader;
+import org.apache.cassandra.db.marshal.ValueAccessor;
 import org.apache.cassandra.io.util.DataInputPlus;
-import org.apache.cassandra.utils.ByteBufferUtil;
-import org.apache.cassandra.utils.memory.AbstractAllocator;
 import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.schema.ColumnMetadata;
+import org.apache.cassandra.utils.CassandraUInt;
+import org.apache.cassandra.utils.memory.ByteBufferCloner;
+import org.apache.cassandra.utils.memory.Cloner;
 
 /**
  * A cell is our atomic unit for a single value of a single column.
@@ -45,13 +44,20 @@ import org.apache.cassandra.service.StorageService;
  *   2) expiring cells: on top of regular cells, those have a ttl and a local deletion time (when they are expired).
  *   3) tombstone cells: those won't have value, but they have a local deletion time (when the tombstone was created).
  */
-public abstract class Cell extends ColumnData
+public abstract class Cell<V> extends ColumnData
 {
     public static final int NO_TTL = 0;
-    public static final int NO_DELETION_TIME = Integer.MAX_VALUE;
-    public static final int MAX_DELETION_TIME = Integer.MAX_VALUE - 1;
+    public static final long NO_DELETION_TIME = Long.MAX_VALUE;
+    public static final int NO_DELETION_TIME_UNSIGNED_INTEGER = CassandraUInt.MAX_VALUE_UINT;
+    public static final long MAX_DELETION_TIME = CassandraUInt.MAX_VALUE_LONG - 2;
+    public static final int MAX_DELETION_TIME_UNSIGNED_INTEGER = CassandraUInt.fromLong(MAX_DELETION_TIME);
 
-    public final static Comparator<Cell> comparator = (c1, c2) ->
+    // Since C14227 we only support Uints, negative ldts (corruption, overflow) get converted to this
+    public static final long INVALID_DELETION_TIME = CassandraUInt.MAX_VALUE_LONG - 1;
+    // Do not use. Only for legacy ser/deser pre CASSANDRA-14227 and backwards compatible CAP policies
+    public static final int MAX_DELETION_TIME_2038_LEGACY_CAP = Integer.MAX_VALUE - 1;
+
+    public final static Comparator<Cell<?>> comparator = (c1, c2) ->
     {
         int cmp = c1.column().compareTo(c2.column());
         if (cmp != 0)
@@ -63,24 +69,57 @@ public abstract class Cell extends ColumnData
 
     public static final Serializer serializer = new BufferCell.Serializer();
 
-    protected Cell(ColumnDefinition column)
+    public interface Factory<V>
+    {
+        Cell<V> create(ColumnMetadata column, long timestamp, int ttl, long localDeletionTime, V value, CellPath path);
+    }
+
+    protected Cell(ColumnMetadata column)
     {
         super(column);
     }
 
+    public static int deletionTimeLongToUnsignedInteger(long deletionTime)
+    {
+        return deletionTime == NO_DELETION_TIME ? NO_DELETION_TIME_UNSIGNED_INTEGER : CassandraUInt.fromLong(deletionTime);
+    }
+
+    public static long deletionTimeUnsignedIntegerToLong(int deletionTimeUnsignedInteger)
+    {
+        return deletionTimeUnsignedInteger == NO_DELETION_TIME_UNSIGNED_INTEGER ? NO_DELETION_TIME : CassandraUInt.toLong(deletionTimeUnsignedInteger);
+    }
+
+    public static long getVersionedMaxDeletiontionTime()
+    {
+        if (DatabaseDescriptor.getStorageCompatibilityMode().disabled())
+            // The whole cluster is 2016, we're out of the 2038/2106 mixed cluster scenario. Shortcut to avoid the 'minClusterVersion' volatile read
+            return Cell.MAX_DELETION_TIME;
+        else
+            return MessagingService.instance().versions.minClusterVersion >= MessagingService.VERSION_50
+                   ? Cell.MAX_DELETION_TIME
+                   : Cell.MAX_DELETION_TIME_2038_LEGACY_CAP;
+    }
+
     /**
-     * Whether the cell is a counter cell or not.
+     * Whether the cell is a counter cell or not.CassandraUInt
      *
      * @return whether the cell is a counter cell or not.
      */
     public abstract boolean isCounterCell();
 
-    /**
-     * The cell value.
-     *
-     * @return the cell value.
-     */
-    public abstract ByteBuffer value();
+    public abstract V value();
+
+    public abstract ValueAccessor<V> accessor();
+
+    public int valueSize()
+    {
+        return accessor().size(value());
+    }
+
+    public ByteBuffer buffer()
+    {
+        return accessor().toBuffer(value());
+    }
 
     /**
      * The cell timestamp.
@@ -102,7 +141,10 @@ public abstract class Cell extends ColumnData
      * @return the cell local deletion time, or {@code NO_DELETION_TIME} if the cell is neither
      * a tombstone nor an expiring one.
      */
-    public abstract int localDeletionTime();
+    public long localDeletionTime()
+    {
+        return deletionTimeUnsignedIntegerToLong(localDeletionTimeAsUnsignedInt());
+    }
 
     /**
      * Whether the cell is a tombstone or not.
@@ -129,7 +171,7 @@ public abstract class Cell extends ColumnData
      * decide if an expiring cell is expired or live.
      * @return whether the cell is live or not at {@code nowInSec}.
      */
-    public abstract boolean isLive(int nowInSec);
+    public abstract boolean isLive(long nowInSec);
 
     /**
      * For cells belonging to complex types (non-frozen collection and UDT), the
@@ -139,21 +181,63 @@ public abstract class Cell extends ColumnData
      */
     public abstract CellPath path();
 
-    public abstract Cell withUpdatedColumn(ColumnDefinition newColumn);
+    public abstract Cell<?> withUpdatedColumn(ColumnMetadata newColumn);
 
-    public abstract Cell withUpdatedValue(ByteBuffer newValue);
+    public abstract Cell<?> withUpdatedValue(ByteBuffer newValue);
 
-    public abstract Cell withUpdatedTimestampAndLocalDeletionTime(long newTimestamp, int newLocalDeletionTime);
+    public abstract Cell<?> withUpdatedTimestampAndLocalDeletionTime(long newTimestamp, long newLocalDeletionTime);
 
-    public abstract Cell copy(AbstractAllocator allocator);
+    /**
+     * Used to apply the same optimization as in {@link Cell.Serializer#deserialize} when
+     * the column is not queried but eventhough it's used for digest calculation.
+     * @return a cell with an empty buffer as value
+     */
+    public abstract Cell<?> withSkippedValue();
+
+    @Override
+    public final Cell<?> clone(Cloner cloner)
+    {
+        return cloner.clone(this);
+    }
+
+    public abstract Cell<?> clone(ByteBufferCloner cloner);
 
     @Override
     // Overrides super type to provide a more precise return type.
-    public abstract Cell markCounterLocalToBeCleared();
+    public abstract Cell<?> markCounterLocalToBeCleared();
 
     @Override
     // Overrides super type to provide a more precise return type.
-    public abstract Cell purge(DeletionPurger purger, int nowInSec);
+    public abstract Cell<?> purge(DeletionPurger purger, long nowInSec);
+
+    @Override
+    // Overrides super type to provide a more precise return type.
+    public abstract Cell<?> purgeDataOlderThan(long timestamp);
+    
+    protected abstract int localDeletionTimeAsUnsignedInt();
+
+    /**
+     * Handle unsigned encoding and potentially invalid localDeletionTime.
+     */
+    public static long decodeLocalDeletionTime(long localDeletionTime, int ttl, DeserializationHelper helper)
+    {
+        if (localDeletionTime >= ttl)
+            return localDeletionTime;   // fast path, positive and valid signed 32-bit integer
+
+        if (localDeletionTime < 0)
+        {
+            // Overflown signed int, decode to long. The result is guaranteed > ttl (and any signed int)
+            return helper.version < MessagingService.VERSION_50
+                   ? INVALID_DELETION_TIME
+                   : deletionTimeUnsignedIntegerToLong((int) localDeletionTime);
+        }
+
+        if (ttl == LivenessInfo.EXPIRED_LIVENESS_TTL)
+            return localDeletionTime;   // ttl is already expired, localDeletionTime is valid
+        else
+            return INVALID_DELETION_TIME;  // Invalid as it can't occur without corruption and would cause negative
+                                           // timestamp on expiry.
+    }
 
     /**
      * The serialization format for cell is:
@@ -182,10 +266,10 @@ public abstract class Cell extends ColumnData
         private final static int USE_ROW_TIMESTAMP_MASK      = 0x08; // Wether the cell has the same timestamp than the row this is a cell of.
         private final static int USE_ROW_TTL_MASK            = 0x10; // Wether the cell has the same ttl than the row this is a cell of.
 
-        public void serialize(Cell cell, ColumnDefinition column, DataOutputPlus out, LivenessInfo rowLiveness, SerializationHeader header) throws IOException
+        public <T> void serialize(Cell<T> cell, ColumnMetadata column, DataOutputPlus out, LivenessInfo rowLiveness, SerializationHeader header) throws IOException
         {
             assert cell != null;
-            boolean hasValue = cell.value().hasRemaining();
+            boolean hasValue = cell.valueSize() > 0;
             boolean isDeleted = cell.isTombstone();
             boolean isExpiring = cell.isExpiring();
             boolean useRowTimestamp = !rowLiveness.isEmpty() && cell.timestamp() == rowLiveness.timestamp();
@@ -218,10 +302,10 @@ public abstract class Cell extends ColumnData
                 column.cellPathSerializer().serialize(cell.path(), out);
 
             if (hasValue)
-                header.getType(column).writeValue(cell.value(), out);
+                header.getType(column).writeValue(cell.value(), cell.accessor(), out);
         }
 
-        public Cell deserialize(DataInputPlus in, LivenessInfo rowLiveness, ColumnDefinition column, SerializationHeader header, SerializationHelper helper) throws IOException
+        public <V> Cell<V> deserialize(DataInputPlus in, LivenessInfo rowLiveness, ColumnMetadata column, SerializationHeader header, DeserializationHelper helper, ValueAccessor<V> accessor) throws IOException
         {
             int flags = in.readUnsignedByte();
             StorageService.instance.totalReadBytes+=1;////
@@ -233,7 +317,8 @@ public abstract class Cell extends ColumnData
 
             long timestamp = useRowTimestamp ? rowLiveness.timestamp() : header.readTimestamp(in);
             StorageService.instance.totalReadBytes+=8;////
-            int localDeletionTime = useRowTTL
+
+            long localDeletionTime = useRowTTL
                                     ? rowLiveness.localExpirationTime()
                                     : (isDeleted || isExpiring ? header.readLocalDeletionTime(in) : NO_DELETION_TIME);
 
@@ -243,7 +328,7 @@ public abstract class Cell extends ColumnData
                             ? column.cellPathSerializer().deserialize(in)
                             : null;
 
-            ByteBuffer value = ByteBufferUtil.EMPTY_BYTE_BUFFER;
+            V value = accessor.empty();
             if (hasValue)
             {
                 if (helper.canSkipValue(column) || (path != null && helper.canSkipValue(path)))
@@ -254,19 +339,23 @@ public abstract class Cell extends ColumnData
                 {
                     boolean isCounter = localDeletionTime == NO_DELETION_TIME && column.type.isCounter();
 
-                    value = header.getType(column).readValue(in, DatabaseDescriptor.getMaxValueSize());
+                    value = header.getType(column).read(accessor, in, DatabaseDescriptor.getMaxValueSize());
                     if (isCounter)
-                        value = helper.maybeClearCounterValue(value);
+                        value = helper.maybeClearCounterValue(value, accessor);
                 }
             }
             StorageService.instance.totalReadBytes+=value.limit();////
-            return new BufferCell(column, timestamp, ttl, localDeletionTime, value, path);
+
+            if (ttl < 0)
+                throw new IOException("Invalid TTL: " + ttl);
+            localDeletionTime = decodeLocalDeletionTime(localDeletionTime, ttl, helper);
+            return accessor.factory().cell(column, timestamp, ttl, localDeletionTime, value, path);
         }
 
-        public long serializedSize(Cell cell, ColumnDefinition column, LivenessInfo rowLiveness, SerializationHeader header)
+        public <T> long serializedSize(Cell<T> cell, ColumnMetadata column, LivenessInfo rowLiveness, SerializationHeader header)
         {
             long size = 1; // flags
-            boolean hasValue = cell.value().hasRemaining();
+            boolean hasValue = cell.valueSize() > 0;
             boolean isDeleted = cell.isTombstone();
             boolean isExpiring = cell.isExpiring();
             boolean useRowTimestamp = !rowLiveness.isEmpty() && cell.timestamp() == rowLiveness.timestamp();
@@ -284,13 +373,13 @@ public abstract class Cell extends ColumnData
                 size += column.cellPathSerializer().serializedSize(cell.path());
 
             if (hasValue)
-                size += header.getType(column).writtenLength(cell.value());
+                size += header.getType(column).writtenLength(cell.value(), cell.accessor());
 
             return size;
         }
 
         // Returns if the skipped cell was an actual cell (i.e. it had its presence flag).
-        public boolean skip(DataInputPlus in, ColumnDefinition column, SerializationHeader header) throws IOException
+        public boolean skip(DataInputPlus in, ColumnMetadata column, SerializationHeader header) throws IOException
         {
             int flags = in.readUnsignedByte();
             boolean hasValue = (flags & HAS_EMPTY_VALUE_MASK) == 0;

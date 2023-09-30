@@ -18,15 +18,26 @@
 */
 package org.apache.cassandra.utils;
 
-import java.io.File;
 import java.io.IOException;
+import java.lang.reflect.InvocationTargetException;
 import java.util.Arrays;
 import java.util.Iterator;
+import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.ExecutionException;
+import java.util.function.Predicate;
 import java.util.stream.Stream;
+import javax.annotation.Nonnull;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Preconditions;
+import com.google.common.collect.Iterables;
 
 import org.apache.cassandra.io.FSReadError;
 import org.apache.cassandra.io.FSWriteError;
+import org.apache.cassandra.io.util.File;
+import org.apache.cassandra.utils.concurrent.UncheckedInterruptedException;
 
 public final class Throwables
 {
@@ -37,10 +48,27 @@ public final class Throwables
         void perform() throws E;
     }
 
+    public static boolean isCausedBy(Throwable t, Predicate<Throwable> cause)
+    {
+        return cause.test(t) || (t.getCause() != null && cause.test(t.getCause()));
+    }
+
+    public static boolean anyCauseMatches(Throwable t, Predicate<Throwable> cause)
+    {
+        do
+        {
+            if (cause.test(t))
+                return true;
+        } while ((t = t.getCause()) != null);
+        return false;
+    }
+
     public static <T extends Throwable> T merge(T existingFail, T newFail)
     {
         if (existingFail == null)
             return newFail;
+        if (newFail == null)
+            return existingFail;
         existingFail.addSuppressed(newFail);
         return existingFail;
     }
@@ -68,6 +96,9 @@ public final class Throwables
         if (fail instanceof RuntimeException)
             throw (RuntimeException) fail;
 
+        if (fail instanceof InterruptedException)
+            throw new UncheckedInterruptedException((InterruptedException) fail);
+
         if (checked != null && checked.isInstance(fail))
             throw checked.cast(fail);
 
@@ -75,9 +106,15 @@ public final class Throwables
     }
 
     @SafeVarargs
+    public static <E extends Exception> void maybeFail(DiscreteAction<? extends E> ... actions)
+    {
+        maybeFail(Throwables.perform(null, Stream.of(actions)));
+    }
+
+    @SafeVarargs
     public static <E extends Exception> void perform(DiscreteAction<? extends E> ... actions) throws E
     {
-        perform(Stream.of(actions));
+        Throwables.<E>perform(Stream.of(actions));
     }
 
     public static <E extends Exception> void perform(Stream<? extends DiscreteAction<? extends E>> stream, DiscreteAction<? extends E> ... extra) throws E
@@ -88,7 +125,7 @@ public final class Throwables
     @SuppressWarnings("unchecked")
     public static <E extends Exception> void perform(Stream<DiscreteAction<? extends E>> actions) throws E
     {
-        Throwable fail = perform((Throwable) null, actions);
+        Throwable fail = perform(null, actions);
         if (failIfCanCast(fail, null))
             throw (E) fail;
     }
@@ -123,7 +160,7 @@ public final class Throwables
     @SafeVarargs
     public static void perform(File against, FileOpType opType, DiscreteAction<? extends IOException> ... actions)
     {
-        perform(against.getPath(), opType, actions);
+        perform(against.path(), opType, actions);
     }
 
     @SafeVarargs
@@ -153,6 +190,59 @@ public final class Throwables
         }));
     }
 
+    /**
+     * @see {@link #closeAndAddSuppressed(Throwable, Iterable)}
+     */
+    public static void closeAndAddSuppressed(@Nonnull Throwable t, AutoCloseable... closeables)
+    {
+        closeAndAddSuppressed(t, Arrays.asList(closeables));
+    }
+
+    /**
+     * Do what {@link #closeAndAddSuppressed(Throwable, Iterable)} does, additionally filtering out all null closables.
+     */
+    public static void closeNonNullAndAddSuppressed(@Nonnull Throwable t, AutoCloseable... closeables)
+    {
+        closeAndAddSuppressed(t, Iterables.filter(Arrays.asList(closeables), Objects::nonNull));
+    }
+
+    /**
+     * Closes all closables in the provided collections and accumulates the possible exceptions thrown when closing.
+     *
+     * @param accumulate non-null exception to accumulate errors thrown when closing the provided resources
+     * @param closeables closeables to be closed
+     */
+    public static void closeAndAddSuppressed(@Nonnull Throwable accumulate, Iterable<AutoCloseable> closeables)
+    {
+        Preconditions.checkNotNull(accumulate);
+        for (AutoCloseable closeable : closeables)
+        {
+            try
+            {
+                closeable.close();
+            }
+            catch (Throwable ex)
+            {
+                accumulate.addSuppressed(ex);
+            }
+        }
+    }
+
+    /**
+     * See {@link #close(Throwable, Iterable)}
+     */
+    public static Throwable close(Throwable accumulate, AutoCloseable ... closeables)
+    {
+        return close(accumulate, Arrays.asList(closeables));
+    }
+
+    /**
+     * Closes all the resources in the provided collections and accumulates the possible exceptions thrown when closing.
+     *
+     * @param accumulate the initial value for the exception accumulator, can be {@code null}
+     * @param closeables closeables to be closed
+     * @return {@code null}, {@param accumulate} or the first exception thrown when closing the provided resources
+     */
     public static Throwable close(Throwable accumulate, Iterable<? extends AutoCloseable> closeables)
     {
         for (AutoCloseable closeable : closeables)
@@ -180,5 +270,67 @@ public final class Throwables
                 return Optional.of((IOException) cause);
         }
         return Optional.empty();
+    }
+
+    /**
+     * If the provided throwable is a "wrapping" exception (see below), return the cause of that throwable, otherwise
+     * return its argument untouched.
+     * <p>
+     * We call a "wrapping" exception in the context of that method an exception whose only purpose is to wrap another
+     * exception, and currently this method recognize only 2 exception as "wrapping" ones: {@link ExecutionException}
+     * and {@link CompletionException}.
+     */
+    public static Throwable unwrapped(Throwable t)
+    {
+        Throwable unwrapped = t;
+        while (unwrapped instanceof CompletionException ||
+               unwrapped instanceof ExecutionException ||
+               unwrapped instanceof InvocationTargetException)
+            unwrapped = unwrapped.getCause();
+
+        // I don't think it make sense for those 2 exception classes to ever be used with null causes, but no point
+        // in failing here if this happen. We still wrap the original exception if that happen so we get a sign
+        // that the assumption of this method is wrong.
+        return unwrapped == null
+               ? new RuntimeException("Got wrapping exception not wrapping anything", t)
+               : unwrapped;
+    }
+
+    /**
+     * If the provided exception is unchecked, return it directly, otherwise wrap it into a {@link RuntimeException}
+     * to make it unchecked.
+     */
+    public static RuntimeException unchecked(Throwable t)
+    {
+        return t instanceof RuntimeException ? (RuntimeException)t :
+               t instanceof InterruptedException
+               ? new UncheckedInterruptedException((InterruptedException) t)
+               : new RuntimeException(t);
+    }
+
+    /**
+     * throw the exception as a unchecked exception, wrapping if a checked exception, else rethroing as is.
+     */
+    public static RuntimeException throwAsUncheckedException(Throwable t)
+    {
+        if (t instanceof Error)
+            throw (Error) t;
+        throw unchecked(t);
+    }
+
+    /**
+     * A shortcut for {@code unchecked(unwrapped(t))}. This is called "cleaned" because this basically removes the annoying
+     * cruft surrounding an exception :).
+     */
+    public static RuntimeException cleaned(Throwable t)
+    {
+        return unchecked(unwrapped(t));
+    }
+
+    @VisibleForTesting
+    public static void assertAnyCause(Throwable err, Class<? extends Throwable> cause)
+    {
+        if (!anyCauseMatches(err, cause::isInstance))
+            throw new AssertionError("The exception is not caused by " + cause.getName(), err);
     }
 }

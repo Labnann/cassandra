@@ -17,6 +17,10 @@
  */
 package org.apache.cassandra.db.compaction;
 
+import static org.apache.cassandra.config.CassandraRelevantProperties.DIAGNOSTIC_SNAPSHOT_INTERVAL_NANOS;
+import static org.apache.cassandra.db.transform.DuplicateRowCheckerTest.assertCommandIssued;
+import static org.apache.cassandra.db.transform.DuplicateRowCheckerTest.makeRow;
+import static org.apache.cassandra.db.transform.DuplicateRowCheckerTest.partition;
 import static org.junit.Assert.*;
 
 import java.util.*;
@@ -29,8 +33,8 @@ import org.junit.Test;
 
 import org.apache.cassandra.SchemaLoader;
 import org.apache.cassandra.Util;
-import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.DeletionTime;
@@ -40,10 +44,16 @@ import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.db.partitions.AbstractUnfilteredPartitionIterator;
 import org.apache.cassandra.db.rows.*;
 import org.apache.cassandra.io.sstable.ISSTableScanner;
-import org.apache.cassandra.io.sstable.metadata.MetadataCollector;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.net.Message;
 import org.apache.cassandra.schema.KeyspaceParams;
+import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.FBUtilities;
 
-public class CompactionIteratorTest
+public class CompactionIteratorTest extends CQLTester
 {
 
     private static final int NOW = 1000;
@@ -52,7 +62,7 @@ public class CompactionIteratorTest
     private static final String CFNAME = "Integer1";
 
     static final DecoratedKey kk;
-    static final CFMetaData metadata;
+    static final TableMetadata metadata;
     private static final int RANGE = 1000;
     private static final int COUNT = 100;
 
@@ -71,7 +81,7 @@ public class CompactionIteratorTest
                                                                          1,
                                                                          UTF8Type.instance,
                                                                          Int32Type.instance,
-                                                                         Int32Type.instance));
+                                                                         Int32Type.instance).build());
     }
 
     // See org.apache.cassandra.db.rows.UnfilteredRowsGenerator.parse for the syntax used in these tests.
@@ -246,7 +256,7 @@ public class CompactionIteratorTest
             int del = Integer.parseInt(m.group(1));
             input = input.substring(m.end());
             List<Unfiltered> list = generator.parse(input, NOW - 1);
-            deletionTimes.put(list, new DeletionTime(del, del));
+            deletionTimes.put(list, DeletionTime.build(del, del));
             return list;
         }
         else
@@ -311,11 +321,72 @@ public class CompactionIteratorTest
         }
     }
 
+    @Test
+    public void transformTest()
+    {
+        UnfilteredRowsGenerator generator = new UnfilteredRowsGenerator(metadata.comparator, false);
+        List<List<Unfiltered>> inputLists = parse(new String[] {"10[100] 11[100] 12[100]"}, generator);
+        List<List<Unfiltered>> tombstoneLists = parse(new String[] {}, generator);
+        List<Iterable<UnfilteredRowIterator>> content = ImmutableList.copyOf(Iterables.transform(inputLists, list -> ImmutableList.of(listToIterator(list, kk))));
+        Map<DecoratedKey, Iterable<UnfilteredRowIterator>> transformedSources = new TreeMap<>();
+        transformedSources.put(kk, Iterables.transform(tombstoneLists, list -> listToIterator(list, kk)));
+        try (CompactionController controller = new Controller(Keyspace.openAndGetStore(metadata), transformedSources, GC_BEFORE);
+             CompactionIterator iter = new CompactionIterator(OperationType.COMPACTION,
+                                                              Lists.transform(content, x -> new Scanner(x)),
+                                                              controller, NOW, null))
+        {
+            assertTrue(iter.hasNext());
+            UnfilteredRowIterator rows = iter.next();
+            assertTrue(rows.hasNext());
+            assertNotNull(rows.next());
+
+            iter.stop();
+            try
+            {
+                // Will call Transformation#applyToRow
+                rows.hasNext();
+                fail("Should have thrown CompactionInterruptedException");
+            }
+            catch (CompactionInterruptedException e)
+            {
+                // ignore
+            }
+        }
+    }
+
+    @Test
+    public void transformPartitionTest()
+    {
+        UnfilteredRowsGenerator generator = new UnfilteredRowsGenerator(metadata.comparator, false);
+        List<List<Unfiltered>> inputLists = parse(new String[] {"10[100] 11[100] 12[100]"}, generator);
+        List<List<Unfiltered>> tombstoneLists = parse(new String[] {}, generator);
+        List<Iterable<UnfilteredRowIterator>> content = ImmutableList.copyOf(Iterables.transform(inputLists, list -> ImmutableList.of(listToIterator(list, kk))));
+        Map<DecoratedKey, Iterable<UnfilteredRowIterator>> transformedSources = new TreeMap<>();
+        transformedSources.put(kk, Iterables.transform(tombstoneLists, list -> listToIterator(list, kk)));
+        try (CompactionController controller = new Controller(Keyspace.openAndGetStore(metadata), transformedSources, GC_BEFORE);
+             CompactionIterator iter = new CompactionIterator(OperationType.COMPACTION,
+                                                              Lists.transform(content, x -> new Scanner(x)),
+                                                              controller, NOW, null))
+        {
+            iter.stop();
+            try
+            {
+                // Will call Transformation#applyToPartition
+                iter.hasNext();
+                fail("Should have thrown CompactionInterruptedException");
+            }
+            catch (CompactionInterruptedException e)
+            {
+                // ignore
+            }
+        }
+    }
+
     class Controller extends CompactionController
     {
         private final Map<DecoratedKey, Iterable<UnfilteredRowIterator>> tombstoneSources;
 
-        public Controller(ColumnFamilyStore cfs, Map<DecoratedKey, Iterable<UnfilteredRowIterator>> tombstoneSources, int gcBefore)
+        public Controller(ColumnFamilyStore cfs, Map<DecoratedKey, Iterable<UnfilteredRowIterator>> tombstoneSources, long gcBefore)
         {
             super(cfs, Collections.emptySet(), gcBefore);
             this.tombstoneSources = tombstoneSources;
@@ -339,13 +410,7 @@ public class CompactionIteratorTest
         }
 
         @Override
-        public boolean isForThrift()
-        {
-            return false;
-        }
-
-        @Override
-        public CFMetaData metadata()
+        public TableMetadata metadata()
         {
             return metadata;
         }
@@ -387,9 +452,62 @@ public class CompactionIteratorTest
         }
 
         @Override
-        public String getBackingFiles()
+        public Set<SSTableReader> getBackingSSTables()
         {
-            return null;
+            return ImmutableSet.of();
+        }
+    }
+
+    @Test
+    public void duplicateRowsTest() throws Throwable
+    {
+        DIAGNOSTIC_SNAPSHOT_INTERVAL_NANOS.setLong(0);
+        // Create a table and insert some data. The actual rows read in the test will be synthetic
+        // but this creates an sstable on disk to be snapshotted.
+        createTable("CREATE TABLE %s (pk text, ck1 int, ck2 int, v int, PRIMARY KEY (pk, ck1, ck2))");
+        for (int i = 0; i < 10; i++)
+            execute("insert into %s (pk, ck1, ck2, v) values (?, ?, ?, ?)", "key", i, i, i);
+        flush();
+
+        DatabaseDescriptor.setSnapshotOnDuplicateRowDetection(true);
+        TableMetadata metadata = getCurrentColumnFamilyStore().metadata();
+
+        final HashMap<InetAddressAndPort, Message<?>> sentMessages = new HashMap<>();
+        MessagingService.instance().outboundSink.add((message, to) -> { sentMessages.put(to, message); return false;});
+
+        // no duplicates
+        sentMessages.clear();
+        iterate(makeRow(metadata,0, 0),
+                makeRow(metadata,0, 1),
+                makeRow(metadata,0, 2));
+        assertCommandIssued(sentMessages, false);
+
+        // now test with a duplicate row and see that we issue a snapshot command
+        sentMessages.clear();
+        iterate(makeRow(metadata, 0, 0),
+                makeRow(metadata, 0, 1),
+                makeRow(metadata, 0, 1));
+        assertCommandIssued(sentMessages, true);
+    }
+
+    private void iterate(Unfiltered...unfiltereds)
+    {
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        DecoratedKey key = cfs.getPartitioner().decorateKey(ByteBufferUtil.bytes("key"));
+        try (CompactionController controller = new CompactionController(cfs, Integer.MAX_VALUE);
+             UnfilteredRowIterator rows = partition(cfs.metadata(), key, false, unfiltereds);
+             ISSTableScanner scanner = new Scanner(Collections.singletonList(rows));
+             CompactionIterator iter = new CompactionIterator(OperationType.COMPACTION,
+                                                              Collections.singletonList(scanner),
+                                                              controller, FBUtilities.nowInSeconds(), null))
+        {
+            while (iter.hasNext())
+            {
+                try (UnfilteredRowIterator partition = iter.next())
+                {
+                    partition.forEachRemaining(u -> {});
+                }
+            }
         }
     }
 }

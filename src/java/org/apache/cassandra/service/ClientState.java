@@ -17,33 +17,49 @@
  */
 package org.apache.cassandra.service;
 
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
 import java.util.Arrays;
 import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.Lists;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.auth.*;
-import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.db.virtual.VirtualSchemaKeyspace;
+import org.apache.cassandra.exceptions.RequestExecutionException;
+import org.apache.cassandra.exceptions.RequestValidationException;
+import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.schema.TableMetadataRef;
 import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.config.Schema;
-import org.apache.cassandra.config.SchemaConstants;
+import org.apache.cassandra.schema.Schema;
+import org.apache.cassandra.schema.SchemaConstants;
+import org.apache.cassandra.schema.SchemaKeyspaceTables;
 import org.apache.cassandra.cql3.QueryHandler;
 import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.cql3.functions.Function;
 import org.apache.cassandra.db.SystemKeyspace;
+import org.apache.cassandra.dht.Datacenters;
 import org.apache.cassandra.exceptions.AuthenticationException;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.exceptions.UnauthorizedException;
-import org.apache.cassandra.schema.SchemaKeyspace;
-import org.apache.cassandra.thrift.ThriftValidation;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.JVMStabilityInspector;
-import org.apache.cassandra.utils.CassandraVersion;
+import org.apache.cassandra.utils.MD5Digest;
+
+import static org.apache.cassandra.config.CassandraRelevantProperties.CUSTOM_QUERY_HANDLER_CLASS;
+import static org.apache.cassandra.utils.Clock.Global.currentTimeMillis;
 
 /**
  * State related to a client connection.
@@ -51,19 +67,22 @@ import org.apache.cassandra.utils.CassandraVersion;
 public class ClientState
 {
     private static final Logger logger = LoggerFactory.getLogger(ClientState.class);
-    public static final CassandraVersion DEFAULT_CQL_VERSION = org.apache.cassandra.cql3.QueryProcessor.CQL_VERSION;
 
     private static final Set<IResource> READABLE_SYSTEM_RESOURCES = new HashSet<>();
     private static final Set<IResource> PROTECTED_AUTH_RESOURCES = new HashSet<>();
-    private static final Set<IResource> DROPPABLE_SYSTEM_AUTH_TABLES = new HashSet<>();
+
     static
     {
         // We want these system cfs to be always readable to authenticated users since many tools rely on them
         // (nodetool, cqlsh, bulkloader, etc.)
-        for (String cf : Arrays.asList(SystemKeyspace.LOCAL, SystemKeyspace.PEERS))
+        for (String cf : Arrays.asList(SystemKeyspace.LOCAL, SystemKeyspace.LEGACY_PEERS, SystemKeyspace.PEERS_V2))
             READABLE_SYSTEM_RESOURCES.add(DataResource.table(SchemaConstants.SYSTEM_KEYSPACE_NAME, cf));
 
-        SchemaKeyspace.ALL.forEach(table -> READABLE_SYSTEM_RESOURCES.add(DataResource.table(SchemaConstants.SCHEMA_KEYSPACE_NAME, table)));
+        // make all schema tables readable by default (required by the drivers)
+        SchemaKeyspaceTables.ALL.forEach(table -> READABLE_SYSTEM_RESOURCES.add(DataResource.table(SchemaConstants.SCHEMA_KEYSPACE_NAME, table)));
+
+        // make all virtual schema tables readable by default as well
+        VirtualSchemaKeyspace.instance.tables().forEach(t -> READABLE_SYSTEM_RESOURCES.add(t.metadata().resource));
 
         // neither clients nor tools need authentication/authorization
         if (DatabaseDescriptor.isDaemonInitialized())
@@ -72,38 +91,30 @@ public class ClientState
             PROTECTED_AUTH_RESOURCES.addAll(DatabaseDescriptor.getAuthorizer().protectedResources());
             PROTECTED_AUTH_RESOURCES.addAll(DatabaseDescriptor.getRoleManager().protectedResources());
         }
-
-        DROPPABLE_SYSTEM_AUTH_TABLES.add(DataResource.table(SchemaConstants.AUTH_KEYSPACE_NAME, PasswordAuthenticator.LEGACY_CREDENTIALS_TABLE));
-        DROPPABLE_SYSTEM_AUTH_TABLES.add(DataResource.table(SchemaConstants.AUTH_KEYSPACE_NAME, CassandraRoleManager.LEGACY_USERS_TABLE));
-        DROPPABLE_SYSTEM_AUTH_TABLES.add(DataResource.table(SchemaConstants.AUTH_KEYSPACE_NAME, CassandraAuthorizer.USER_PERMISSIONS));
     }
 
     // Current user for the session
     private volatile AuthenticatedUser user;
     private volatile String keyspace;
-
-    /**
-     * Force Compact Tables to be represented as CQL ones for the current client session (simulates
-     * ALTER .. DROP COMPACT STORAGE but only for this session)
-     */
-    private volatile boolean noCompactMode;
+    private volatile boolean issuedPreparedStatementsUseWarning;
 
     private static final QueryHandler cqlQueryHandler;
     static
     {
         QueryHandler handler = QueryProcessor.instance;
-        String customHandlerClass = System.getProperty("cassandra.custom_query_handler_class");
+        String customHandlerClass = CUSTOM_QUERY_HANDLER_CLASS.getString();
         if (customHandlerClass != null)
         {
             try
             {
                 handler = FBUtilities.construct(customHandlerClass, "QueryHandler");
-                logger.info("Using {} as query handler for native protocol queries (as requested with -Dcassandra.custom_query_handler_class)", customHandlerClass);
+                logger.info("Using {} as a query handler for native protocol queries (as requested by the {} system property)",
+                            customHandlerClass, CUSTOM_QUERY_HANDLER_CLASS.getKey());
             }
             catch (Exception e)
             {
-                JVMStabilityInspector.inspectThrowable(e);
-                logger.info("Cannot use class {} as query handler ({}), ignoring by defaulting on normal query handling", customHandlerClass, e.getMessage());
+                logger.error("Cannot use class {} as query handler", customHandlerClass, e);
+                JVMStabilityInspector.killCurrentJVM(e, true);
             }
         }
         cqlQueryHandler = handler;
@@ -116,11 +127,26 @@ public class ClientState
     // The remote address of the client - null for internal clients.
     private final InetSocketAddress remoteAddress;
 
+    // Driver String for the client
+    private volatile String driverName;
+    private volatile String driverVersion;
+    
+    // Options provided by the client
+    private volatile Map<String,String> clientOptions;
+
     // The biggest timestamp that was returned by getTimestamp/assigned to a query. This is global to ensure that the
     // timestamp assigned are strictly monotonic on a node, which is likely what user expect intuitively (more likely,
     // most new user will intuitively expect timestamp to be strictly monotonic cluster-wise, but while that last part
     // is unrealistic expectation, doing it node-wise is easy).
     private static final AtomicLong lastTimestampMicros = new AtomicLong(0);
+
+    @VisibleForTesting
+    public static void resetLastTimestamp(long nowMillis)
+    {
+        long nowMicros = TimeUnit.MILLISECONDS.toMicros(nowMillis);
+        if (lastTimestampMicros.get() > nowMicros)
+            lastTimestampMicros.set(nowMicros);
+    }
 
     /**
      * Construct a new, empty ClientState for internal calls.
@@ -139,6 +165,17 @@ public class ClientState
             this.user = AuthenticatedUser.ANONYMOUS_USER;
     }
 
+    protected ClientState(ClientState source)
+    {
+        this.isInternal = source.isInternal;
+        this.remoteAddress = source.remoteAddress;
+        this.user = source.user;
+        this.keyspace = source.keyspace;
+        this.driverName = source.driverName;
+        this.driverVersion = source.driverVersion;
+        this.clientOptions = source.clientOptions;
+    }
+
     /**
      * @return a ClientState object for internal C* calls (not limited by any kind of auth).
      */
@@ -147,8 +184,15 @@ public class ClientState
         return new ClientState();
     }
 
+    public static ClientState forInternalCalls(String keyspace)
+    {
+        ClientState state = new ClientState();
+        state.setKeyspace(keyspace);
+        return state;
+    }
+
     /**
-     * @return a ClientState object for external clients (thrift/native protocol users).
+     * @return a ClientState object for external clients (native protocol users).
      */
     public static ClientState forExternalCalls(SocketAddress remoteAddress)
     {
@@ -156,14 +200,30 @@ public class ClientState
     }
 
     /**
+     * Clone this ClientState object, but use the provided keyspace instead of the
+     * keyspace in this ClientState object.
+     *
+     * @return a new ClientState object if the keyspace argument is non-null. Otherwise do not clone
+     *   and return this ClientState object.
+     */
+    public ClientState cloneWithKeyspaceIfSet(String keyspace)
+    {
+        if (keyspace == null)
+            return this;
+        ClientState clientState = new ClientState(this);
+        clientState.setKeyspace(keyspace);
+        return clientState;
+    }
+
+    /**
      * This clock guarantees that updates for the same ClientState will be ordered
      * in the sequence seen, even if multiple updates happen in the same millisecond.
      */
-    public long getTimestamp()
+    public static long getTimestamp()
     {
         while (true)
         {
-            long current = System.currentTimeMillis() * 1000;
+            long current = currentTimeMillis() * 1000;
             long last = lastTimestampMicros.get();
             long tstamp = last >= current ? last + 1 : current;
             if (lastTimestampMicros.compareAndSet(last, tstamp))
@@ -204,7 +264,7 @@ public class ClientState
      * with a clock in the future compared to the local one), we use the last proposal timestamp plus 1, ensuring
      * progress.
      *
-     * @param minTimestampToUse the max timestamp of the last proposal accepted by replica having responded
+     * @param minUnixMicros the max timestamp of the last proposal accepted by replica having responded
      * to the prepare phase of the paxos round this is for. In practice, that's the minimum timestamp this method
      * may return.
      * @return a timestamp suitable for a Paxos proposal (using the reasoning described above). Note that
@@ -213,20 +273,55 @@ public class ClientState
      * it may be returned multiple times). Note that we still ensure Paxos "ballot" are unique (for different
      * proposal) by (securely) randomizing the non-timestamp part of the UUID.
      */
-    public long getTimestampForPaxos(long minTimestampToUse)
+    public static long getTimestampForPaxos(long minUnixMicros)
     {
         while (true)
         {
-            long current = Math.max(System.currentTimeMillis() * 1000, minTimestampToUse);
+            long current = Math.max(currentTimeMillis() * 1000, minUnixMicros);
             long last = lastTimestampMicros.get();
             long tstamp = last >= current ? last + 1 : current;
             // Note that if we ended up picking minTimestampMicrosToUse (it was "in the future"), we don't
             // want to change the local clock, otherwise a single node in the future could corrupt the clock
             // of all nodes and for all inserts (since non-paxos inserts also use lastTimestampMicros).
             // See CASSANDRA-11991
-            if (tstamp == minTimestampToUse || lastTimestampMicros.compareAndSet(last, tstamp))
+            if (tstamp == minUnixMicros || lastTimestampMicros.compareAndSet(last, tstamp))
                 return tstamp;
         }
+    }
+
+    public static long getLastTimestampMicros()
+    {
+        return lastTimestampMicros.get();
+    }
+
+    public Optional<String> getDriverName()
+    {
+        return Optional.ofNullable(driverName);
+    }
+
+    public Optional<String> getDriverVersion()
+    {
+        return Optional.ofNullable(driverVersion);
+    }
+
+    public Optional<Map<String,String>> getClientOptions()
+    {
+        return Optional.ofNullable(clientOptions);
+    }
+
+    public void setDriverName(String driverName)
+    {
+        this.driverName = driverName;
+    }
+
+    public void setDriverVersion(String driverVersion)
+    {
+        this.driverVersion = driverVersion;
+    }
+    
+    public void setClientOptions(Map<String,String> clientOptions)
+    {
+        this.clientOptions = ImmutableMap.copyOf(clientOptions);
     }
 
     public static QueryHandler getCQLQueryHandler()
@@ -237,6 +332,11 @@ public class ClientState
     public InetSocketAddress getRemoteAddress()
     {
         return remoteAddress;
+    }
+
+    InetAddress getClientAddress()
+    {
+        return isInternal ? null : remoteAddress.getAddress();
     }
 
     public String getRawKeyspace()
@@ -251,67 +351,93 @@ public class ClientState
         return keyspace;
     }
 
-    public void setKeyspace(String ks) throws InvalidRequestException
+    public void setKeyspace(String ks)
     {
         // Skip keyspace validation for non-authenticated users. Apparently, some client libraries
         // call set_keyspace() before calling login(), and we have to handle that.
-        if (user != null && Schema.instance.getKSMetaData(ks) == null)
+        if (user != null && Schema.instance.getKeyspaceMetadata(ks) == null)
             throw new InvalidRequestException("Keyspace '" + ks + "' does not exist");
         keyspace = ks;
-    }
-
-    public void setNoCompactMode()
-    {
-        this.noCompactMode = true;
-    }
-
-    public boolean isNoCompactMode()
-    {
-        return noCompactMode;
     }
 
     /**
      * Attempts to login the given user.
      */
-    public void login(AuthenticatedUser user) throws AuthenticationException
+    public void login(AuthenticatedUser user)
     {
-        // Login privilege is not inherited via granted roles, so just
-        // verify that the role with the credentials that were actually
-        // supplied has it
-        if (user.isAnonymous() || DatabaseDescriptor.getRoleManager().canLogin(user.getPrimaryRole()))
+        if (user.isAnonymous() || canLogin(user))
             this.user = user;
         else
             throw new AuthenticationException(String.format("%s is not permitted to log in", user.getName()));
     }
 
-    public void hasAllKeyspacesAccess(Permission perm) throws UnauthorizedException
+    private boolean canLogin(AuthenticatedUser user)
+    {
+        try
+        {
+            return user.canLogin();
+        }
+        catch (RequestExecutionException | RequestValidationException e)
+        {
+            throw new AuthenticationException("Unable to perform authentication: " + e.getMessage(), e);
+        }
+    }
+
+    public void ensureAllKeyspacesPermission(Permission perm)
     {
         if (isInternal)
             return;
         validateLogin();
-        ensureHasPermission(perm, DataResource.root());
+        ensurePermission(perm, DataResource.root());
     }
 
-    public void hasKeyspaceAccess(String keyspace, Permission perm) throws UnauthorizedException, InvalidRequestException
+    public void ensureKeyspacePermission(String keyspace, Permission perm)
     {
-        hasAccess(keyspace, perm, DataResource.keyspace(keyspace));
+        ensurePermission(keyspace, perm, DataResource.keyspace(keyspace));
     }
 
-    public void hasColumnFamilyAccess(String keyspace, String columnFamily, Permission perm)
-    throws UnauthorizedException, InvalidRequestException
+    public void ensureAllTablesPermission(String keyspace, Permission perm)
     {
-        ThriftValidation.validateColumnFamily(keyspace, columnFamily);
-        hasAccess(keyspace, perm, DataResource.table(keyspace, columnFamily));
+        ensurePermission(keyspace, perm, DataResource.allTables(keyspace));
     }
 
-    public void hasColumnFamilyAccess(CFMetaData cfm, Permission perm)
-    throws UnauthorizedException, InvalidRequestException
+    public void ensureTablePermission(String keyspace, String table, Permission perm)
     {
-        hasAccess(cfm.ksName, perm, cfm.resource);
+        ensurePermission(keyspace, perm, DataResource.table(keyspace, table));
     }
 
-    private void hasAccess(String keyspace, Permission perm, DataResource resource)
-    throws UnauthorizedException, InvalidRequestException
+    public void ensureTablePermission(TableMetadataRef tableRef, Permission perm)
+    {
+        ensureTablePermission(tableRef.get(), perm);
+    }
+
+    public void ensureTablePermission(TableMetadata table, Permission perm)
+    {
+        ensurePermission(table.keyspace, perm, table.resource);
+    }
+
+    public boolean hasTablePermission(TableMetadata table, Permission perm)
+    {
+        if (isInternal)
+            return true;
+
+        validateLogin();
+
+        if (!DatabaseDescriptor.getAuthorizer().requireAuthorization())
+            return true;
+
+        List<? extends IResource> resources = Resources.chain(table.resource);
+        if (DatabaseDescriptor.getAuthFromRoot())
+            resources = Lists.reverse(resources);
+
+        for (IResource r : resources)
+            if (authorize(r).contains(perm))
+                return true;
+
+        return false;
+    }
+
+    private void ensurePermission(String keyspace, Permission perm, DataResource resource)
     {
         validateKeyspace(keyspace);
 
@@ -328,11 +454,10 @@ public class ClientState
         if (PROTECTED_AUTH_RESOURCES.contains(resource))
             if ((perm == Permission.CREATE) || (perm == Permission.ALTER) || (perm == Permission.DROP))
                 throw new UnauthorizedException(String.format("%s schema is protected", resource));
-
-        ensureHasPermission(perm, resource);
+        ensurePermission(perm, resource);
     }
 
-    public void ensureHasPermission(Permission perm, IResource resource) throws UnauthorizedException
+    public void ensurePermission(Permission perm, IResource resource)
     {
         if (!DatabaseDescriptor.getAuthorizer().requireAuthorization())
             return;
@@ -342,12 +467,12 @@ public class ClientState
             if (((FunctionResource)resource).getKeyspace().equals(SchemaConstants.SYSTEM_KEYSPACE_NAME))
                 return;
 
-        checkPermissionOnResourceChain(perm, resource);
+        ensurePermissionOnResourceChain(perm, resource);
     }
 
-    // Convenience method called from checkAccess method of CQLStatement
+    // Convenience method called from authorize method of CQLStatement
     // Also avoids needlessly creating lots of FunctionResource objects
-    public void ensureHasPermission(Permission permission, Function function)
+    public void ensurePermission(Permission permission, Function function)
     {
         // Save creating a FunctionResource is we don't need to
         if (!DatabaseDescriptor.getAuthorizer().requireAuthorization())
@@ -357,14 +482,18 @@ public class ClientState
         if (function.isNative())
             return;
 
-        checkPermissionOnResourceChain(permission, FunctionResource.function(function.name().keyspace,
-                                                                             function.name().name,
-                                                                             function.argTypes()));
+        ensurePermissionOnResourceChain(permission, FunctionResource.function(function.name().keyspace,
+                                                                              function.name().name,
+                                                                              function.argTypes()));
     }
 
-    private void checkPermissionOnResourceChain(Permission perm, IResource resource)
+    private void ensurePermissionOnResourceChain(Permission perm, IResource resource)
     {
-        for (IResource r : Resources.chain(resource))
+        List<? extends IResource> resources = Resources.chain(resource);
+        if (DatabaseDescriptor.getAuthFromRoot())
+            resources = Lists.reverse(resources);
+
+        for (IResource r : resources)
             if (authorize(r).contains(perm))
                 return;
 
@@ -374,7 +503,7 @@ public class ClientState
                                                       resource));
     }
 
-    private void preventSystemKSSchemaModification(String keyspace, DataResource resource, Permission perm) throws UnauthorizedException
+    private void preventSystemKSSchemaModification(String keyspace, DataResource resource, Permission perm)
     {
         // we only care about DDL statements
         if (perm != Permission.ALTER && perm != Permission.DROP && perm != Permission.CREATE)
@@ -390,35 +519,82 @@ public class ClientState
             if (perm == Permission.ALTER && resource.isKeyspaceLevel())
                 return;
 
-            // allow users with sufficient privileges to drop legacy tables in replicated system keyspaces
-            if (perm == Permission.DROP && DROPPABLE_SYSTEM_AUTH_TABLES.contains(resource))
-                return;
-
             // prevent all other modifications of replicated system keyspaces
             throw new UnauthorizedException(String.format("Cannot %s %s", perm, resource));
         }
     }
 
-    public void validateLogin() throws UnauthorizedException
+    public void validateLogin()
     {
         if (user == null)
+        {
             throw new UnauthorizedException("You have not logged in");
+        }
+        else if (!user.hasLocalAccess())
+        {
+            throw new UnauthorizedException(String.format("You do not have access to this datacenter (%s)", Datacenters.thisDatacenter()));
+        }
+        else
+        {
+            if (remoteAddress != null && !user.hasAccessFromIp(remoteAddress))
+                throw new UnauthorizedException("You do not have access from this IP " + remoteAddress.getHostString());
+        }
     }
 
-    public void ensureNotAnonymous() throws UnauthorizedException
+    public void ensureNotAnonymous()
     {
         validateLogin();
         if (user.isAnonymous())
             throw new UnauthorizedException("You have to be logged in and not anonymous to perform this request");
     }
 
-    public void ensureIsSuper(String message) throws UnauthorizedException
+    /**
+     * Checks if this user is an ordinary user (not a super or system user).
+     *
+     * @return {@code true} if this user is an ordinary user, {@code false} otherwise.
+     */
+    public boolean isOrdinaryUser()
     {
-        if (DatabaseDescriptor.getAuthenticator().requireAuthentication() && (user == null || !user.isSuper()))
+        return !isSuper() && !isSystem();
+    }
+
+    /**
+     * Checks if this user is a super user.
+     */
+    public boolean isSuper()
+    {
+        return !DatabaseDescriptor.getAuthenticator().requireAuthentication() || (user != null && user.isSuper());
+    }
+
+    /**
+     * Checks if the user is the system user.
+     *
+     * @return {@code true} if this user is the system user, {@code false} otherwise.
+     */
+    public boolean isSystem()
+    {
+        return isInternal;
+    }
+
+    public void ensureIsSuperuser(String message)
+    {
+        if (!isSuper())
             throw new UnauthorizedException(message);
     }
 
-    private static void validateKeyspace(String keyspace) throws InvalidRequestException
+    public void warnAboutUseWithPreparedStatements(MD5Digest statementId, String preparedKeyspace)
+    {
+        if (!issuedPreparedStatementsUseWarning)
+        {
+            ClientWarn.instance.warn(String.format("`USE <keyspace>` with prepared statements is considered to be an anti-pattern due to ambiguity in non-qualified table names. " +
+                                                   "Please consider removing instances of `Session#setKeyspace(<keyspace>)`, `Session#execute(\"USE <keyspace>\")` and `cluster.newSession(<keyspace>)` from your code, and " +
+                                                   "always use fully qualified table names (e.g. <keyspace>.<table>). " +
+                                                   "Keyspace used: %s, statement keyspace: %s, statement id: %s", getRawKeyspace(), preparedKeyspace, statementId));
+            issuedPreparedStatementsUseWarning = true;
+        }
+    }
+
+    private static void validateKeyspace(String keyspace)
     {
         if (keyspace == null)
             throw new InvalidRequestException("You have not set a keyspace for this session");
@@ -429,13 +605,9 @@ public class ClientState
         return user;
     }
 
-    public static CassandraVersion[] getCQLSupportedVersion()
-    {
-        return new CassandraVersion[]{ QueryProcessor.CQL_VERSION };
-    }
-
     private Set<Permission> authorize(IResource resource)
     {
         return user.getPermissions(resource);
     }
+
 }

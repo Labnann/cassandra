@@ -17,10 +17,14 @@
  */
 package org.apache.cassandra.concurrent;
 
-import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 import com.google.common.annotations.VisibleForTesting;
+
+import org.apache.cassandra.utils.ExecutorUtils;
+
+import static org.apache.cassandra.concurrent.ExecutorFactory.Global.executorFactory;
 
 /**
  * Centralized location for shared executors
@@ -30,30 +34,26 @@ public class ScheduledExecutors
     /**
      * This pool is used for periodic fast (sub-microsecond) tasks.
      */
-    public static final DebuggableScheduledThreadPoolExecutor scheduledFastTasks = new DebuggableScheduledThreadPoolExecutor("ScheduledFastTasks");
+    public static final ScheduledExecutorPlus scheduledFastTasks = executorFactory().scheduled("ScheduledFastTasks");
 
     /**
      * This pool is used for periodic short (sub-second) tasks.
      */
-     public static final DebuggableScheduledThreadPoolExecutor scheduledTasks = new DebuggableScheduledThreadPoolExecutor("ScheduledTasks");
+     public static final ScheduledExecutorPlus scheduledTasks = executorFactory().scheduled("ScheduledTasks");
 
     /**
      * This executor is used for tasks that can have longer execution times, and usually are non periodic.
      */
-    public static final DebuggableScheduledThreadPoolExecutor nonPeriodicTasks = new DebuggableScheduledThreadPoolExecutor("NonPeriodicTasks");
+    public static final ScheduledExecutorPlus nonPeriodicTasks = executorFactory().scheduled("NonPeriodicTasks");
 
     /**
      * This executor is used for tasks that do not need to be waited for on shutdown/drain.
      */
-    public static final DebuggableScheduledThreadPoolExecutor optionalTasks = new DebuggableScheduledThreadPoolExecutor("OptionalTasks");
+    public static final ScheduledExecutorPlus optionalTasks = executorFactory().scheduled(false, "OptionalTasks");
 
     @VisibleForTesting
-    public static void shutdownAndWait() throws InterruptedException
+    public static void shutdownNowAndWait(long timeout, TimeUnit unit) throws InterruptedException, TimeoutException
     {
-        ExecutorService[] executors = new ExecutorService[] { scheduledFastTasks, scheduledTasks, nonPeriodicTasks, optionalTasks };
-        for (ExecutorService executor : executors)
-            executor.shutdownNow();
-        for (ExecutorService executor : executors)
-            executor.awaitTermination(60, TimeUnit.SECONDS);
+        ExecutorUtils.shutdownNowAndWait(timeout, unit, scheduledTasks, scheduledFastTasks, nonPeriodicTasks, optionalTasks);
     }
 }

@@ -20,13 +20,16 @@ package org.apache.cassandra.db.rows;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 
-import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.db.marshal.ByteBufferAccessor;
+import org.apache.cassandra.db.marshal.ValueAccessor;
+import org.apache.cassandra.schema.ColumnMetadata;
+import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.ObjectSizes;
 import org.apache.cassandra.utils.concurrent.OpOrder;
 import org.apache.cassandra.utils.memory.MemoryUtil;
 import org.apache.cassandra.utils.memory.NativeAllocator;
 
-public class NativeCell extends AbstractCell
+public class NativeCell extends AbstractCell<ByteBuffer>
 {
     private static final long EMPTY_SIZE = ObjectSizes.measure(new NativeCell());
 
@@ -47,35 +50,49 @@ public class NativeCell extends AbstractCell
 
     public NativeCell(NativeAllocator allocator,
                       OpOrder.Group writeOp,
-                      Cell cell)
+                      Cell<?> cell)
     {
         this(allocator,
              writeOp,
              cell.column(),
              cell.timestamp(),
              cell.ttl(),
-             cell.localDeletionTime(),
-             cell.value(),
+             cell.localDeletionTimeAsUnsignedInt(),
+             cell.buffer(),
              cell.path());
+    }
+
+    // Please keep both int/long overloaded ctros public. Otherwise silent casts will mess timestamps when one is not
+    // available.
+    public NativeCell(NativeAllocator allocator,
+                      OpOrder.Group writeOp,
+                      ColumnMetadata column,
+                      long timestamp,
+                      int ttl,
+                      long localDeletionTime,
+                      ByteBuffer value,
+                      CellPath path)
+    {
+        this(allocator, writeOp, column, timestamp, ttl, deletionTimeLongToUnsignedInteger(localDeletionTime), value, path);
     }
 
     public NativeCell(NativeAllocator allocator,
                       OpOrder.Group writeOp,
-                      ColumnDefinition column,
+                      ColumnMetadata column,
                       long timestamp,
                       int ttl,
-                      int localDeletionTime,
+                      int localDeletionTimeUnsignedInteger,
                       ByteBuffer value,
                       CellPath path)
     {
         super(column);
-        long size = simpleSize(value.remaining());
+        long size = offHeapSizeWithoutPath(value.remaining());
 
         assert value.order() == ByteOrder.BIG_ENDIAN;
         assert column.isComplex() == (path != null);
         if (path != null)
         {
-            assert path.size() == 1;
+            assert path.size() == 1 : String.format("Expected path size to be 1 but was not; %s", path);
             size += 4 + path.get(0).remaining();
         }
 
@@ -87,7 +104,7 @@ public class NativeCell extends AbstractCell
         MemoryUtil.setByte(peer + HAS_CELLPATH, (byte)(path == null ? 0 : 1));
         MemoryUtil.setLong(peer + TIMESTAMP, timestamp);
         MemoryUtil.setInt(peer + TTL, ttl);
-        MemoryUtil.setInt(peer + DELETION, localDeletionTime);
+        MemoryUtil.setInt(peer + DELETION, localDeletionTimeUnsignedInteger);
         MemoryUtil.setInt(peer + LENGTH, value.remaining());
         MemoryUtil.setBytes(peer + VALUE, value);
 
@@ -102,7 +119,7 @@ public class NativeCell extends AbstractCell
         }
     }
 
-    private static long simpleSize(int length)
+    private static long offHeapSizeWithoutPath(int length)
     {
         return VALUE + length;
     }
@@ -117,20 +134,20 @@ public class NativeCell extends AbstractCell
         return MemoryUtil.getInt(peer + TTL);
     }
 
-    public int localDeletionTime()
-    {
-        return MemoryUtil.getInt(peer + DELETION);
-    }
-
-    public ByteBuffer value()
+    public ByteBuffer value()// FIXME: add native accessor
     {
         int length = MemoryUtil.getInt(peer + LENGTH);
         return MemoryUtil.getByteBuffer(peer + VALUE, length, ByteOrder.BIG_ENDIAN);
     }
 
+    public ValueAccessor<ByteBuffer> accessor()
+    {
+        return ByteBufferAccessor.instance;  // FIXME: add native accessor
+    }
+
     public CellPath path()
     {
-        if (MemoryUtil.getByte(peer+ HAS_CELLPATH) == 0)
+        if (!hasPath())
             return null;
 
         long offset = peer + VALUE + MemoryUtil.getInt(peer + LENGTH);
@@ -138,24 +155,54 @@ public class NativeCell extends AbstractCell
         return CellPath.create(MemoryUtil.getByteBuffer(offset + 4, size, ByteOrder.BIG_ENDIAN));
     }
 
-    public Cell withUpdatedValue(ByteBuffer newValue)
+    public Cell<?> withUpdatedValue(ByteBuffer newValue)
     {
         throw new UnsupportedOperationException();
     }
 
-    public Cell withUpdatedTimestampAndLocalDeletionTime(long newTimestamp, int newLocalDeletionTime)
+    public Cell<?> withUpdatedTimestampAndLocalDeletionTime(long newTimestamp, long newLocalDeletionTime)
     {
         return new BufferCell(column, newTimestamp, ttl(), newLocalDeletionTime, value(), path());
     }
 
-    public Cell withUpdatedColumn(ColumnDefinition column)
+    public Cell<?> withUpdatedColumn(ColumnMetadata column)
     {
-        return new BufferCell(column, timestamp(), ttl(), localDeletionTime(), value(), path());
+        return new BufferCell(column, timestamp(), ttl(), localDeletionTimeAsUnsignedInt(), value(), path());
     }
 
+    public Cell withSkippedValue()
+    {
+        return new BufferCell(column, timestamp(), ttl(), localDeletionTimeAsUnsignedInt(), ByteBufferUtil.EMPTY_BYTE_BUFFER, path());
+    }
+
+    @Override
+    public long unsharedHeapSize()
+    {
+        return EMPTY_SIZE;
+    }
+
+    @Override
     public long unsharedHeapSizeExcludingData()
     {
         return EMPTY_SIZE;
     }
 
+    public long offHeapSize()
+    {
+        long size = offHeapSizeWithoutPath(MemoryUtil.getInt(peer + LENGTH));
+        if (hasPath())
+            size += 4 + MemoryUtil.getInt(peer + size);
+        return size;
+    }
+
+    private boolean hasPath()
+    {
+        return MemoryUtil.getByte(peer+ HAS_CELLPATH) != 0;
+    }
+
+    @Override
+    protected int localDeletionTimeAsUnsignedInt()
+    {
+        return MemoryUtil.getInt(peer + DELETION);
+    }
 }

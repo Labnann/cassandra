@@ -17,17 +17,36 @@
  */
 package org.apache.cassandra.repair;
 
+import java.util.Collection;
+import java.util.List;
+
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.streaming.SessionSummary;
+
 /**
  * Statistics about synchronizing two replica
  */
 public class SyncStat
 {
-    public final NodePair nodes;
-    public final long numberOfDifferences;
+    public final SyncNodePair nodes;
+    public final Collection<Range<Token>> differences;
+    public final List<SessionSummary> summaries;
 
-    public SyncStat(NodePair nodes, long numberOfDifferences)
+    public SyncStat(SyncNodePair nodes, Collection<Range<Token>> differences)
+    {
+        this(nodes, differences, null);
+    }
+
+    public SyncStat(SyncNodePair nodes,  Collection<Range<Token>> differences, List<SessionSummary> summaries)
     {
         this.nodes = nodes;
-        this.numberOfDifferences = numberOfDifferences;
+        this.summaries = summaries;
+        this.differences = differences;
+    }
+
+    public SyncStat withSummaries(List<SessionSummary> summaries)
+    {
+        return new SyncStat(nodes, differences, summaries);
     }
 }

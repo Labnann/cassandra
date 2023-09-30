@@ -22,19 +22,19 @@ import java.nio.ByteBuffer;
 import org.apache.cassandra.cql3.CQL3Type;
 import org.apache.cassandra.cql3.Constants;
 import org.apache.cassandra.cql3.Term;
+import org.apache.cassandra.cql3.functions.ArgumentDeserializer;
 import org.apache.cassandra.serializers.TypeSerializer;
 import org.apache.cassandra.serializers.BooleanSerializer;
 import org.apache.cassandra.serializers.MarshalException;
 import org.apache.cassandra.transport.ProtocolVersion;
-
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.apache.cassandra.utils.bytecomparable.ByteComparable;
+import org.apache.cassandra.utils.bytecomparable.ByteSource;
 
 public class BooleanType extends AbstractType<Boolean>
 {
-    private static final Logger logger = LoggerFactory.getLogger(BooleanType.class);
-
     public static final BooleanType instance = new BooleanType();
+    private static final ArgumentDeserializer ARGUMENT_DESERIALIZER = new DefaultArgumentDeserializer(instance);
+    private static final ByteBuffer MASKED_VALUE = instance.decompose(false);
 
     BooleanType() {super(ComparisonType.CUSTOM);} // singleton
 
@@ -43,17 +43,35 @@ public class BooleanType extends AbstractType<Boolean>
         return true;
     }
 
-    public int compareCustom(ByteBuffer o1, ByteBuffer o2)
+    public <VL, VR> int compareCustom(VL left, ValueAccessor<VL> accessorL, VR right, ValueAccessor<VR> accessorR)
     {
-        if (!o1.hasRemaining() || !o2.hasRemaining())
-            return o1.hasRemaining() ? 1 : o2.hasRemaining() ? -1 : 0;
+        if (accessorL.isEmpty(left) || accessorR.isEmpty(right))
+            return Boolean.compare(accessorR.isEmpty(right), accessorL.isEmpty(left));
 
         // False is 0, True is anything else, makes False sort before True.
-        byte b1 = o1.get(o1.position());
-        byte b2 = o2.get(o2.position());
-        if (b1 == 0)
-            return b2 == 0 ? 0 : -1;
-        return b2 == 0 ? 1 : 0;
+        int v1 = accessorL.getByte(left, 0) == 0 ? 0 : 1;
+        int v2 = accessorR.getByte(right, 0) == 0 ? 0 : 1;
+        return v1 - v2;
+    }
+
+    @Override
+    public <V> ByteSource asComparableBytes(ValueAccessor<V> accessor, V data, ByteComparable.Version version)
+    {
+        if (accessor.isEmpty(data))
+            return null;
+        byte b = accessor.toByte(data);
+        if (b != 0)
+            b = 1;
+        return ByteSource.oneByte(b);
+    }
+
+    @Override
+    public <V> V fromComparableBytes(ValueAccessor<V> accessor, ByteSource.Peekable comparableBytes, ByteComparable.Version version)
+    {
+        if (comparableBytes == null)
+            return accessor.empty();
+        int b = comparableBytes.next();
+        return accessor.valueOf(b == 1);
     }
 
     public ByteBuffer fromString(String source) throws MarshalException
@@ -97,8 +115,20 @@ public class BooleanType extends AbstractType<Boolean>
     }
 
     @Override
-    protected int valueLengthIfFixed()
+    public ArgumentDeserializer getArgumentDeserializer()
+    {
+        return ARGUMENT_DESERIALIZER;
+    }
+
+    @Override
+    public int valueLengthIfFixed()
     {
         return 1;
+    }
+
+    @Override
+    public ByteBuffer getMaskedValue()
+    {
+        return MASKED_VALUE;
     }
 }

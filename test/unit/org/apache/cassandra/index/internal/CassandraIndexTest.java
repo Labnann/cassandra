@@ -18,6 +18,7 @@
 
 package org.apache.cassandra.index.internal;
 
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import java.util.stream.StreamSupport;
@@ -26,9 +27,6 @@ import com.google.common.base.Joiner;
 import com.google.common.collect.*;
 import org.junit.Test;
 
-import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.config.ColumnDefinition;
-import org.apache.cassandra.config.SchemaConstants;
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.cql3.restrictions.StatementRestrictions;
@@ -40,15 +38,18 @@ import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.rows.Unfiltered;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.schema.ColumnMetadata;
+import org.apache.cassandra.schema.SchemaConstants;
+import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
+import org.awaitility.Awaitility;
 
 import static org.apache.cassandra.Util.throwAssert;
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 /**
@@ -69,6 +70,33 @@ public class CassandraIndexTest extends CQLTester
                         .updateExpression("SET v=2")
                         .postUpdateQueryExpression("v=2")
                         .run();
+    }
+
+    @Test
+    public void testIndexOnPartitionKeyWithPartitionWithoutRows() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk1 int, pk2 int, c int, s int static, v int, PRIMARY KEY((pk1, pk2), c))");
+        createIndex("CREATE INDEX ON %s (pk2)");
+
+        execute("INSERT INTO %s (pk1, pk2, c, s, v) VALUES (?, ?, ?, ?, ?)", 1, 1, 1, 9, 1);
+        execute("INSERT INTO %s (pk1, pk2, c, s, v) VALUES (?, ?, ?, ?, ?)", 1, 1, 2, 9, 2);
+        execute("INSERT INTO %s (pk1, pk2, c, s, v) VALUES (?, ?, ?, ?, ?)", 3, 1, 1, 9, 1);
+        execute("INSERT INTO %s (pk1, pk2, c, s, v) VALUES (?, ?, ?, ?, ?)", 4, 1, 1, 9, 1);
+        flush();
+
+        assertRowsIgnoringOrder(execute("SELECT * FROM %s WHERE pk2 = ?", 1),
+                                row(1, 1, 1, 9, 1),
+                                row(1, 1, 2, 9, 2),
+                                row(3, 1, 1, 9, 1),
+                                row(4, 1, 1, 9, 1));
+
+        execute("DELETE FROM %s WHERE pk1 = ? AND pk2 = ? AND c = ?", 3, 1, 1);
+
+        assertRowsIgnoringOrder(execute("SELECT * FROM %s WHERE pk2 = ?", 1),
+                                row(1, 1, 1, 9, 1),
+                                row(1, 1, 2, 9, 2),
+                                row(3, 1, null, 9, null),
+                                row(4, 1, 1, 9, 1));
     }
 
     @Test
@@ -363,6 +391,31 @@ public class CassandraIndexTest extends CQLTester
 
         assertEmpty(execute("SELECT * FROM %s WHERE s = ? AND token(k) < token(?)", "s0", "k0"));
         assertEmpty(execute("SELECT * FROM %s WHERE s = ? AND token(k) < token(?)", "s1", "k1"));
+
+        row1 = row("s0");
+        row2 = row("s0");
+        row3 = row("s1");
+        row4 = row("s1");
+
+        assertRows(execute("SELECT s FROM %s WHERE s = ?", "s0"), row1, row2);
+        assertRows(execute("SELECT s FROM %s WHERE s = ?", "s1"), row3, row4);
+
+        assertRows(execute("SELECT s FROM %s WHERE s = ? AND token(k) >= token(?)", "s0", "k0"), row1, row2);
+        assertRows(execute("SELECT s FROM %s WHERE s = ? AND token(k) >= token(?)", "s1", "k1"), row3, row4);
+
+        assertEmpty(execute("SELECT s FROM %s WHERE s = ? AND token(k) < token(?)", "s0", "k0"));
+        assertEmpty(execute("SELECT s FROM %s WHERE s = ? AND token(k) < token(?)", "s1", "k1"));
+
+        dropIndex(String.format("DROP INDEX %s.sc_index", keyspace()));
+
+        assertRows(execute("SELECT s FROM %s WHERE s = ? ALLOW FILTERING", "s0"), row1, row2);
+        assertRows(execute("SELECT s FROM %s WHERE s = ? ALLOW FILTERING", "s1"), row3, row4);
+
+        assertRows(execute("SELECT s FROM %s WHERE s = ? AND token(k) >= token(?) ALLOW FILTERING", "s0", "k0"), row1, row2);
+        assertRows(execute("SELECT s FROM %s WHERE s = ? AND token(k) >= token(?) ALLOW FILTERING", "s1", "k1"), row3, row4);
+
+        assertEmpty(execute("SELECT s FROM %s WHERE s = ? AND token(k) < token(?) ALLOW FILTERING", "s0", "k0"));
+        assertEmpty(execute("SELECT s FROM %s WHERE s = ? AND token(k) < token(?) ALLOW FILTERING", "s1", "k1"));
     }
 
     @Test
@@ -372,7 +425,7 @@ public class CassandraIndexTest extends CQLTester
         Object[] row2 = row("k0", "c1");
         Object[] row3 = row("k1", "c0");
         Object[] row4 = row("k1", "c1");
-        String tableName = createTable("CREATE TABLE %s (k text, c text, PRIMARY KEY(k, c))");
+        createTable("CREATE TABLE %s (k text, c text, PRIMARY KEY(k, c))");
         createIndex("CREATE INDEX no_regulars_idx ON %s(c)");
 
         execute("INSERT INTO %s (k, c) VALUES (?, ?)", row1);
@@ -386,7 +439,6 @@ public class CassandraIndexTest extends CQLTester
 
         dropIndex("DROP INDEX %s.no_regulars_idx");
         createIndex("CREATE INDEX no_regulars_idx ON %s(c)");
-        assertTrue(waitForIndex(keyspace(), tableName, "no_regulars_idx"));
 
         assertRowsIgnoringOrder(execute("SELECT * FROM %s WHERE c = ?", "c0"), row1, row3);
         assertRowsIgnoringOrder(execute("SELECT * FROM %s WHERE c = ?", "c1"), row2, row4);
@@ -506,38 +558,52 @@ public class CassandraIndexTest extends CQLTester
     @Test
     public void indexCorrectlyMarkedAsBuildAndRemoved() throws Throwable
     {
+        String selectBuiltIndexesQuery = String.format("SELECT * FROM %s.\"%s\"",
+                                                       SchemaConstants.SYSTEM_KEYSPACE_NAME,
+                                                       SystemKeyspace.BUILT_INDEXES);
+
+        // Wait for any background index clearing tasks to complete. Warn: When we used to run tests in parallel there
+        // could also be cross test class talk and have other indices pop up here.
+        Awaitility.await()
+                  .atMost(1, TimeUnit.MINUTES)
+                  .pollDelay(1, TimeUnit.SECONDS)
+                  .untilAsserted(() -> assertRows(execute(selectBuiltIndexesQuery), row("system", "PaxosUncommittedIndex", null)));
+
         String indexName = "build_remove_test_idx";
-        String tableName = createTable("CREATE TABLE %s (a int, b int, c int, PRIMARY KEY (a, b))");
+        createTable("CREATE TABLE %s (a int, b int, c int, PRIMARY KEY (a, b))");
         createIndex(String.format("CREATE INDEX %s ON %%s(c)", indexName));
-        waitForIndex(KEYSPACE, tableName, indexName);
+
         // check that there are no other rows in the built indexes table
-        assertRows(execute(String.format("SELECT * FROM %s.\"%s\"", SchemaConstants.SYSTEM_KEYSPACE_NAME, SystemKeyspace.BUILT_INDEXES)),
-                   row(KEYSPACE, indexName));
+        assertRows(execute(selectBuiltIndexesQuery), row(KEYSPACE, indexName, null), row("system", "PaxosUncommittedIndex", null));
 
         // rebuild the index and verify the built status table
         getCurrentColumnFamilyStore().rebuildSecondaryIndex(indexName);
-        waitForIndex(KEYSPACE, tableName, indexName);
+        waitForIndexQueryable(indexName);
 
         // check that there are no other rows in the built indexes table
-        assertRows(execute(String.format("SELECT * FROM %s.\"%s\"", SchemaConstants.SYSTEM_KEYSPACE_NAME, SystemKeyspace.BUILT_INDEXES)),
-                   row(KEYSPACE, indexName));
+        assertRows(execute(selectBuiltIndexesQuery), row(KEYSPACE, indexName, null), row("system", "PaxosUncommittedIndex", null));
+
+        // check that dropping the index removes it from the built indexes table
+        dropIndex("DROP INDEX %s." + indexName);
+        assertRows(execute(selectBuiltIndexesQuery), row("system", "PaxosUncommittedIndex", null));
     }
 
+
     // this is slightly annoying, but we cannot read rows from the methods in Util as
-    // ReadCommand#executeInternal uses metadata retrieved via the cfId, which the index
+    // ReadCommand#executeLocally uses metadata retrieved via the tableId, which the index
     // CFS inherits from the base CFS. This has the 'wrong' partitioner (the index table
     // uses LocalPartition, the base table a real one, so we cannot read from the index
-    // table with executeInternal
+    // table with executeLocally
     private void assertIndexRowTtl(ColumnFamilyStore indexCfs, int indexedValue, int ttl) throws Throwable
     {
         DecoratedKey indexKey = indexCfs.decorateKey(ByteBufferUtil.bytes(indexedValue));
-        ClusteringIndexFilter filter = new ClusteringIndexSliceFilter(Slices.with(indexCfs.metadata.comparator,
+        ClusteringIndexFilter filter = new ClusteringIndexSliceFilter(Slices.with(indexCfs.metadata().comparator,
                                                                                   Slice.ALL),
                                                                       false);
-        SinglePartitionReadCommand command = SinglePartitionReadCommand.create(indexCfs.metadata,
+        SinglePartitionReadCommand command = SinglePartitionReadCommand.create(indexCfs.metadata(),
                                                                                FBUtilities.nowInSeconds(),
                                                                                indexKey,
-                                                                               ColumnFilter.all(indexCfs.metadata),
+                                                                               ColumnFilter.all(indexCfs.metadata()),
                                                                                filter);
         try (ReadExecutionController executionController = command.executionController();
              UnfilteredRowIterator iter = command.queryMemtableAndDisk(indexCfs, executionController))
@@ -555,7 +621,7 @@ public class CassandraIndexTest extends CQLTester
     // Used in order to generate the unique names for indexes
     private static int indexCounter;
 
-    private class TestScript
+    public class TestScript
     {
         String tableDefinition;
         String indexName;
@@ -635,7 +701,7 @@ public class CassandraIndexTest extends CQLTester
             if (updateExpression != null)
                 assertNotNull(postUpdateQueryExpression);
 
-            // first, create the table as we need the CFMetaData to build the other cql statements
+            // first, create the table as we need the Tablemetadata to build the other cql statements
             String tableName = createTable(tableDefinition);
 
             indexName = String.format("index_%s_%d", tableName, indexCounter++);
@@ -738,9 +804,9 @@ public class CassandraIndexTest extends CQLTester
         private void assertPrimaryKeyColumnsOnly(UntypedResultSet resultSet, Object[] row)
         {
             assertFalse(resultSet.isEmpty());
-            CFMetaData cfm = getCurrentColumnFamilyStore().metadata;
+            TableMetadata cfm = getCurrentColumnFamilyStore().metadata();
             int columnCount = cfm.partitionKeyColumns().size();
-            if (cfm.isCompound())
+            if (TableMetadata.Flag.isCompound(cfm.flags))
                 columnCount += cfm.clusteringColumns().size();
             Object[] expected = copyValuesFromRow(row, columnCount);
             assertArrayEquals(expected, copyValuesFromRow(getRows(resultSet)[0], columnCount));
@@ -748,14 +814,12 @@ public class CassandraIndexTest extends CQLTester
 
         private String getInsertCql()
         {
-            CFMetaData cfm = getCurrentColumnFamilyStore().metadata;
+            TableMetadata metadata = getCurrentColumnFamilyStore().metadata();
             String columns = Joiner.on(", ")
-                                   .join(Iterators.transform(cfm.allColumnsInSelectOrder(),
+                                   .join(Iterators.transform(metadata.allColumnsInSelectOrder(),
                                                              (column) -> column.name.toString()));
-            String markers = Joiner.on(", ").join(Iterators.transform(cfm.allColumnsInSelectOrder(),
-                                                                      (column) -> {
-                                                                          return "?";
-                                                                      }));
+            String markers = Joiner.on(", ").join(Iterators.transform(metadata.allColumnsInSelectOrder(),
+                                                                      (column) -> "?"));
             return String.format("INSERT INTO %%s (%s) VALUES (%s)", columns, markers);
         }
 
@@ -774,15 +838,15 @@ public class CassandraIndexTest extends CQLTester
 
         private String getDeletePartitionCql()
         {
-            CFMetaData cfm = getCurrentColumnFamilyStore().metadata;
+            TableMetadata cfm = getCurrentColumnFamilyStore().metadata();
             return StreamSupport.stream(cfm.partitionKeyColumns().spliterator(), false)
                                 .map(column -> column.name.toString() + "=?")
                                 .collect(Collectors.joining(" AND ", "DELETE FROM %s WHERE ", ""));
         }
 
-        private Stream<ColumnDefinition> getPrimaryKeyColumns()
+        private Stream<ColumnMetadata> getPrimaryKeyColumns()
         {
-            CFMetaData cfm = getCurrentColumnFamilyStore().metadata;
+            TableMetadata cfm = getCurrentColumnFamilyStore().metadata();
             if (cfm.isCompactTable())
                 return cfm.partitionKeyColumns().stream();
             else
@@ -791,16 +855,17 @@ public class CassandraIndexTest extends CQLTester
 
         private Object[] getPrimaryKeyValues(Object[] row)
         {
-            CFMetaData cfm = getCurrentColumnFamilyStore().metadata;
+            TableMetadata cfm = getCurrentColumnFamilyStore().metadata();
             if (cfm.isCompactTable())
                 return getPartitionKeyValues(row);
 
             return copyValuesFromRow(row, cfm.partitionKeyColumns().size() + cfm.clusteringColumns().size());
         }
 
+
         private Object[] getPartitionKeyValues(Object[] row)
         {
-            CFMetaData cfm = getCurrentColumnFamilyStore().metadata;
+            TableMetadata cfm = getCurrentColumnFamilyStore().metadata();
             return copyValuesFromRow(row, cfm.partitionKeyColumns().size());
         }
 

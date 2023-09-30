@@ -20,46 +20,55 @@ package org.apache.cassandra.serializers;
 
 import java.nio.BufferUnderflowException;
 import java.nio.ByteBuffer;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.function.Consumer;
 
 import org.apache.cassandra.db.marshal.AbstractType;
-import org.apache.cassandra.transport.ProtocolVersion;
+import org.apache.cassandra.db.marshal.ByteBufferAccessor;
+import org.apache.cassandra.db.marshal.ValueAccessor;
+import org.apache.cassandra.db.marshal.ValueComparators;
 import org.apache.cassandra.utils.Pair;
 
-public class MapSerializer<K, V> extends CollectionSerializer<Map<K, V>>
+public class MapSerializer<K, V> extends AbstractMapSerializer<Map<K, V>>
 {
     // interning instances
-    private static final Map<Pair<TypeSerializer<?>, TypeSerializer<?>>, MapSerializer> instances = new HashMap<Pair<TypeSerializer<?>, TypeSerializer<?>>, MapSerializer>();
+    @SuppressWarnings("rawtypes")
+    private static final ConcurrentMap<Pair<TypeSerializer<?>, TypeSerializer<?>>, MapSerializer> instances = new ConcurrentHashMap<>();
 
     public final TypeSerializer<K> keys;
     public final TypeSerializer<V> values;
-    private final Comparator<Pair<ByteBuffer, ByteBuffer>> comparator;
+    private final ValueComparators comparators;
 
-    public static synchronized <K, V> MapSerializer<K, V> getInstance(TypeSerializer<K> keys, TypeSerializer<V> values, Comparator<ByteBuffer> comparator)
+    @SuppressWarnings("unchecked")
+    public static <K, V> MapSerializer<K, V> getInstance(TypeSerializer<K> keys, TypeSerializer<V> values, ValueComparators comparators)
     {
-        Pair<TypeSerializer<?>, TypeSerializer<?>> p = Pair.<TypeSerializer<?>, TypeSerializer<?>>create(keys, values);
+        Pair<TypeSerializer<?>, TypeSerializer<?>> p = Pair.create(keys, values);
         MapSerializer<K, V> t = instances.get(p);
         if (t == null)
-        {
-            t = new MapSerializer<K, V>(keys, values, comparator);
-            instances.put(p, t);
-        }
+            t = instances.computeIfAbsent(p, k -> new MapSerializer<>(k.left, k.right, comparators));
         return t;
     }
 
-    private MapSerializer(TypeSerializer<K> keys, TypeSerializer<V> values, Comparator<ByteBuffer> comparator)
+    private MapSerializer(TypeSerializer<K> keys, TypeSerializer<V> values, ValueComparators comparators)
     {
+        super(true);
         this.keys = keys;
         this.values = values;
-        this.comparator = (p1, p2) -> comparator.compare(p1.left, p2.left);
+        this.comparators = comparators;
     }
 
+    @Override
     public List<ByteBuffer> serializeValues(Map<K, V> map)
     {
         List<Pair<ByteBuffer, ByteBuffer>> pairs = new ArrayList<>(map.size());
         for (Map.Entry<K, V> entry : map.entrySet())
             pairs.add(Pair.create(keys.serialize(entry.getKey()), values.serialize(entry.getValue())));
-        Collections.sort(pairs, comparator);
+        pairs.sort((l, r) -> comparators.buffer.compare(l.left, r.left));
         List<ByteBuffer> buffers = new ArrayList<>(pairs.size() * 2);
         for (Pair<ByteBuffer, ByteBuffer> p : pairs)
         {
@@ -69,37 +78,50 @@ public class MapSerializer<K, V> extends CollectionSerializer<Map<K, V>>
         return buffers;
     }
 
+    @Override
     public int getElementCount(Map<K, V> value)
     {
         return value.size();
     }
 
-    public void validateForNativeProtocol(ByteBuffer bytes, ProtocolVersion version)
+    @Override
+    public <T> void validate(T input, ValueAccessor<T> accessor)
     {
+        if (accessor.isEmpty(input))
+            throw new MarshalException("Not enough bytes to read a map");
         try
         {
-            ByteBuffer input = bytes.duplicate();
-            int n = readCollectionSize(input, version);
+            // Empty values are still valid.
+            if (accessor.isEmpty(input)) return;
+
+            int n = readCollectionSize(input, accessor);
+            int offset = sizeOfCollectionSize();
             for (int i = 0; i < n; i++)
             {
-                keys.validate(readValue(input, version));
-                values.validate(readValue(input, version));
+                T key = readNonNullValue(input, accessor, offset);
+                offset += sizeOfValue(key, accessor);
+                keys.validate(key, accessor);
+
+                T value = readNonNullValue(input, accessor, offset);
+                offset += sizeOfValue(value, accessor);
+                values.validate(value, accessor);
             }
-            if (input.hasRemaining())
+            if (!accessor.isEmptyFromOffset(input, offset))
                 throw new MarshalException("Unexpected extraneous bytes after map value");
         }
-        catch (BufferUnderflowException e)
+        catch (BufferUnderflowException | IndexOutOfBoundsException e)
         {
             throw new MarshalException("Not enough bytes to read a map");
         }
     }
 
-    public Map<K, V> deserializeForNativeProtocol(ByteBuffer bytes, ProtocolVersion version)
+    @Override
+    public <I> Map<K, V> deserialize(I input, ValueAccessor<I> accessor)
     {
         try
         {
-            ByteBuffer input = bytes.duplicate();
-            int n = readCollectionSize(input, version);
+            int n = readCollectionSize(input, accessor);
+            int offset = sizeOfCollectionSize();
 
             if (n < 0)
                 throw new MarshalException("The data cannot be deserialized as a map");
@@ -108,59 +130,59 @@ public class MapSerializer<K, V> extends CollectionSerializer<Map<K, V>>
             // In such a case we do not want to initialize the map with that initialCapacity as it can result
             // in an OOM when put is called (see CASSANDRA-12618). On the other hand we do not want to have to resize
             // the map if we can avoid it, so we put a reasonable limit on the initialCapacity.
-            Map<K, V> m = new LinkedHashMap<K, V>(Math.min(n, 256));
+            Map<K, V> m = new LinkedHashMap<>(Math.min(n, 256));
             for (int i = 0; i < n; i++)
             {
-                ByteBuffer kbb = readValue(input, version);
-                keys.validate(kbb);
+                I key = readNonNullValue(input, accessor, offset);
+                offset += sizeOfValue(key, accessor);
+                keys.validate(key, accessor);
 
-                ByteBuffer vbb = readValue(input, version);
-                values.validate(vbb);
+                I value = readNonNullValue(input, accessor, offset);
+                offset += sizeOfValue(value, accessor);
+                values.validate(value, accessor);
 
-                m.put(keys.deserialize(kbb), values.deserialize(vbb));
+                m.put(keys.deserialize(key, accessor), values.deserialize(value, accessor));
             }
-            if (input.hasRemaining())
+            if (!accessor.isEmptyFromOffset(input, offset))
                 throw new MarshalException("Unexpected extraneous bytes after map value");
             return m;
         }
-        catch (BufferUnderflowException e)
+        catch (BufferUnderflowException | IndexOutOfBoundsException e)
         {
             throw new MarshalException("Not enough bytes to read a map");
         }
     }
 
-    /**
-     * Given a serialized map, gets the value associated with a given key.
-     * @param serializedMap a serialized map
-     * @param serializedKey a serialized key
-     * @param keyType the key type for the map
-     * @return the value associated with the key if one exists, null otherwise
-     */
-    public ByteBuffer getSerializedValue(ByteBuffer serializedMap, ByteBuffer serializedKey, AbstractType keyType)
+    @Override
+    public ByteBuffer getSerializedValue(ByteBuffer collection, ByteBuffer key, AbstractType<?> comparator)
     {
         try
         {
-            ByteBuffer input = serializedMap.duplicate();
-            int n = readCollectionSize(input, ProtocolVersion.V3);
+            ByteBuffer input = collection.duplicate();
+            int n = readCollectionSize(input, ByteBufferAccessor.instance);
+            int offset = sizeOfCollectionSize();
             for (int i = 0; i < n; i++)
             {
-                ByteBuffer kbb = readValue(input, ProtocolVersion.V3);
-                ByteBuffer vbb = readValue(input, ProtocolVersion.V3);
-                int comparison = keyType.compare(kbb, serializedKey);
+                ByteBuffer kbb = readValue(input, ByteBufferAccessor.instance, offset);
+                offset += sizeOfValue(kbb, ByteBufferAccessor.instance);
+                int comparison = comparator.compareForCQL(kbb, key);
                 if (comparison == 0)
-                    return vbb;
+                    return readValue(input, ByteBufferAccessor.instance, offset);
                 else if (comparison > 0)
                     // since the map is in sorted order, we know we've gone too far and the element doesn't exist
                     return null;
+                else // comparison < 0
+                    offset += skipValue(input, ByteBufferAccessor.instance, offset);
             }
             return null;
         }
-        catch (BufferUnderflowException e)
+        catch (BufferUnderflowException | IndexOutOfBoundsException e)
         {
             throw new MarshalException("Not enough bytes to read a map");
         }
     }
 
+    @Override
     public String toString(Map<K, V> value)
     {
         StringBuilder sb = new StringBuilder();
@@ -180,8 +202,16 @@ public class MapSerializer<K, V> extends CollectionSerializer<Map<K, V>>
         return sb.toString();
     }
 
+    @Override
+    @SuppressWarnings({ "rawtypes", "unchecked" })
     public Class<Map<K, V>> getType()
     {
-        return (Class)Map.class;
+        return (Class) Map.class;
+    }
+
+    @Override
+    public void forEach(ByteBuffer input, Consumer<ByteBuffer> action)
+    {
+        throw new UnsupportedOperationException();
     }
 }

@@ -1,9 +1,30 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package org.apache.cassandra.utils.logging;
 
 import java.lang.management.ManagementFactory;
 import java.security.AccessControlException;
+import java.util.ArrayList;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 import javax.management.JMX;
 import javax.management.ObjectName;
@@ -39,6 +60,8 @@ public class LogbackLoggingSupport implements LoggingSupport
     @Override
     public void onStartup()
     {
+        checkOnlyOneVirtualTableAppender();
+
         // The default logback configuration in conf/logback.xml allows reloading the
         // configuration when the configuration file has changed (every 60 seconds by default).
         // This requires logback to use file I/O APIs. But file I/O is not allowed from UDFs.
@@ -48,6 +71,8 @@ public class LogbackLoggingSupport implements LoggingSupport
         // To work around this, a custom ReconfigureOnChangeFilter is installed, that simply
         // prevents this configuration file check and possible reload of the configuration,
         // while executing sandboxed UDF code.
+        //
+        // NOTE: this is obsolte with logback versions (at least since 1.2.3)
         Logger logbackLogger = (Logger) LoggerFactory.getLogger(ThreadAwareSecurityManager.class);
         LoggerContext ctx = logbackLogger.getLoggerContext();
 
@@ -112,6 +137,46 @@ public class LogbackLoggingSupport implements LoggingSupport
         return logLevelMaps;
     }
 
+    @Override
+    public Optional<Appender<?>> getAppender(Class<?> appenderClass, String name)
+    {
+        LoggerContext lc = (LoggerContext) LoggerFactory.getILoggerFactory();
+        for (Logger logBackLogger : lc.getLoggerList())
+        {
+            for (Iterator<Appender<ILoggingEvent>> iterator = logBackLogger.iteratorForAppenders(); iterator.hasNext();)
+            {
+                Appender<ILoggingEvent> appender = iterator.next();
+                if (appender.getClass() == appenderClass && appender.getName().equals(name))
+                    return Optional.of(appender);
+            }
+        }
+
+        return Optional.empty();
+    }
+
+    private void checkOnlyOneVirtualTableAppender()
+    {
+        int count = 0;
+        LoggerContext lc = (LoggerContext) LoggerFactory.getILoggerFactory();
+        List<String> virtualAppenderNames = new ArrayList<>();
+        for (Logger logBackLogger : lc.getLoggerList())
+        {
+            for (Iterator<Appender<ILoggingEvent>> iterator = logBackLogger.iteratorForAppenders(); iterator.hasNext();)
+            {
+                Appender<?> appender = iterator.next();
+                if (appender instanceof VirtualTableAppender)
+                {
+                    virtualAppenderNames.add(appender.getName());
+                    count += 1;
+                }
+            }
+        }
+
+        if (count > 1)
+            throw new IllegalStateException(String.format("There are multiple appenders of class %s of names %s. There is only one appender of such class allowed.",
+                                                          VirtualTableAppender.class.getName(), String.join(",", virtualAppenderNames)));
+    }
+
     private boolean hasAppenders(Logger logBackLogger)
     {
         Iterator<Appender<ILoggingEvent>> it = logBackLogger.iteratorForAppenders();
@@ -121,6 +186,9 @@ public class LogbackLoggingSupport implements LoggingSupport
     /**
      * The purpose of this class is to prevent logback from checking for config file change,
      * if the current thread is executing a sandboxed thread to avoid {@link AccessControlException}s.
+     *
+     * This is obsolete with logback versions that replaced {@link ReconfigureOnChangeFilter}
+     * with {@link ch.qos.logback.classic.joran.ReconfigureOnChangeTask} (at least logback since 1.2.3).
      */
     private static class SMAwareReconfigureOnChangeFilter extends ReconfigureOnChangeFilter
     {

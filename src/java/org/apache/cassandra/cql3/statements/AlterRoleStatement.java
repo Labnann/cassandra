@@ -17,39 +17,70 @@
  */
 package org.apache.cassandra.cql3.statements;
 
+import org.apache.cassandra.audit.AuditLogContext;
+import org.apache.cassandra.audit.AuditLogEntryType;
 import org.apache.cassandra.auth.*;
 import org.apache.cassandra.auth.IRoleManager.Option;
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.cql3.PasswordObfuscator;
 import org.apache.cassandra.cql3.RoleName;
 import org.apache.cassandra.exceptions.*;
 import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.transport.messages.ResultMessage;
+import org.apache.commons.lang3.builder.ToStringBuilder;
+import org.apache.commons.lang3.builder.ToStringStyle;
+import static org.apache.cassandra.cql3.statements.RequestValidations.*;
 
 public class AlterRoleStatement extends AuthenticationStatement
 {
     private final RoleResource role;
     private final RoleOptions opts;
+    final DCPermissions dcPermissions;
+    final CIDRPermissions cidrPermissions;
+    private final boolean ifExists;
 
     public AlterRoleStatement(RoleName name, RoleOptions opts)
     {
+        this(name, opts, null, null, false);
+    }
+
+    public AlterRoleStatement(RoleName name, RoleOptions opts, DCPermissions dcPermissions,
+                              CIDRPermissions cidrPermissions, boolean ifExists)
+    {
         this.role = RoleResource.role(name.getName());
         this.opts = opts;
+        this.dcPermissions = dcPermissions;
+        this.cidrPermissions = cidrPermissions;
+        this.ifExists = ifExists;
     }
 
     public void validate(ClientState state) throws RequestValidationException
     {
         opts.validate();
 
-        if (opts.isEmpty())
+        if (opts.isEmpty() && dcPermissions == null && cidrPermissions == null)
             throw new InvalidRequestException("ALTER [ROLE|USER] can't be empty");
 
-        // validate login here before checkAccess to avoid leaking user existence to anonymous users.
+        if (dcPermissions != null)
+        {
+            dcPermissions.validate();
+        }
+
+        if (cidrPermissions != null)
+        {
+            // Ensure input CIDR group names are valid, i.e, existing in CIDR groups mapping table
+            cidrPermissions.validate();
+        }
+
+        // validate login here before authorize to avoid leaking user existence to anonymous users.
         state.ensureNotAnonymous();
         if (!DatabaseDescriptor.getRoleManager().isExistingRole(role))
-            throw new InvalidRequestException(String.format("%s doesn't exist", role.getRoleName()));
+        {
+            checkTrue(ifExists, "Role %s doesn't exist", role.getRoleName());
+        }
     }
 
-    public void checkAccess(ClientState state) throws UnauthorizedException
+    public void authorize(ClientState state) throws UnauthorizedException
     {
         AuthenticatedUser user = state.getUser();
         boolean isSuper = user.isSuper();
@@ -85,6 +116,31 @@ public class AlterRoleStatement extends AuthenticationStatement
     {
         if (!opts.isEmpty())
             DatabaseDescriptor.getRoleManager().alterRole(state.getUser(), role, opts);
+
+        if (dcPermissions != null)
+            DatabaseDescriptor.getNetworkAuthorizer().setRoleDatacenters(role, dcPermissions);
+
+        if (cidrPermissions != null)
+            DatabaseDescriptor.getCIDRAuthorizer().setCidrGroupsForRole(role, cidrPermissions);
+
         return null;
+    }
+
+    @Override
+    public String toString()
+    {
+        return ToStringBuilder.reflectionToString(this, ToStringStyle.SHORT_PREFIX_STYLE);
+    }
+
+    @Override
+    public AuditLogContext getAuditLogContext()
+    {
+        return new AuditLogContext(AuditLogEntryType.ALTER_ROLE);
+    }
+
+    @Override
+    public String obfuscatePassword(String query)
+    {
+        return PasswordObfuscator.obfuscate(query, opts);
     }
 }

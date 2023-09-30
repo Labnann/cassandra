@@ -19,14 +19,17 @@ package org.apache.cassandra.cql3.functions;
 
 import java.math.BigDecimal;
 import java.math.BigInteger;
+import java.time.LocalDate;
+import java.time.LocalTime;
+import java.time.ZoneOffset;
+import java.time.ZonedDateTime;
 import java.util.Date;
 
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.serializers.SimpleDateSerializer;
-import org.apache.cassandra.utils.UUIDGen;
-import org.joda.time.DateTime;
-import org.joda.time.DateTimeZone;
-import org.joda.time.format.DateTimeFormat;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.utils.TimeUUID;
+
 import org.junit.Test;
 
 public class CastFctsTest extends CQLTester
@@ -35,24 +38,6 @@ public class CastFctsTest extends CQLTester
     public void testInvalidQueries() throws Throwable
     {
         createTable("CREATE TABLE %s (a int primary key, b text, c double)");
-
-        assertInvalidSyntaxMessage("no viable alternative at input '(' (... b, c) VALUES ([CAST](...)",
-                                   "INSERT INTO %s (a, b, c) VALUES (CAST(? AS int), ?, ?)", 1.6, "test", 6.3);
-
-        assertInvalidSyntaxMessage("no viable alternative at input '(' (..." + KEYSPACE + "." + currentTable()
-                + " SET c = [cast](...)",
-                                   "UPDATE %s SET c = cast(? as double) WHERE a = ?", 1, 1);
-
-        assertInvalidSyntaxMessage("no viable alternative at input '(' (...= ? WHERE a = [CAST] (...)",
-                                   "UPDATE %s SET c = ? WHERE a = CAST (? AS INT)", 1, 2.0);
-
-        assertInvalidSyntaxMessage("no viable alternative at input '(' (..." + KEYSPACE + "." + currentTable()
-                + " WHERE a = [CAST] (...)",
-                                   "DELETE FROM %s WHERE a = CAST (? AS INT)", 1, 2.0);
-
-        assertInvalidSyntaxMessage("no viable alternative at input '(' (..." + KEYSPACE + "." + currentTable()
-                + " WHERE a = [CAST] (...)",
-                                   "SELECT * FROM %s WHERE a = CAST (? AS INT)", 1, 2.0);
 
         assertInvalidMessage("a cannot be cast to boolean", "SELECT CAST(a AS boolean) FROM %s");
     }
@@ -157,7 +142,7 @@ public class CastFctsTest extends CQLTester
                        BigDecimal.valueOf(2),
                        BigDecimal.valueOf(3),
                        BigDecimal.valueOf(4),
-                       BigDecimal.valueOf(5.2F),
+                       new BigDecimal("5.2"),
                        BigDecimal.valueOf(6.3),
                        BigDecimal.valueOf(6.3),
                        BigDecimal.valueOf(4),
@@ -217,25 +202,23 @@ public class CastFctsTest extends CQLTester
     {
         createTable("CREATE TABLE %s (a timeuuid primary key, b timestamp, c date, d time)");
 
-        DateTime dateTime = DateTimeFormat.forPattern("yyyy-MM-dd hh:mm:ss")
-                .withZone(DateTimeZone.UTC)
-                .parseDateTime("2015-05-21 11:03:02");
+        final String yearMonthDay = "2015-05-21";
+        final LocalDate localDate = LocalDate.of(2015, 5, 21);
+        ZonedDateTime date = localDate.atStartOfDay(ZoneOffset.UTC);
 
-        DateTime date = DateTimeFormat.forPattern("yyyy-MM-dd")
-                .withZone(DateTimeZone.UTC)
-                .parseDateTime("2015-05-21");
+        ZonedDateTime dateTime = ZonedDateTime.of(localDate, LocalTime.of(11,3,2), ZoneOffset.UTC);
 
-        long timeInMillis = dateTime.getMillis();
+        long timeInMillis = dateTime.toInstant().toEpochMilli();
 
-        execute("INSERT INTO %s (a, b, c, d) VALUES (?, '2015-05-21 11:03:02+00', '2015-05-21', '11:03:02')",
-                UUIDGen.getTimeUUID(timeInMillis));
+        execute("INSERT INTO %s (a, b, c, d) VALUES (?, '" + yearMonthDay + " 11:03:02+00', '2015-05-21', '11:03:02')",
+                TimeUUID.Generator.atUnixMillis(timeInMillis));
 
         assertRows(execute("SELECT CAST(a AS timestamp), " +
                            "CAST(b AS timestamp), " +
                            "CAST(c AS timestamp) FROM %s"),
-                   row(new Date(dateTime.getMillis()), new Date(dateTime.getMillis()), new Date(date.getMillis())));
+                   row(Date.from(dateTime.toInstant()), Date.from(dateTime.toInstant()), Date.from(date.toInstant())));
 
-        int timeInMillisToDay = SimpleDateSerializer.timeInMillisToDay(date.getMillis());
+        int timeInMillisToDay = SimpleDateSerializer.timeInMillisToDay(date.toInstant().toEpochMilli());
         assertRows(execute("SELECT CAST(a AS date), " +
                            "CAST(b AS date), " +
                            "CAST(c AS date) FROM %s"),
@@ -244,7 +227,7 @@ public class CastFctsTest extends CQLTester
         assertRows(execute("SELECT CAST(b AS text), " +
                            "CAST(c AS text), " +
                            "CAST(d AS text) FROM %s"),
-                   row("2015-05-21T11:03:02.000Z", "2015-05-21", "11:03:02.000000000"));
+                   row(yearMonthDay + "T11:03:02.000Z", yearMonthDay, "11:03:02.000000000"));
     }
 
     @Test
@@ -320,5 +303,257 @@ public class CastFctsTest extends CQLTester
                 "CAST(b AS ascii), " +
                 "CAST(b AS text) FROM %s"),
                    row((byte) 2, (short) 2, 2, 2L, 2.0F, 2.0, BigDecimal.valueOf(2), "2", "2"));
+    }
+
+    /**
+     * Verifies that the {@code CAST} function can be used in the values of {@code INSERT INTO} statements.
+     */
+    @Test
+    public void testCastsInInsertIntoValues() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v int)");
+
+        // Simple cast
+        execute("INSERT INTO %s (k, v) VALUES (1, CAST(1.3 AS int))");
+        assertRows(execute("SELECT v FROM %s"), row(1));
+
+        // Nested casts
+        execute("INSERT INTO %s (k, v) VALUES (1, CAST(CAST(CAST(2.3 AS int) AS float) AS int))");
+        assertRows(execute("SELECT v FROM %s"), row(2));
+
+        // Cast of placeholder with type hint
+        execute("INSERT INTO %s (k, v) VALUES (1, CAST((float) ? AS int))", 3.4f);
+        assertRows(execute("SELECT v FROM %s"), row(3));
+
+        // Cast of placeholder without type hint
+        assertInvalidRequestMessage("Ambiguous call to function system.cast_as_int",
+                                    "INSERT INTO %s (k, v) VALUES (1, CAST(? AS int))", 3.4f);
+
+        // Type hint of cast
+        execute("INSERT INTO %s (k, v) VALUES (1, (int) CAST(4.9 AS int))");
+        assertRows(execute("SELECT v FROM %s"), row(4));
+
+        // Function of cast
+        execute(String.format("INSERT INTO %%s (k, v) VALUES (1, %s(CAST(5 AS float)))", floatToInt()));
+        assertRows(execute("SELECT v FROM %s"), row(5));
+
+        // Cast of function
+        execute(String.format("INSERT INTO %%s (k, v) VALUES (1, CAST(%s(6) AS int))", intToFloat()));
+        assertRows(execute("SELECT v FROM %s"), row(6));
+    }
+
+    /**
+     * Verifies that the {@code CAST} function can be used in the values of {@code UPDATE} statements.
+     */
+    @Test
+    public void testCastsInUpdateValues() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v int)");
+
+        // Simple cast
+        execute("UPDATE %s SET v = CAST(1.3 AS int) WHERE k = 1");
+        assertRows(execute("SELECT v FROM %s"), row(1));
+
+        // Nested casts
+        execute("UPDATE %s SET v = CAST(CAST(CAST(2.3 AS int) AS float) AS int) WHERE k = 1");
+        assertRows(execute("SELECT v FROM %s"), row(2));
+
+        // Cast of placeholder with type hint
+        execute("UPDATE %s SET v = CAST((float) ? AS int) WHERE k = 1", 3.4f);
+        assertRows(execute("SELECT v FROM %s"), row(3));
+
+        // Cast of placeholder without type hint
+        assertInvalidRequestMessage("Ambiguous call to function system.cast_as_int",
+                                    "UPDATE %s SET v = CAST(? AS int) WHERE k = 1", 3.4f);
+
+        // Type hint of cast
+        execute("UPDATE %s SET v = (int) CAST(4.9 AS int) WHERE k = 1");
+        assertRows(execute("SELECT v FROM %s"), row(4));
+
+        // Function of cast
+        execute(String.format("UPDATE %%s SET v = %s(CAST(5 AS float)) WHERE k = 1", floatToInt()));
+        assertRows(execute("SELECT v FROM %s"), row(5));
+
+        // Cast of function
+        execute(String.format("UPDATE %%s SET v = CAST(%s(6) AS int) WHERE k = 1", intToFloat()));
+        assertRows(execute("SELECT v FROM %s"), row(6));
+    }
+
+    /**
+     * Verifies that the {@code CAST} function can be used in the {@code WHERE} clause of {@code UPDATE} statements.
+     */
+    @Test
+    public void testCastsInUpdateWhereClause() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v int)");
+
+        for (int i = 1; i <= 6; i++)
+        {
+            execute("INSERT INTO %s (k) VALUES (?)", i);
+        }
+
+        // Simple cast
+        execute("UPDATE %s SET v = ? WHERE k = CAST(1.3 AS int)", 1);
+        assertRows(execute("SELECT v FROM %s WHERE k = ?", 1), row(1));
+
+        // Nested casts
+        execute("UPDATE %s SET v = ? WHERE k = CAST(CAST(CAST(2.3 AS int) AS float) AS int)", 2);
+        assertRows(execute("SELECT v FROM %s WHERE k = ?", 2), row(2));
+
+        // Cast of placeholder with type hint
+        execute("UPDATE %s SET v = ? WHERE k = CAST((float) ? AS int)", 3, 3.4f);
+        assertRows(execute("SELECT v FROM %s WHERE k = ?", 3), row(3));
+
+        // Cast of placeholder without type hint
+        assertInvalidRequestMessage("Ambiguous call to function system.cast_as_int",
+                                    "UPDATE %s SET v = ? WHERE k = CAST(? AS int)", 3, 3.4f);
+
+        // Type hint of cast
+        execute("UPDATE %s SET v = ? WHERE k = (int) CAST(4.9 AS int)", 4);
+        assertRows(execute("SELECT v FROM %s WHERE k = ?", 4), row(4));
+
+        // Function of cast
+        execute(String.format("UPDATE %%s SET v = ? WHERE k = %s(CAST(5 AS float))", floatToInt()), 5);
+        assertRows(execute("SELECT v FROM %s WHERE k = ?", 5), row(5));
+
+        // Cast of function
+        execute(String.format("UPDATE %%s SET v = ? WHERE k = CAST(%s(6) AS int)", intToFloat()), 6);
+        assertRows(execute("SELECT v FROM %s WHERE k = ?", 6), row(6));
+    }
+
+    /**
+     * Verifies that the {@code CAST} function can be used in the {@code WHERE} clause of {@code SELECT} statements.
+     */
+    @Test
+    public void testCastsInSelectWhereClause() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY)");
+
+        for (int i = 1; i <= 6; i++)
+        {
+            execute("INSERT INTO %s (k) VALUES (?)", i);
+        }
+
+        // Simple cast
+        assertRows(execute("SELECT k FROM %s WHERE k = CAST(1.3 AS int)"), row(1));
+
+        // Nested casts
+        assertRows(execute("SELECT k FROM %s WHERE k = CAST(CAST(CAST(2.3 AS int) AS float) AS int)"), row(2));
+
+        // Cast of placeholder with type hint
+        assertRows(execute("SELECT k FROM %s WHERE k = CAST((float) ? AS int)", 3.4f), row(3));
+
+        // Cast of placeholder without type hint
+        assertInvalidRequestMessage("Ambiguous call to function system.cast_as_int",
+                                    "SELECT k FROM %s WHERE k = CAST(? AS int)", 3.4f);
+
+        // Type hint of cast
+        assertRows(execute("SELECT k FROM %s WHERE k = (int) CAST(4.9 AS int)"), row(4));
+
+        // Function of cast
+        assertRows(execute(String.format("SELECT k FROM %%s WHERE k = %s(CAST(5 AS float))", floatToInt())), row(5));
+
+        // Cast of function
+        assertRows(execute(String.format("SELECT k FROM %%s WHERE k = CAST(%s(6) AS int)", intToFloat())), row(6));
+    }
+
+    /**
+     * Verifies that the {@code CAST} function can be used in the {@code WHERE} clause of {@code DELETE} statements.
+     */
+    @Test
+    public void testCastsInDeleteWhereClause() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY)");
+
+        for (int i = 1; i <= 6; i++)
+        {
+            execute("INSERT INTO %s (k) VALUES (?)", i);
+        }
+
+        // Simple cast
+        execute("DELETE FROM %s WHERE k = CAST(1.3 AS int)");
+        assertEmpty(execute("SELECT * FROM %s WHERE k = ?", 1));
+
+        // Nested casts
+        execute("DELETE FROM %s WHERE k = CAST(CAST(CAST(2.3 AS int) AS float) AS int)");
+        assertEmpty(execute("SELECT * FROM %s WHERE k = ?", 2));
+
+        // Cast of placeholder with type hint
+        execute("DELETE FROM %s WHERE k = CAST((float) ? AS int)", 3.4f);
+        assertEmpty(execute("SELECT * FROM %s WHERE k = ?", 3));
+
+        // Cast of placeholder without type hint
+        assertInvalidRequestMessage("Ambiguous call to function system.cast_as_int",
+                                    "DELETE FROM %s WHERE k = CAST(? AS int)", 3.4f);
+
+        // Type hint of cast
+        execute("DELETE FROM %s WHERE k = (int) CAST(4.9 AS int)");
+        assertEmpty(execute("SELECT * FROM %s WHERE k = ?", 4));
+
+        // Function of cast
+        execute(String.format("DELETE FROM %%s WHERE k = %s(CAST(5 AS float))", floatToInt()));
+        assertEmpty(execute("SELECT * FROM %s WHERE k = ?", 5));
+
+        // Cast of function
+        execute(String.format("DELETE FROM %%s WHERE k = CAST(%s(6) AS int)", intToFloat()));
+        assertEmpty(execute("SELECT * FROM %s WHERE k = ?", 6));
+    }
+
+    /**
+     * Creates a CQL function that casts an {@code int} argument into a {@code float}.
+     *
+     * @return the name of the created function
+     */
+    private String floatToInt() throws Throwable
+    {
+        return createFunction(KEYSPACE,
+                              "int, int",
+                              "CREATE FUNCTION IF NOT EXISTS %s (x float) " +
+                              "CALLED ON NULL INPUT " +
+                              "RETURNS int " +
+                              "LANGUAGE java " +
+                              "AS 'return Float.valueOf(x).intValue();'");
+    }
+
+    /**
+     * Creates a CQL function that casts a {@code float} argument into an {@code int}.
+     *
+     * @return the name of the created function
+     */
+    private String intToFloat() throws Throwable
+    {
+        return createFunction(KEYSPACE,
+                              "int, int",
+                              "CREATE FUNCTION IF NOT EXISTS %s (x int) " +
+                              "CALLED ON NULL INPUT " +
+                              "RETURNS float " +
+                              "LANGUAGE java " +
+                              "AS 'return (float) x;'");
+    }
+
+    /**
+     * Verifies that the {@code CAST} function can be used in the {@code WHERE} clause of {@code CREATE MATERIALIZED
+     * VIEW} statements.
+     */
+    @Test
+    public void testCastsInCreateViewWhereClause() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v int)");
+
+        String viewName = keyspace() + ".mv_with_cast";
+        execute(String.format("CREATE MATERIALIZED VIEW %s AS SELECT * FROM %%s" +
+                              "   WHERE k < CAST(3.14 AS int) AND v IS NOT NULL" +
+                              "   PRIMARY KEY (v, k)", viewName));
+
+        // start storage service so MV writes are applied
+        StorageService.instance.initServer();
+
+        execute("INSERT INTO %s (k, v) VALUES (1, 10)");
+        execute("INSERT INTO %s (k, v) VALUES (2, 20)");
+        execute("INSERT INTO %s (k, v) VALUES (3, 30)");
+
+        assertRows(execute(String.format("SELECT * FROM %s", viewName)), row(10, 1), row(20, 2));
+
+        execute("DROP MATERIALIZED VIEW " + viewName);
     }
 }

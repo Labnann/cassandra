@@ -70,6 +70,14 @@ public interface Term
      */
     public abstract boolean containsBindMarker();
 
+    /**
+     * Whether that term is terminal (this is a shortcut for {@code this instanceof Term.Terminal}).
+     */
+    default public boolean isTerminal()
+    {
+        return false; // overriden below by Terminal
+    }
+
     public void addFunctionsTo(List<Function> functions);
 
     /**
@@ -105,16 +113,34 @@ public interface Term
          *
          * @param keyspace the keyspace on which the statement containing this term is on.
          * @return the type of this {@code Term} if inferrable, or {@code null}
-         * otherwise (for instance, the type isn't inferable for a bind marker. Even for
+         * otherwise (for instance, the type isn't inferrable for a bind marker. Even for
          * literals, the exact type is not inferrable since they are valid for many
          * different types and so this will return {@code null} too).
          */
         public abstract AbstractType<?> getExactTypeIfKnown(String keyspace);
 
         @Override
+        public AbstractType<?> getCompatibleTypeIfKnown(String keyspace)
+        {
+            return getExactTypeIfKnown(keyspace);
+        }
+
+        @Override
         public String toString()
         {
             return getText();
+        }
+
+        @Override
+        public int hashCode()
+        {
+            return getText().hashCode();
+        }
+
+        @Override
+        public boolean equals(Object o)
+        {
+            return this == o || (o instanceof Raw && getText().equals(((Raw) o).getText()));
         }
     }
 
@@ -153,11 +179,16 @@ public interface Term
             return false;
         }
 
+        @Override
+        public boolean isTerminal()
+        {
+            return true;
+        }
+
         /**
          * @return the serialized value of this terminal.
-         * @param protocolVersion
          */
-        public abstract ByteBuffer get(ProtocolVersion protocolVersion) throws InvalidRequestException;
+        public abstract ByteBuffer get(ProtocolVersion version) throws InvalidRequestException;
 
         public ByteBuffer bindAndGet(QueryOptions options) throws InvalidRequestException
         {

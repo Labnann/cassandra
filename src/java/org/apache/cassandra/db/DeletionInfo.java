@@ -21,7 +21,7 @@ import java.util.Iterator;
 
 import org.apache.cassandra.cache.IMeasurableMemory;
 import org.apache.cassandra.db.rows.EncodingStats;
-import org.apache.cassandra.utils.memory.AbstractAllocator;
+import org.apache.cassandra.utils.memory.ByteBufferCloner;
 
 /**
  * A combination of a top-level (partition) tombstone and range tombstones describing the deletions
@@ -52,7 +52,7 @@ public interface DeletionInfo extends IMeasurableMemory
 
     public Iterator<RangeTombstone> rangeIterator(Slice slice, boolean reversed);
 
-    public RangeTombstone rangeCovering(Clustering name);
+    public RangeTombstone rangeCovering(Clustering<?> name);
 
     public void collectStats(EncodingStats.Collector collector);
 
@@ -70,5 +70,6 @@ public interface DeletionInfo extends IMeasurableMemory
     public boolean mayModify(DeletionInfo delInfo);
 
     public MutableDeletionInfo mutableCopy();
-    public DeletionInfo copy(AbstractAllocator allocator);
+
+    public DeletionInfo clone(ByteBufferCloner cloner);
 }

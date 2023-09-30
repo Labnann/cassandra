@@ -17,8 +17,8 @@
  */
 package org.apache.cassandra.tools.nodetool;
 
-import io.airlift.command.Command;
-import io.airlift.command.Option;
+import io.airlift.airline.Command;
+import io.airlift.airline.Option;
 import org.apache.cassandra.tools.NodeProbe;
 import org.apache.cassandra.tools.NodeTool.NodeToolCmd;
 import org.apache.cassandra.tools.nodetool.stats.CompactionHistoryHolder;
@@ -43,6 +43,6 @@ public class CompactionHistory extends NodeToolCmd
         }
         StatsHolder data = new CompactionHistoryHolder(probe);
         StatsPrinter printer = CompactionHistoryPrinter.from(outputFormat);
-        printer.print(data, System.out);
+        printer.print(data, probe.output().out);
     }
 }

@@ -20,7 +20,7 @@ package org.apache.cassandra.service.pager;
 import java.nio.ByteBuffer;
 import java.util.NoSuchElementException;
 
-import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.aggregation.GroupingState;
 import org.apache.cassandra.db.filter.DataLimits;
@@ -28,6 +28,8 @@ import org.apache.cassandra.db.partitions.PartitionIterator;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.rows.RowIterator;
 import org.apache.cassandra.service.ClientState;
+
+import static org.apache.cassandra.utils.Clock.Global.nanoTime;
 
 /**
  * {@code QueryPager} that takes care of fetching the pages for aggregation queries.
@@ -71,9 +73,9 @@ public final class AggregationQueryPager implements QueryPager
     public PartitionIterator fetchPageInternal(int pageSize, ReadExecutionController executionController)
     {
         if (limits.isGroupByLimit())
-            return new GroupByPartitionIterator(pageSize, executionController, System.nanoTime());
+            return new GroupByPartitionIterator(pageSize, executionController, nanoTime());
 
-        return new AggregationPartitionIterator(pageSize, executionController, System.nanoTime());
+        return new AggregationPartitionIterator(pageSize, executionController, nanoTime());
     }
 
     @Override
@@ -146,7 +148,7 @@ public final class AggregationQueryPager implements QueryPager
         /**
          * The clustering of the last row processed
          */
-        private Clustering lastClustering;
+        private Clustering<?> lastClustering;
 
         /**
          * The initial amount of row remaining
@@ -260,7 +262,7 @@ public final class AggregationQueryPager implements QueryPager
         protected QueryPager updatePagerLimit(QueryPager pager,
                                               DataLimits limits,
                                               ByteBuffer lastPartitionKey,
-                                              Clustering lastClustering)
+                                              Clustering<?> lastClustering)
         {
             GroupingState state = new GroupingState(lastPartitionKey, lastClustering);
             DataLimits newLimits = limits.forGroupByInternalPaging(state);
@@ -319,7 +321,7 @@ public final class AggregationQueryPager implements QueryPager
                 this.rowIterator = delegate;
             }
 
-            public CFMetaData metadata()
+            public TableMetadata metadata()
             {
                 return rowIterator.metadata();
             }
@@ -329,7 +331,7 @@ public final class AggregationQueryPager implements QueryPager
                 return rowIterator.isReverseOrder();
             }
 
-            public PartitionColumns columns()
+            public RegularAndStaticColumns columns()
             {
                 return rowIterator.columns();
             }
@@ -417,7 +419,7 @@ public final class AggregationQueryPager implements QueryPager
         protected QueryPager updatePagerLimit(QueryPager pager,
                                               DataLimits limits,
                                               ByteBuffer lastPartitionKey,
-                                              Clustering lastClustering)
+                                              Clustering<?> lastClustering)
         {
             return pager;
         }

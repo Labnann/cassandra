@@ -18,20 +18,19 @@
 
 package org.apache.cassandra.tools;
 
-import java.io.File;
 
+import org.apache.cassandra.io.util.File;
 import org.junit.Test;
-import org.junit.runner.RunWith;
 
-import org.apache.cassandra.OrderedJUnit4ClassRunner;
+import org.apache.cassandra.tools.ToolRunner.ToolResult;
 
-@RunWith(OrderedJUnit4ClassRunner.class)
-public class CompactionStressTest extends ToolsTester
+public class CompactionStressTest extends OfflineToolUtils
 {
     @Test
     public void testNoArgs()
     {
-        runTool(0, "org.apache.cassandra.stress.CompactionStress");
+        ToolResult tool = ToolRunner.invokeClass("org.apache.cassandra.stress.CompactionStress");
+        tool.assertOnCleanExit();
     }
 
     @Test
@@ -39,22 +38,28 @@ public class CompactionStressTest extends ToolsTester
     {
         ClassLoader classLoader = getClass().getClassLoader();
         File file = new File(classLoader.getResource("blogpost.yaml").getFile());
-        String profileFile = file.getAbsolutePath();
+        String profileFile = file.absolutePath();
 
-        runTool(0,
-                "org.apache.cassandra.stress.CompactionStress",
-                "write",
-                "-d", "build/test/cassandra",
-                "-g", "0",
-                "-p", profileFile,
-                "-t", "4");
+        ToolResult tool = ToolRunner.invokeClass("org.apache.cassandra.stress.CompactionStress",
+                                                 "write",
+                                                 "-d",
+                                                 "build/test/cassandra",
+                                                 "-g",
+                                                 "0",
+                                                 "-p",
+                                                 profileFile,
+                                                 "-t",
+                                                 "4");
+        tool.assertOnCleanExit();
 
-        runTool(0,
-                "org.apache.cassandra.stress.CompactionStress",
-                "compact",
-                "-d", "build/test/cassandra",
-                "-p", profileFile,
-                "-t", "4");
+        tool = ToolRunner.invokeClass("org.apache.cassandra.stress.CompactionStress",
+                                      "compact",
+                                      "-d",
+                                      "build/test/cassandra",
+                                      "-p",
+                                      profileFile,
+                                      "-t",
+                                      "4");
+              tool.assertOnCleanExit();
     }
-
 }

@@ -17,14 +17,15 @@
  */
 package org.apache.cassandra.io.sstable;
 
-import java.io.File;
 import java.io.IOException;
 
 import com.google.common.base.Throwables;
 
-import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.RegularAndStaticColumns;
 import org.apache.cassandra.db.partitions.PartitionUpdate;
+import org.apache.cassandra.io.util.File;
+import org.apache.cassandra.schema.TableMetadataRef;
 
 /**
  * A SSTable writer that assumes rows are in (partitioner) sorted order.
@@ -39,24 +40,24 @@ import org.apache.cassandra.db.partitions.PartitionUpdate;
 class SSTableSimpleWriter extends AbstractSSTableSimpleWriter
 {
     protected DecoratedKey currentKey;
-    protected PartitionUpdate update;
+    protected PartitionUpdate.Builder update;
 
     private SSTableTxnWriter writer;
 
-    protected SSTableSimpleWriter(File directory, CFMetaData metadata, PartitionColumns columns)
+    protected SSTableSimpleWriter(File directory, TableMetadataRef metadata, RegularAndStaticColumns columns)
     {
         super(directory, metadata, columns);
     }
 
-    private SSTableTxnWriter getOrCreateWriter()
+    private SSTableTxnWriter getOrCreateWriter() throws IOException
     {
         if (writer == null)
-            writer = createWriter();
+            writer = createWriter(null);
 
         return writer;
     }
 
-    PartitionUpdate getUpdateFor(DecoratedKey key) throws IOException
+    PartitionUpdate.Builder getUpdateFor(DecoratedKey key) throws IOException
     {
         assert key != null;
 
@@ -65,9 +66,9 @@ class SSTableSimpleWriter extends AbstractSSTableSimpleWriter
         if (!key.equals(currentKey))
         {
             if (update != null)
-                writePartition(update);
+                writePartition(update.build());
             currentKey = key;
-            update = new PartitionUpdate(metadata, currentKey, columns, 4);
+            update = new PartitionUpdate.Builder(metadata.get(), currentKey, columns, 4);
         }
 
         assert update != null;
@@ -79,13 +80,15 @@ class SSTableSimpleWriter extends AbstractSSTableSimpleWriter
         try
         {
             if (update != null)
-                writePartition(update);
+                writePartition(update.build());
             if (writer != null)
                 writer.finish(false);
         }
         catch (Throwable t)
         {
-            throw Throwables.propagate(writer == null ? t : writer.abort(t));
+            Throwable e = writer == null ? t : writer.abort(t);
+            Throwables.throwIfUnchecked(e);
+            throw new RuntimeException(e);
         }
     }
 

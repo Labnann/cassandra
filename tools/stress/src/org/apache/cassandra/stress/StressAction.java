@@ -33,12 +33,13 @@ import org.apache.cassandra.stress.settings.SettingsCommand;
 import org.apache.cassandra.stress.settings.StressSettings;
 import org.apache.cassandra.stress.util.JavaDriverClient;
 import org.apache.cassandra.stress.util.ResultLogger;
-import org.apache.cassandra.stress.util.ThriftClient;
 import org.apache.cassandra.transport.SimpleClient;
 import org.jctools.queues.SpscArrayQueue;
 import org.jctools.queues.SpscUnboundedArrayQueue;
 
 import com.google.common.util.concurrent.Uninterruptibles;
+
+import static org.apache.cassandra.utils.Clock.Global.nanoTime;
 
 public class StressAction implements Runnable
 {
@@ -316,7 +317,7 @@ public class StressAction implements Runnable
 
         void start()
         {
-            start = System.nanoTime();
+            start = nanoTime();
         }
 
         /**
@@ -362,7 +363,7 @@ public class StressAction implements Runnable
                 long intendedTime = rateLimiter.acquire(partitionCount);
                 op.intendedStartNs(intendedTime);
                 long now;
-                while ((now = System.nanoTime()) < intendedTime)
+                while ((now = nanoTime()) < intendedTime)
                 {
                     LockSupport.parkNanos(intendedTime - now);
                 }
@@ -427,7 +428,6 @@ public class StressAction implements Runnable
             try
             {
                 SimpleClient sclient = null;
-                ThriftClient tclient = null;
                 JavaDriverClient jclient = null;
                 final ConnectionAPI clientType = settings.mode.api;
 
@@ -440,10 +440,6 @@ public class StressAction implements Runnable
                             break;
                         case SIMPLE_NATIVE:
                             sclient = settings.getSimpleNativeClient();
-                            break;
-                        case THRIFT:
-                        case THRIFT_SMART:
-                            tclient = settings.getThriftClient();
                             break;
                         default:
                             throw new IllegalStateException();
@@ -474,10 +470,8 @@ public class StressAction implements Runnable
                             case SIMPLE_NATIVE:
                                 op.run(sclient);
                                 break;
-                            case THRIFT:
-                            case THRIFT_SMART:
                             default:
-                                op.run(tclient);
+                                throw new IllegalStateException();
                         }
                     }
                     catch (Exception e)

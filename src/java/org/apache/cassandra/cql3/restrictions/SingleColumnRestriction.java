@@ -22,16 +22,16 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 
-import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.schema.ColumnMetadata;
+import org.apache.cassandra.serializers.ListSerializer;
 import org.apache.cassandra.cql3.*;
 import org.apache.cassandra.cql3.Term.Terminal;
 import org.apache.cassandra.cql3.functions.Function;
 import org.apache.cassandra.cql3.statements.Bound;
 import org.apache.cassandra.db.MultiCBuilder;
 import org.apache.cassandra.db.filter.RowFilter;
-import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.index.Index;
-import org.apache.cassandra.index.SecondaryIndexManager;
+import org.apache.cassandra.index.IndexRegistry;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.Pair;
 
@@ -46,39 +46,49 @@ public abstract class SingleColumnRestriction implements SingleRestriction
     /**
      * The definition of the column to which apply the restriction.
      */
-    protected final ColumnDefinition columnDef;
+    protected final ColumnMetadata columnDef;
 
-    public SingleColumnRestriction(ColumnDefinition columnDef)
+    public SingleColumnRestriction(ColumnMetadata columnDef)
     {
         this.columnDef = columnDef;
     }
 
     @Override
-    public List<ColumnDefinition> getColumnDefs()
+    public List<ColumnMetadata> getColumnDefs()
     {
         return Collections.singletonList(columnDef);
     }
 
     @Override
-    public ColumnDefinition getFirstColumn()
+    public ColumnMetadata getFirstColumn()
     {
         return columnDef;
     }
 
     @Override
-    public ColumnDefinition getLastColumn()
+    public ColumnMetadata getLastColumn()
     {
         return columnDef;
     }
 
     @Override
-    public boolean hasSupportingIndex(SecondaryIndexManager indexManager)
+    public boolean hasSupportingIndex(IndexRegistry indexRegistry)
     {
-        for (Index index : indexManager.listIndexes())
+        for (Index index : indexRegistry.listIndexes())
             if (isSupportedBy(index))
                 return true;
 
         return false;
+    }
+
+    @Override
+    public boolean needsFiltering(Index.Group indexGroup)
+    {
+        for (Index index : indexGroup.getIndexes())
+            if (isSupportedBy(index))
+                return false;
+
+        return true;
     }
 
     @Override
@@ -122,11 +132,11 @@ public abstract class SingleColumnRestriction implements SingleRestriction
      */
     protected abstract boolean isSupportedBy(Index index);
 
-    public static class EQRestriction extends SingleColumnRestriction
+    public static final class EQRestriction extends SingleColumnRestriction
     {
-        public final Term value;
+        private final Term value;
 
-        public EQRestriction(ColumnDefinition columnDef, Term value)
+        public EQRestriction(ColumnMetadata columnDef, Term value)
         {
             super(columnDef);
             this.value = value;
@@ -151,8 +161,8 @@ public abstract class SingleColumnRestriction implements SingleRestriction
         }
 
         @Override
-        public void addRowFilterTo(RowFilter filter,
-                                   SecondaryIndexManager indexManager,
+        public void addToRowFilter(RowFilter filter,
+                                   IndexRegistry indexRegistry,
                                    QueryOptions options)
         {
             filter.add(columnDef, Operator.EQ, value.bindAndGet(options));
@@ -188,7 +198,7 @@ public abstract class SingleColumnRestriction implements SingleRestriction
 
     public static abstract class INRestriction extends SingleColumnRestriction
     {
-        public INRestriction(ColumnDefinition columnDef)
+        public INRestriction(ColumnMetadata columnDef)
         {
             super(columnDef);
         }
@@ -215,11 +225,13 @@ public abstract class SingleColumnRestriction implements SingleRestriction
         }
 
         @Override
-        public void addRowFilterTo(RowFilter filter,
-                                   SecondaryIndexManager indexManager,
+        public void addToRowFilter(RowFilter filter,
+                                   IndexRegistry indexRegistry,
                                    QueryOptions options)
         {
-            throw invalidRequest("IN restrictions are not supported on indexed columns");
+            List<ByteBuffer> values = getValues(options);
+            ByteBuffer buffer = ListSerializer.pack(values, values.size());
+            filter.add(columnDef, Operator.IN, buffer);
         }
 
         @Override
@@ -235,7 +247,7 @@ public abstract class SingleColumnRestriction implements SingleRestriction
     {
         protected final List<Term> values;
 
-        public InRestrictionWithValues(ColumnDefinition columnDef, List<Term> values)
+        public InRestrictionWithValues(ColumnMetadata columnDef, List<Term> values)
         {
             super(columnDef);
             this.values = values;
@@ -273,7 +285,7 @@ public abstract class SingleColumnRestriction implements SingleRestriction
     {
         protected final AbstractMarker marker;
 
-        public InRestrictionWithMarker(ColumnDefinition columnDef, AbstractMarker marker)
+        public InRestrictionWithMarker(ColumnMetadata columnDef, AbstractMarker marker)
         {
             super(columnDef);
             this.marker = marker;
@@ -309,9 +321,9 @@ public abstract class SingleColumnRestriction implements SingleRestriction
 
     public static class SliceRestriction extends SingleColumnRestriction
     {
-        public final TermSlice slice;
+        private final TermSlice slice;
 
-        public SliceRestriction(ColumnDefinition columnDef, Bound bound, boolean inclusive, Term term)
+        public SliceRestriction(ColumnMetadata columnDef, Bound bound, boolean inclusive, Term term)
         {
             super(columnDef);
             slice = TermSlice.newInstance(bound, inclusive, term);
@@ -386,7 +398,7 @@ public abstract class SingleColumnRestriction implements SingleRestriction
         }
 
         @Override
-        public void addRowFilterTo(RowFilter filter, SecondaryIndexManager indexManager, QueryOptions options)
+        public void addToRowFilter(RowFilter filter, IndexRegistry indexRegistry, QueryOptions options)
         {
             for (Bound b : Bound.values())
                 if (hasBound(b))
@@ -405,7 +417,7 @@ public abstract class SingleColumnRestriction implements SingleRestriction
             return String.format("SLICE%s", slice);
         }
 
-        SliceRestriction(ColumnDefinition columnDef, TermSlice slice)
+        private SliceRestriction(ColumnMetadata columnDef, TermSlice slice)
         {
             super(columnDef);
             this.slice = slice;
@@ -415,12 +427,12 @@ public abstract class SingleColumnRestriction implements SingleRestriction
     // This holds CONTAINS, CONTAINS_KEY, and map[key] = value restrictions because we might want to have any combination of them.
     public static final class ContainsRestriction extends SingleColumnRestriction
     {
-        private List<Term> values = new ArrayList<>(); // for CONTAINS
-        private List<Term> keys = new ArrayList<>(); // for CONTAINS_KEY
-        private List<Term> entryKeys = new ArrayList<>(); // for map[key] = value
-        private List<Term> entryValues = new ArrayList<>(); // for map[key] = value
+        private final List<Term> values = new ArrayList<>(); // for CONTAINS
+        private final List<Term> keys = new ArrayList<>(); // for CONTAINS_KEY
+        private final List<Term> entryKeys = new ArrayList<>(); // for map[key] = value
+        private final List<Term> entryValues = new ArrayList<>(); // for map[key] = value
 
-        public ContainsRestriction(ColumnDefinition columnDef, Term t, boolean isKey)
+        public ContainsRestriction(ColumnMetadata columnDef, Term t, boolean isKey)
         {
             super(columnDef);
             if (isKey)
@@ -429,7 +441,7 @@ public abstract class SingleColumnRestriction implements SingleRestriction
                 values.add(t);
         }
 
-        public ContainsRestriction(ColumnDefinition columnDef, Term mapKey, Term mapValue)
+        public ContainsRestriction(ColumnMetadata columnDef, Term mapKey, Term mapValue)
         {
             super(columnDef);
             entryKeys.add(mapKey);
@@ -476,7 +488,7 @@ public abstract class SingleColumnRestriction implements SingleRestriction
         }
 
         @Override
-        public void addRowFilterTo(RowFilter filter, SecondaryIndexManager indexManager, QueryOptions options)
+        public void addToRowFilter(RowFilter filter, IndexRegistry indexRegistry, QueryOptions options)
         {
             for (ByteBuffer value : bindAndGet(values, options))
                 filter.add(columnDef, Operator.CONTAINS, value);
@@ -505,6 +517,21 @@ public abstract class SingleColumnRestriction implements SingleRestriction
                 supported |= index.supportsExpression(columnDef, Operator.EQ);
 
             return supported;
+        }
+
+        @Override
+        public boolean needsFiltering(Index.Group indexGroup)
+        {
+            // multiple contains might require filtering on some indexes, since that is equivalent to a disjunction (or)
+            boolean hasMultipleContains = (numberOfValues() + numberOfKeys() + numberOfEntries()) > 1;
+
+            for (Index index : indexGroup.getIndexes())
+            {
+                if (isSupportedBy(index) && !(hasMultipleContains && index.filtersMultipleContains()))
+                    return false;
+            }
+
+            return true;
         }
 
         public int numberOfValues()
@@ -584,7 +611,7 @@ public abstract class SingleColumnRestriction implements SingleRestriction
             to.entryValues.addAll(from.entryValues);
         }
 
-        private ContainsRestriction(ColumnDefinition columnDef)
+        private ContainsRestriction(ColumnMetadata columnDef)
         {
             super(columnDef);
         }
@@ -592,7 +619,7 @@ public abstract class SingleColumnRestriction implements SingleRestriction
 
     public static final class IsNotNullRestriction extends SingleColumnRestriction
     {
-        public IsNotNullRestriction(ColumnDefinition columnDef)
+        public IsNotNullRestriction(ColumnMetadata columnDef)
         {
             super(columnDef);
         }
@@ -615,8 +642,8 @@ public abstract class SingleColumnRestriction implements SingleRestriction
         }
 
         @Override
-        public void addRowFilterTo(RowFilter filter,
-                                   SecondaryIndexManager indexManager,
+        public void addToRowFilter(RowFilter filter,
+                                   IndexRegistry indexRegistry,
                                    QueryOptions options)
         {
             throw new UnsupportedOperationException("Secondary indexes do not support IS NOT NULL restrictions");
@@ -653,7 +680,7 @@ public abstract class SingleColumnRestriction implements SingleRestriction
         private final Operator operator;
         private final Term value;
 
-        public LikeRestriction(ColumnDefinition columnDef, Operator operator, Term value)
+        public LikeRestriction(ColumnMetadata columnDef, Operator operator, Term value)
         {
             super(columnDef);
             this.operator = operator;
@@ -691,17 +718,17 @@ public abstract class SingleColumnRestriction implements SingleRestriction
         }
 
         @Override
-        public void addRowFilterTo(RowFilter filter,
-                                   SecondaryIndexManager indexManager,
+        public void addToRowFilter(RowFilter filter,
+                                   IndexRegistry indexRegistry,
                                    QueryOptions options)
         {
             Pair<Operator, ByteBuffer> operation = makeSpecific(value.bindAndGet(options));
 
             // there must be a suitable INDEX for LIKE_XXX expressions
             RowFilter.SimpleExpression expression = filter.add(columnDef, operation.left, operation.right);
-            indexManager.getBestIndexFor(expression)
-                        .orElseThrow(() -> invalidRequest("%s is only supported on properly indexed columns",
-                                                          expression));
+            indexRegistry.getBestIndexFor(expression)
+                         .orElseThrow(() -> invalidRequest("%s is only supported on properly indexed columns",
+                                                           expression));
         }
 
         @Override
@@ -775,204 +802,6 @@ public abstract class SingleColumnRestriction implements SingleRestriction
             newValue.position(beginIndex);
             newValue.limit(endIndex);
             return Pair.create(operator, newValue);
-        }
-    }
-
-    /**
-     * Super Column Compatibiltiy
-     */
-
-    public static class SuperColumnMultiEQRestriction extends EQRestriction
-    {
-        public ByteBuffer firstValue;
-        public ByteBuffer secondValue;
-
-        public SuperColumnMultiEQRestriction(ColumnDefinition columnDef, Term value)
-        {
-            super(columnDef, value);
-        }
-
-        @Override
-        public MultiCBuilder appendTo(MultiCBuilder builder, QueryOptions options)
-        {
-            Term term = value.bind(options);
-
-            assert (term instanceof Tuples.Value);
-            firstValue = ((Tuples.Value)term).getElements().get(0);
-            secondValue = ((Tuples.Value)term).getElements().get(1);
-
-            builder.addElementToAll(firstValue);
-            checkFalse(builder.containsNull(), "Invalid null value in condition for column %s", columnDef.name);
-            checkFalse(builder.containsUnset(), "Invalid unset value for column %s", columnDef.name);
-            return builder;
-        }
-    }
-
-    public static class SuperColumnMultiSliceRestriction extends SliceRestriction
-    {
-        public ByteBuffer firstValue;
-        public ByteBuffer secondValue;
-
-        // These are here to avoid polluting SliceRestriction
-        public final Bound bound;
-        public final boolean trueInclusive;
-        public SuperColumnMultiSliceRestriction(ColumnDefinition columnDef, Bound bound, boolean inclusive, Term term)
-        {
-            super(columnDef, bound, true, term);
-            this.bound = bound;
-            this.trueInclusive = inclusive;
-
-        }
-
-        @Override
-        public MultiCBuilder appendBoundTo(MultiCBuilder builder, Bound bound, QueryOptions options)
-        {
-            Bound b = bound.reverseIfNeeded(getFirstColumn());
-
-            if (!hasBound(b))
-                return builder;
-
-            Term term = slice.bound(b);
-
-            assert (term instanceof Tuples.Value);
-            firstValue = ((Tuples.Value)term).getElements().get(0);
-            secondValue = ((Tuples.Value)term).getElements().get(1);
-
-            checkBindValueSet(firstValue, "Invalid unset value for column %s", columnDef.name);
-            checkBindValueSet(secondValue, "Invalid unset value for column %s", columnDef.name);
-            return builder.addElementToAll(firstValue);
-
-        }
-    }
-
-    public static final class SuperColumnKeyEQRestriction extends EQRestriction
-    {
-        public SuperColumnKeyEQRestriction(ColumnDefinition columnDef, Term value)
-        {
-            super(columnDef, value);
-        }
-
-        public ByteBuffer bindValue(QueryOptions options)
-        {
-            return value.bindAndGet(options);
-        }
-
-        @Override
-        public MultiCBuilder appendBoundTo(MultiCBuilder builder, Bound bound, QueryOptions options)
-        {
-            // no-op
-            return builder;
-        }
-
-        @Override
-        public void addRowFilterTo(RowFilter filter, SecondaryIndexManager indexManager, QueryOptions options) throws InvalidRequestException
-        {
-            // no-op
-        }
-    }
-
-    public static abstract class SuperColumnKeyINRestriction extends INRestriction
-    {
-        public SuperColumnKeyINRestriction(ColumnDefinition columnDef)
-        {
-            super(columnDef);
-        }
-
-        @Override
-        public MultiCBuilder appendTo(MultiCBuilder builder, QueryOptions options)
-        {
-            // no-op
-            return builder;
-        }
-
-        @Override
-        public void addRowFilterTo(RowFilter filter,
-                                   SecondaryIndexManager indexManager,
-                                   QueryOptions options) throws InvalidRequestException
-        {
-            // no-op
-        }
-
-        public void addFunctionsTo(List<Function> functions)
-        {
-            // no-op
-        }
-
-        MultiColumnRestriction toMultiColumnRestriction()
-        {
-            // no-op
-            return null;
-        }
-
-        public abstract List<ByteBuffer> getValues(QueryOptions options) throws InvalidRequestException;
-    }
-
-    public static class SuperColumnKeyINRestrictionWithMarkers extends SuperColumnKeyINRestriction
-    {
-        protected final AbstractMarker marker;
-
-        public SuperColumnKeyINRestrictionWithMarkers(ColumnDefinition columnDef, AbstractMarker marker)
-        {
-            super(columnDef);
-            this.marker = marker;
-        }
-
-        public List<ByteBuffer> getValues(QueryOptions options) throws InvalidRequestException
-        {
-            Terminal term = marker.bind(options);
-            checkNotNull(term, "Invalid null value for column %s", columnDef.name);
-            checkFalse(term == Constants.UNSET_VALUE, "Invalid unset value for column %s", columnDef.name);
-            Term.MultiItemTerminal lval = (Term.MultiItemTerminal) term;
-            return lval.getElements();
-        }
-    }
-
-    public static class SuperColumnKeyINRestrictionWithValues extends SuperColumnKeyINRestriction
-    {
-        private final List<Term> values;
-
-        public SuperColumnKeyINRestrictionWithValues(ColumnDefinition columnDef, List<Term> values)
-        {
-            super(columnDef);
-            this.values = values;
-        }
-
-        public List<ByteBuffer> getValues(QueryOptions options) throws InvalidRequestException
-        {
-            List<ByteBuffer> buffers = new ArrayList<>(values.size());
-            for (Term value : values)
-                buffers.add(value.bindAndGet(options));
-            return buffers;
-        }
-    }
-
-    public static class SuperColumnKeySliceRestriction extends SliceRestriction
-    {
-        // These are here to avoid polluting SliceRestriction
-        private Term term;
-
-        public SuperColumnKeySliceRestriction(ColumnDefinition columnDef, Bound bound, boolean inclusive, Term term)
-        {
-            super(columnDef, bound, inclusive, term);
-            this.term = term;
-        }
-
-        public ByteBuffer bindValue(QueryOptions options)
-        {
-            return term.bindAndGet(options);
-        }
-
-        @Override
-        public MultiCBuilder appendBoundTo(MultiCBuilder builder, Bound bound, QueryOptions options)
-        {
-            // no-op
-            return builder;
-        }
-
-        @Override
-        public void addRowFilterTo(RowFilter filter, SecondaryIndexManager indexManager, QueryOptions options) throws InvalidRequestException
-        {
-            // no-op
         }
     }
 }

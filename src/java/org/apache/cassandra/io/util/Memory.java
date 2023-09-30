@@ -19,7 +19,6 @@ package org.apache.cassandra.io.util;
 
 import java.lang.reflect.Field;
 import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
 
 import net.nicoulaj.compilecommand.annotations.Inline;
 
@@ -28,12 +27,11 @@ import org.apache.cassandra.utils.FastByteOperations;
 import org.apache.cassandra.utils.concurrent.Ref;
 import org.apache.cassandra.utils.memory.MemoryUtil;
 import sun.misc.Unsafe;
-import sun.nio.ch.DirectBuffer;
 
 /**
  * An off-heap region of memory that must be manually free'd when no longer needed.
  */
-public class Memory implements AutoCloseable
+public class Memory implements AutoCloseable, ReadableMemory
 {
     private static final Unsafe unsafe;
     static
@@ -52,8 +50,6 @@ public class Memory implements AutoCloseable
 
     private static final long BYTE_ARRAY_BASE_OFFSET = unsafe.arrayBaseOffset(byte[].class);
 
-    private static final boolean bigEndian = ByteOrder.nativeOrder().equals(ByteOrder.BIG_ENDIAN);
-
     public static final ByteBuffer[] NO_BYTE_BUFFERS = new ByteBuffer[0];
 
     protected long peer;
@@ -69,7 +65,7 @@ public class Memory implements AutoCloseable
         // we permit a 0 peer iff size is zero, since such an allocation makes no sense, and an allocator would be
         // justified in returning a null pointer (and permitted to do so: http://www.cplusplus.com/reference/cstdlib/malloc)
         if (peer == 0)
-            throw new OutOfMemoryError();
+            throw new OutOfMemoryError(); // checkstyle: permit this instantiation
     }
 
     // create a memory object that references the exacy same memory location as the one provided.
@@ -108,18 +104,14 @@ public class Memory implements AutoCloseable
     {
         checkBounds(offset, offset + 8);
         if (Architecture.IS_UNALIGNED)
-        {
-            unsafe.putLong(peer + offset, l);
-        }
+            unsafe.putLong(peer + offset, Architecture.BIG_ENDIAN ? Long.reverseBytes(l) : l);
         else
-        {
             putLongByByte(peer + offset, l);
-        }
     }
 
     private void putLongByByte(long address, long value)
     {
-        if (bigEndian)
+        if (Architecture.BIG_ENDIAN)
         {
             unsafe.putByte(address, (byte) (value >> 56));
             unsafe.putByte(address + 1, (byte) (value >> 48));
@@ -147,18 +139,14 @@ public class Memory implements AutoCloseable
     {
         checkBounds(offset, offset + 4);
         if (Architecture.IS_UNALIGNED)
-        {
-            unsafe.putInt(peer + offset, l);
-        }
+            unsafe.putInt(peer + offset, Architecture.BIG_ENDIAN ? Integer.reverseBytes(l) : l);
         else
-        {
             putIntByByte(peer + offset, l);
-        }
     }
 
     private void putIntByByte(long address, int value)
     {
-        if (bigEndian)
+        if (Architecture.BIG_ENDIAN)
         {
             unsafe.putByte(address, (byte) (value >> 24));
             unsafe.putByte(address + 1, (byte) (value >> 16));
@@ -178,18 +166,14 @@ public class Memory implements AutoCloseable
     {
         checkBounds(offset, offset + 2);
         if (Architecture.IS_UNALIGNED)
-        {
-            unsafe.putShort(peer + offset, l);
-        }
+            unsafe.putShort(peer + offset, Architecture.BIG_ENDIAN ? Short.reverseBytes(l) : l);
         else
-        {
             putShortByByte(peer + offset, l);
-        }
     }
 
     private void putShortByByte(long address, short value)
     {
-        if (bigEndian)
+        if (Architecture.BIG_ENDIAN)
         {
             unsafe.putByte(address, (byte) (value >> 8));
             unsafe.putByte(address + 1, (byte) (value));
@@ -213,9 +197,9 @@ public class Memory implements AutoCloseable
         {
             setBytes(memoryOffset, buffer.array(), buffer.arrayOffset() + buffer.position(), buffer.remaining());
         }
-        else if (buffer instanceof DirectBuffer)
+        else if (buffer.isDirect())
         {
-            unsafe.copyMemory(((DirectBuffer) buffer).address() + buffer.position(), peer + memoryOffset, buffer.remaining());
+            unsafe.copyMemory(MemoryUtil.getAddress(buffer) + buffer.position(), peer + memoryOffset, buffer.remaining());
         }
         else
             throw new IllegalStateException();
@@ -253,16 +237,14 @@ public class Memory implements AutoCloseable
     {
         checkBounds(offset, offset + 8);
         if (Architecture.IS_UNALIGNED)
-        {
-            return unsafe.getLong(peer + offset);
-        } else {
+            return Architecture.BIG_ENDIAN ? Long.reverseBytes(unsafe.getLong(peer+offset)) : unsafe.getLong(peer+offset);
+        else
             return getLongByByte(peer + offset);
-        }
     }
 
     private long getLongByByte(long address)
     {
-        if (bigEndian)
+        if (Architecture.BIG_ENDIAN)
         {
             return  (((long) unsafe.getByte(address    )       ) << 56) |
                     (((long) unsafe.getByte(address + 1) & 0xff) << 48) |
@@ -290,18 +272,14 @@ public class Memory implements AutoCloseable
     {
         checkBounds(offset, offset + 4);
         if (Architecture.IS_UNALIGNED)
-        {
-            return unsafe.getInt(peer + offset);
-        }
+            return Architecture.BIG_ENDIAN ? Integer.reverseBytes(unsafe.getInt(peer+offset)) : unsafe.getInt(peer+offset);
         else
-        {
             return getIntByByte(peer + offset);
-        }
     }
 
     private int getIntByByte(long address)
     {
-        if (bigEndian)
+        if (Architecture.BIG_ENDIAN)
         {
             return  ((unsafe.getByte(address    )       ) << 24) |
                     ((unsafe.getByte(address + 1) & 0xff) << 16) |
@@ -418,7 +396,7 @@ public class Memory implements AutoCloseable
     public void setByteBuffer(ByteBuffer buffer, long offset, int length)
     {
         checkBounds(offset, offset + length);
-        MemoryUtil.setByteBuffer(buffer, peer + offset, length);
+        MemoryUtil.setDirectByteBuffer(buffer, peer + offset, length);
     }
 
     public String toString()

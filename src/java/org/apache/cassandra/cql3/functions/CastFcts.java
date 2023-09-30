@@ -20,8 +20,6 @@ package org.apache.cassandra.cql3.functions;
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.nio.ByteBuffer;
-import java.util.ArrayList;
-import java.util.Collection;
 import java.util.List;
 
 import org.apache.cassandra.cql3.CQL3Type;
@@ -46,7 +44,9 @@ import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.db.marshal.UUIDType;
 import org.apache.cassandra.transport.ProtocolVersion;
 
-import org.apache.commons.lang3.text.WordUtils;
+import static org.apache.cassandra.cql3.functions.TimeFcts.*;
+
+import org.apache.commons.lang3.StringUtils;
 
 /**
  * Casting functions
@@ -54,12 +54,14 @@ import org.apache.commons.lang3.text.WordUtils;
  */
 public final class CastFcts
 {
-    private static final String FUNCTION_NAME_PREFIX = "castAs";
+    private static final String FUNCTION_NAME_PREFIX = "cast_as_";
 
-    public static Collection<Function> all()
+    // Until 5.0 we have used camel cased names for cast functions. That changed with CASSANDRA-18037, where we decided
+    // to adopt snake case for all native function names. However, we should still support the old came case names.
+    private static final String LEGACY_FUNCTION_NAME_PREFIX = "castAs";
+
+    public static void addFunctionsTo(NativeFunctions functions)
     {
-        List<Function> functions = new ArrayList<>();
-
         @SuppressWarnings("unchecked")
         final AbstractType<? extends Number>[] numericTypes = new AbstractType[] {ByteType.instance,
                                                                                   ShortType.instance,
@@ -93,14 +95,14 @@ public final class CastFcts
         functions.add(CastAsTextFunction.create(BooleanType.instance, AsciiType.instance));
         functions.add(CastAsTextFunction.create(BooleanType.instance, UTF8Type.instance));
 
-        functions.add(CassandraFunctionWrapper.create(TimeUUIDType.instance, SimpleDateType.instance, TimeFcts.timeUuidtoDate));
-        functions.add(CassandraFunctionWrapper.create(TimeUUIDType.instance, TimestampType.instance, TimeFcts.timeUuidToTimestamp));
+        functions.add(CassandraFunctionWrapper.create(TimeUUIDType.instance, SimpleDateType.instance, toDate(TimeUUIDType.instance)));
+        functions.add(CassandraFunctionWrapper.create(TimeUUIDType.instance, TimestampType.instance, toTimestamp(TimeUUIDType.instance)));
         functions.add(CastAsTextFunction.create(TimeUUIDType.instance, AsciiType.instance));
         functions.add(CastAsTextFunction.create(TimeUUIDType.instance, UTF8Type.instance));
-        functions.add(CassandraFunctionWrapper.create(TimestampType.instance, SimpleDateType.instance, TimeFcts.timestampToDate));
+        functions.add(CassandraFunctionWrapper.create(TimestampType.instance, SimpleDateType.instance, toDate(TimestampType.instance)));
         functions.add(CastAsTextFunction.create(TimestampType.instance, AsciiType.instance));
         functions.add(CastAsTextFunction.create(TimestampType.instance, UTF8Type.instance));
-        functions.add(CassandraFunctionWrapper.create(SimpleDateType.instance, TimestampType.instance, TimeFcts.dateToTimestamp));
+        functions.add(CassandraFunctionWrapper.create(SimpleDateType.instance, TimestampType.instance, toTimestamp(SimpleDateType.instance)));
         functions.add(CastAsTextFunction.create(SimpleDateType.instance, AsciiType.instance));
         functions.add(CastAsTextFunction.create(SimpleDateType.instance, UTF8Type.instance));
         functions.add(CastAsTextFunction.create(TimeType.instance, AsciiType.instance));
@@ -108,8 +110,6 @@ public final class CastFcts
 
         functions.add(CastAsTextFunction.create(UUIDType.instance, AsciiType.instance));
         functions.add(CastAsTextFunction.create(UUIDType.instance, UTF8Type.instance));
-
-        return functions;
     }
 
     /**
@@ -120,7 +120,10 @@ public final class CastFcts
      */
     private static <I extends Number> java.util.function.Function<I, BigDecimal> getDecimalConversionFunction(AbstractType<? extends Number> inputType)
     {
-        if (inputType == FloatType.instance || inputType == DoubleType.instance)
+        if (inputType == FloatType.instance)
+            return p -> new BigDecimal(Float.toString(p.floatValue()));
+
+        if (inputType == DoubleType.instance)
             return p -> BigDecimal.valueOf(p.doubleValue());
 
         if (inputType == IntegerType.instance)
@@ -130,25 +133,38 @@ public final class CastFcts
     }
 
     /**
-     * Creates the name of the cast function use to cast to the specified type.
+     * Creates the snake-cased name of the cast function used to cast to the specified type.
      *
      * @param outputType the output type
-     * @return the name of the cast function use to cast to the specified type
-     */
-    public static String getFunctionName(AbstractType<?> outputType)
-    {
-        return getFunctionName(outputType.asCQL3Type());
-    }
-
-    /**
-     * Creates the name of the cast function use to cast to the specified type.
-     *
-     * @param outputType the output type
-     * @return the name of the cast function use to cast to the specified type
+     * @return the name of the cast function used to cast to the specified type
      */
     public static String getFunctionName(CQL3Type outputType)
     {
-        return FUNCTION_NAME_PREFIX + WordUtils.capitalize(toLowerCaseString(outputType));
+        return FUNCTION_NAME_PREFIX + toLowerCaseString(outputType);
+    }
+
+    /**
+     * Creates the legacy camel-cased name of the cast function used to cast to the specified type.
+     *
+     * @param outputType the output type
+     * @return the legacy camel-cased name of the cast function used to cast to the specified type
+     */
+    private static String getLegacyFunctionName(CQL3Type outputType)
+    {
+        return LEGACY_FUNCTION_NAME_PREFIX + StringUtils.capitalize(toLowerCaseString(outputType));
+    }
+
+    /**
+     * Creates the name of the cast function used to cast to the specified type.
+     *
+     * @param outputType the output type
+     * @param legacy whether to use the old cameCase names, instead of the new snake_case names
+     * @return the name of the cast function used to cast to the specified type
+     */
+    private static String getFunctionName(AbstractType<?> outputType, boolean legacy)
+    {
+        CQL3Type type = outputType.asCQL3Type();
+        return legacy ? getLegacyFunctionName(type) : getFunctionName(type);
     }
 
     /**
@@ -159,7 +175,7 @@ public final class CastFcts
      * @param outputType the output type
      * @param converter the function use to convert the input type into the output type
      */
-    private static <I, O> void addFunctionIfNeeded(List<Function> functions,
+    private static <I, O> void addFunctionIfNeeded(NativeFunctions functions,
                                                    AbstractType<I> inputType,
                                                    AbstractType<O> outputType,
                                                    java.util.function.Function<I, O> converter)
@@ -169,9 +185,9 @@ public final class CastFcts
     }
 
     @SuppressWarnings("unchecked")
-    private static <O, I> Function wrapJavaFunction(AbstractType<I> inputType,
-                                                    AbstractType<O> outputType,
-                                                    java.util.function.Function<I, O> converter)
+    private static <O, I> CastFunction<?, O> wrapJavaFunction(AbstractType<I> inputType,
+                                                              AbstractType<O> outputType,
+                                                              java.util.function.Function<I, O> converter)
     {
         return inputType.equals(CounterColumnType.instance)
                 ? JavaCounterFunctionWrapper.create(outputType, (java.util.function.Function<Long, O>) converter)
@@ -191,9 +207,9 @@ public final class CastFcts
      */
     private static abstract class CastFunction<I, O> extends NativeScalarFunction
     {
-        public CastFunction(AbstractType<I> inputType, AbstractType<O> outputType)
+        public CastFunction(AbstractType<I> inputType, AbstractType<O> outputType, boolean useLegacyName)
         {
-            super(getFunctionName(outputType), outputType, inputType);
+            super(getFunctionName(outputType, useLegacyName), outputType, inputType);
         }
 
         @Override
@@ -226,30 +242,37 @@ public final class CastFcts
         /**
          * The java function used to convert the input type into the output one.
          */
-        private final java.util.function.Function<I, O> converter;
+        protected final java.util.function.Function<I, O> converter;
 
         public static <I, O> JavaFunctionWrapper<I, O> create(AbstractType<I> inputType,
                                                               AbstractType<O> outputType,
                                                               java.util.function.Function<I, O> converter)
         {
-            return new JavaFunctionWrapper<I, O>(inputType, outputType, converter);
+            return new JavaFunctionWrapper<>(inputType, outputType, converter, false);
         }
 
         protected JavaFunctionWrapper(AbstractType<I> inputType,
                                       AbstractType<O> outputType,
-                                      java.util.function.Function<I, O> converter)
+                                      java.util.function.Function<I, O> converter,
+                                      boolean useLegacyName)
         {
-            super(inputType, outputType);
+            super(inputType, outputType, useLegacyName);
             this.converter = converter;
         }
 
-        public final ByteBuffer execute(ProtocolVersion protocolVersion, List<ByteBuffer> parameters)
+        @Override
+        public JavaFunctionWrapper<I, O> withLegacyName()
         {
-            ByteBuffer bb = parameters.get(0);
-            if (bb == null)
+            return new JavaFunctionWrapper<>(inputType(), outputType(), converter, true);
+        }
+
+        @Override
+        public final ByteBuffer execute(Arguments arguments)
+        {
+            if (arguments.containsNulls())
                 return null;
 
-            return outputType().decompose(converter.apply(compose(bb)));
+            return outputType().decompose(converter.apply(arguments.get(0)));
         }
 
         protected I compose(ByteBuffer bb)
@@ -271,13 +294,20 @@ public final class CastFcts
         public static <O> JavaFunctionWrapper<Long, O> create(AbstractType<O> outputType,
                                                               java.util.function.Function<Long, O> converter)
         {
-            return new JavaCounterFunctionWrapper<O>(outputType, converter);
+            return new JavaCounterFunctionWrapper<>(outputType, converter, false);
         }
 
         protected JavaCounterFunctionWrapper(AbstractType<O> outputType,
-                                            java.util.function.Function<Long, O> converter)
+                                             java.util.function.Function<Long, O> converter,
+                                             boolean useLegacyName)
         {
-            super(CounterColumnType.instance, outputType, converter);
+            super(CounterColumnType.instance, outputType, converter, useLegacyName);
+        }
+
+        @Override
+        public JavaCounterFunctionWrapper<O> withLegacyName()
+        {
+            return new JavaCounterFunctionWrapper<>(outputType(), converter, true);
         }
 
         protected Long compose(ByteBuffer bb)
@@ -303,22 +333,30 @@ public final class CastFcts
                                                                    AbstractType<O> outputType,
                                                                    NativeScalarFunction delegate)
         {
-            return new CassandraFunctionWrapper<I, O>(inputType, outputType, delegate);
+            return new CassandraFunctionWrapper<>(inputType, outputType, delegate, false);
         }
 
         private CassandraFunctionWrapper(AbstractType<I> inputType,
                                          AbstractType<O> outputType,
-                                         NativeScalarFunction delegate)
+                                         NativeScalarFunction delegate,
+                                         boolean useLegacyName)
         {
-            super(inputType, outputType);
+            super(inputType, outputType, useLegacyName);
             assert delegate.argTypes().size() == 1 && inputType.equals(delegate.argTypes().get(0));
             assert outputType.equals(delegate.returnType());
             this.delegate = delegate;
         }
 
-        public ByteBuffer execute(ProtocolVersion protocolVersion, List<ByteBuffer> parameters)
+        @Override
+        public CassandraFunctionWrapper<I, O> withLegacyName()
         {
-            return delegate.execute(protocolVersion, parameters);
+            return new CassandraFunctionWrapper<>(inputType(), outputType(), delegate, true);
+        }
+
+        @Override
+        public ByteBuffer execute(Arguments arguments)
+        {
+            return delegate.execute(arguments);
         }
     }
 
@@ -333,22 +371,39 @@ public final class CastFcts
         public static <I> CastAsTextFunction<I> create(AbstractType<I> inputType,
                                                        AbstractType<String> outputType)
         {
-            return new CastAsTextFunction<I>(inputType, outputType);
+            return new CastAsTextFunction<>(inputType, outputType, false);
         }
 
-        private CastAsTextFunction(AbstractType<I> inputType,
-                                    AbstractType<String> outputType)
+        private CastAsTextFunction(AbstractType<I> inputType, AbstractType<String> outputType, boolean useLegacyName)
         {
-            super(inputType, outputType);
+            super(inputType, outputType, useLegacyName);
         }
 
-        public ByteBuffer execute(ProtocolVersion protocolVersion, List<ByteBuffer> parameters)
+        @Override
+        public CastAsTextFunction<I> withLegacyName()
         {
-            ByteBuffer bb = parameters.get(0);
-            if (bb == null)
+            return new CastAsTextFunction<>(inputType(), outputType(), true);
+        }
+
+        @Override
+        public Arguments newArguments(ProtocolVersion version)
+        {
+            return new FunctionArguments(version, (protocolVersion, buffer) -> {
+                AbstractType<?> argType = argTypes.get(0);
+                if (buffer == null || (!buffer.hasRemaining() && argType.isEmptyValueMeaningless()))
+                    return null;
+
+                return argType.getSerializer().toCQLLiteralNoQuote(buffer);
+            });
+        }
+
+        @Override
+        public ByteBuffer execute(Arguments arguments)
+        {
+            if (arguments.containsNulls())
                 return null;
 
-            return outputType().decompose(inputType().getSerializer().toCQLLiteral(bb));
+            return outputType().decompose(arguments.get(0));
         }
     }
 

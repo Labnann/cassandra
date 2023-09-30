@@ -27,7 +27,8 @@ import org.junit.Test;
 import org.apache.cassandra.SchemaLoader;
 import org.apache.cassandra.Util;
 import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.config.Schema;
+import org.apache.cassandra.db.marshal.IntegerType;
+import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.db.RowUpdateBuilder;
@@ -36,6 +37,8 @@ import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.schema.KeyspaceParams;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.bytecomparable.ByteComparable;
+import org.apache.cassandra.utils.bytecomparable.ByteSource;
 import org.apache.cassandra.utils.FBUtilities;
 
 /**
@@ -95,7 +98,7 @@ public class KeyCollisionTest
 
     private void insert(String key)
     {
-        RowUpdateBuilder builder = new RowUpdateBuilder(Schema.instance.getCFMetaData(KEYSPACE1, CF), FBUtilities.timestampMicros(), key);
+        RowUpdateBuilder builder = new RowUpdateBuilder(Schema.instance.getTableMetadata(KEYSPACE1, CF), FBUtilities.timestampMicros(), key);
         builder.clustering("c").add("val", "asdf").build().applyUnsafe();
     }
 
@@ -123,6 +126,18 @@ public class KeyCollisionTest
         public long getHeapSize()
         {
             return 0;
+        }
+
+        @Override
+        public long getLongValue()
+        {
+            return token.longValue();
+        }
+
+        @Override
+        public ByteSource asComparableBytes(ByteComparable.Version version)
+        {
+            return IntegerType.instance.asComparableBytes(IntegerType.instance.decompose(token), version);
         }
     }
 }

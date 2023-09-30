@@ -21,13 +21,15 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.*;
 
+import com.google.common.annotations.VisibleForTesting;
+
 import org.apache.cassandra.db.Mutation;
 import org.apache.cassandra.io.IVersionedSerializer;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputPlus;
 import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.utils.ByteBufferUtil;
-import org.apache.cassandra.utils.UUIDSerializer;
+import org.apache.cassandra.utils.TimeUUID;
 
 import static org.apache.cassandra.db.TypeSizes.sizeof;
 import static org.apache.cassandra.db.TypeSizes.sizeofUnsignedVInt;
@@ -36,14 +38,14 @@ public final class Batch
 {
     public static final Serializer serializer = new Serializer();
 
-    public final UUID id;
+    public final TimeUUID id;
     public final long creationTime; // time of batch creation (in microseconds)
 
     // one of these will always be empty
     final Collection<Mutation> decodedMutations;
     final Collection<ByteBuffer> encodedMutations;
 
-    private Batch(UUID id, long creationTime, Collection<Mutation> decodedMutations, Collection<ByteBuffer> encodedMutations)
+    private Batch(TimeUUID id, long creationTime, Collection<Mutation> decodedMutations, Collection<ByteBuffer> encodedMutations)
     {
         this.id = id;
         this.creationTime = creationTime;
@@ -55,7 +57,7 @@ public final class Batch
     /**
      * Creates a 'local' batch - with all enclosed mutations in decoded form (as Mutation instances)
      */
-    public static Batch createLocal(UUID id, long creationTime, Collection<Mutation> mutations)
+    public static Batch createLocal(TimeUUID id, long creationTime, Collection<Mutation> mutations)
     {
         return new Batch(id, creationTime, mutations, Collections.emptyList());
     }
@@ -65,7 +67,8 @@ public final class Batch
      *
      * The mutations will always be encoded using the current messaging version.
      */
-    public static Batch createRemote(UUID id, long creationTime, Collection<ByteBuffer> mutations)
+    @SuppressWarnings("RedundantTypeArguments")
+    public static Batch createRemote(TimeUUID id, long creationTime, Collection<ByteBuffer> mutations)
     {
         return new Batch(id, creationTime, Collections.<Mutation>emptyList(), mutations);
     }
@@ -77,20 +80,38 @@ public final class Batch
     {
         return decodedMutations.size() + encodedMutations.size();
     }
+    
+    @VisibleForTesting
+    public Collection<ByteBuffer> getEncodedMutations()
+    {
+        return encodedMutations;
+    }
 
-    static final class Serializer implements IVersionedSerializer<Batch>
+    /**
+     * Local batches contain only already decoded {@link Mutation} instances. Unlike remote 
+     * batches, which contain mutations encoded as {@link ByteBuffer} instances, local batches 
+     * can be serialized and sent over the wire.
+     * 
+     * @return {@code true} if there are no encoded mutations present, and {@code false} otherwise 
+     */
+    public boolean isLocal()
+    {
+        return encodedMutations.isEmpty();
+    }
+    
+    public static final class Serializer implements IVersionedSerializer<Batch>
     {
         public long serializedSize(Batch batch, int version)
         {
-            assert batch.encodedMutations.isEmpty() : "attempted to serialize a 'remote' batch";
+            assert batch.isLocal() : "attempted to serialize a 'remote' batch";
 
-            long size = UUIDSerializer.serializer.serializedSize(batch.id, version);
+            long size = TimeUUID.sizeInBytes();
             size += sizeof(batch.creationTime);
 
             size += sizeofUnsignedVInt(batch.decodedMutations.size());
             for (Mutation mutation : batch.decodedMutations)
             {
-                int mutationSize = (int) Mutation.serializer.serializedSize(mutation, version);
+                int mutationSize = mutation.serializedSize(version);
                 size += sizeofUnsignedVInt(mutationSize);
                 size += mutationSize;
             }
@@ -100,22 +121,22 @@ public final class Batch
 
         public void serialize(Batch batch, DataOutputPlus out, int version) throws IOException
         {
-            assert batch.encodedMutations.isEmpty() : "attempted to serialize a 'remote' batch";
+            assert batch.isLocal() : "attempted to serialize a 'remote' batch";
 
-            UUIDSerializer.serializer.serialize(batch.id, out, version);
+            batch.id.serialize(out);
             out.writeLong(batch.creationTime);
 
-            out.writeUnsignedVInt(batch.decodedMutations.size());
+            out.writeUnsignedVInt32(batch.decodedMutations.size());
             for (Mutation mutation : batch.decodedMutations)
             {
-                out.writeUnsignedVInt(Mutation.serializer.serializedSize(mutation, version));
+                out.writeUnsignedVInt32(mutation.serializedSize(version));
                 Mutation.serializer.serialize(mutation, out, version);
             }
         }
 
         public Batch deserialize(DataInputPlus in, int version) throws IOException
         {
-            UUID id = UUIDSerializer.serializer.deserialize(in, version);
+            TimeUUID id = TimeUUID.deserialize(in);
             long creationTime = in.readLong();
 
             /*
@@ -129,7 +150,7 @@ public final class Batch
 
         private static Collection<ByteBuffer> readEncodedMutations(DataInputPlus in) throws IOException
         {
-            int count = (int) in.readUnsignedVInt();
+            int count = in.readUnsignedVInt32();
 
             ArrayList<ByteBuffer> mutations = new ArrayList<>(count);
             for (int i = 0; i < count; i++)
@@ -140,12 +161,12 @@ public final class Batch
 
         private static Collection<Mutation> decodeMutations(DataInputPlus in, int version) throws IOException
         {
-            int count = (int) in.readUnsignedVInt();
+            int count = in.readUnsignedVInt32();
 
             ArrayList<Mutation> mutations = new ArrayList<>(count);
             for (int i = 0; i < count; i++)
             {
-                in.readUnsignedVInt(); // skip mutation size
+                in.readUnsignedVInt32(); // skip mutation size
                 mutations.add(Mutation.serializer.deserialize(in, version));
             }
 

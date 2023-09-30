@@ -17,8 +17,8 @@
  */
 package org.apache.cassandra.io.util;
 
-import java.io.File;
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.StandardOpenOption;
 
@@ -37,11 +37,21 @@ public class SequentialWriter extends BufferedDataOutputStreamPlus implements Tr
 {
     // absolute path to the given file
     private final String filePath;
+    private final File file;
 
     // Offset for start of buffer relative to underlying file
     protected long bufferOffset;
 
     protected final FileChannel fchannel;
+
+    //Allow derived classes to specify writing to the channel
+    //directly shouldn't happen because they intercept via doFlush for things
+    //like compression or checksumming
+    //Another hack for this value is that it also indicates that flushing early
+    //should not occur, flushes aligned with buffer size are desired
+    //Unless... it's the last flush. Compression and checksum formats
+    //expect block (same as buffer size) alignment for everything except the last block
+    private final boolean strictFlushing;
 
     // whether to do trickling fsync() to avoid sudden bursts of dirty buffer flushing by kernel causing read
     // latency spikes
@@ -74,16 +84,19 @@ public class SequentialWriter extends BufferedDataOutputStreamPlus implements Tr
             return accumulate;
         }
 
+        @Override
         protected void doPrepare()
         {
             syncInternal();
         }
 
+        @Override
         protected Throwable doCommit(Throwable accumulate)
         {
             return accumulate;
         }
 
+        @Override
         protected Throwable doAbort(Throwable accumulate)
         {
             return accumulate;
@@ -104,7 +117,7 @@ public class SequentialWriter extends BufferedDataOutputStreamPlus implements Tr
                 FileChannel channel = FileChannel.open(file.toPath(), StandardOpenOption.READ, StandardOpenOption.WRITE, StandardOpenOption.CREATE_NEW);
                 try
                 {
-                    SyncUtil.trySyncDir(file.getParentFile());
+                    SyncUtil.trySyncDir(file.parent());
                 }
                 catch (Throwable t)
                 {
@@ -138,16 +151,28 @@ public class SequentialWriter extends BufferedDataOutputStreamPlus implements Tr
      */
     public SequentialWriter(File file, SequentialWriterOption option)
     {
-        super(openChannel(file), option.allocateBuffer());
-        strictFlushing = true;
-        fchannel = (FileChannel)channel;
+        this(file, option, true);
+    }
 
-        filePath = file.getAbsolutePath();
+    /**
+     * Create SequentialWriter for given file with specific writer option.
+     * @param file
+     * @param option
+     * @param strictFlushing
+     */
+    public SequentialWriter(File file, SequentialWriterOption option, boolean strictFlushing)
+    {
+        super(openChannel(file), option.allocateBuffer());
+        this.strictFlushing = strictFlushing;
+        this.fchannel = (FileChannel)channel;
+
+        this.file = file;
+        this.filePath = file.absolutePath();
 
         this.option = option;
     }
 
-    public void skipBytes(int numBytes) throws IOException
+    public void skipBytes(long numBytes) throws IOException
     {
         flush();
         fchannel.position(fchannel.position() + numBytes);
@@ -230,14 +255,40 @@ public class SequentialWriter extends BufferedDataOutputStreamPlus implements Tr
             runPostFlush.run();
     }
 
+    @Override
     public boolean hasPosition()
     {
         return true;
     }
 
+    @Override
     public long position()
     {
         return current();
+    }
+
+    @Override
+    public int maxBytesInPage()
+    {
+        return PageAware.PAGE_SIZE;
+    }
+
+    @Override
+    public void padToPageBoundary() throws IOException
+    {
+        PageAware.pad(this);
+    }
+
+    @Override
+    public int bytesLeftInPage()
+    {
+        return PageAware.bytesLeftInPage(position());
+    }
+
+    @Override
+    public long paddedPosition()
+    {
+        return PageAware.padded(position());
     }
 
     /**
@@ -274,6 +325,11 @@ public class SequentialWriter extends BufferedDataOutputStreamPlus implements Tr
     public String getPath()
     {
         return filePath;
+    }
+
+    public File getFile()
+    {
+        return file;
     }
 
     protected void resetBuffer()
@@ -353,16 +409,19 @@ public class SequentialWriter extends BufferedDataOutputStreamPlus implements Tr
         return channel.isOpen();
     }
 
+    @Override
     public final void prepareToCommit()
     {
         txnProxy.prepareToCommit();
     }
 
+    @Override
     public final Throwable commit(Throwable accumulate)
     {
         return txnProxy.commit(accumulate);
     }
 
+    @Override
     public final Throwable abort(Throwable accumulate)
     {
         return txnProxy.abort(accumulate);
@@ -375,6 +434,15 @@ public class SequentialWriter extends BufferedDataOutputStreamPlus implements Tr
             txnProxy.finish();
         else
             txnProxy.close();
+    }
+
+    public int writeDirectlyToChannel(ByteBuffer buf) throws IOException
+    {
+        if (strictFlushing)
+            throw new UnsupportedOperationException();
+        // Don't allow writes to the underlying channel while data is buffered
+        flush();
+        return channel.write(buf);
     }
 
     public final void finish()

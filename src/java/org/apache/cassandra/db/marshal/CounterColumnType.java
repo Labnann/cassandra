@@ -21,16 +21,19 @@ import java.nio.ByteBuffer;
 
 import org.apache.cassandra.cql3.CQL3Type;
 import org.apache.cassandra.cql3.Term;
+import org.apache.cassandra.cql3.functions.ArgumentDeserializer;
 import org.apache.cassandra.db.context.CounterContext;
-import org.apache.cassandra.serializers.TypeSerializer;
 import org.apache.cassandra.serializers.CounterSerializer;
 import org.apache.cassandra.serializers.MarshalException;
 import org.apache.cassandra.transport.ProtocolVersion;
+import org.apache.cassandra.serializers.TypeSerializer;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
-public class CounterColumnType extends AbstractType<Long>
+public class CounterColumnType extends NumberType<Long>
 {
     public static final CounterColumnType instance = new CounterColumnType();
+
+    private static final ByteBuffer MASKED_VALUE = instance.decompose(0L);
 
     CounterColumnType() {super(ComparisonType.NOT_COMPARABLE);} // singleton
 
@@ -44,10 +47,9 @@ public class CounterColumnType extends AbstractType<Long>
         return true;
     }
 
-    @Override
-    public Long compose(ByteBuffer bytes)
+    public <V> Long compose(V value, ValueAccessor<V> accessor)
     {
-        return CounterContext.instance().total(bytes);
+        return CounterContext.instance().total(value, accessor);
     }
 
     @Override
@@ -57,14 +59,14 @@ public class CounterColumnType extends AbstractType<Long>
     }
 
     @Override
-    public void validateCellValue(ByteBuffer cellValue) throws MarshalException
+    public <V> void validateCellValue(V cellValue, ValueAccessor<V> accessor) throws MarshalException
     {
-        CounterContext.instance().validateContext(cellValue);
+        CounterContext.instance().validateContext(cellValue, accessor);
     }
 
-    public String getString(ByteBuffer bytes)
+    public <V> String getString(V value, ValueAccessor<V> accessor)
     {
-        return ByteBufferUtil.bytesToHex(bytes);
+        return accessor.toHex(value);
     }
 
     public ByteBuffer fromString(String source)
@@ -92,5 +94,82 @@ public class CounterColumnType extends AbstractType<Long>
     public TypeSerializer<Long> getSerializer()
     {
         return CounterSerializer.instance;
+    }
+
+    @Override
+    public ArgumentDeserializer getArgumentDeserializer()
+    {
+        return LongType.instance.getArgumentDeserializer();
+    }
+
+    @Override
+    public ByteBuffer add(Number left, Number right)
+    {
+        return ByteBufferUtil.bytes(left.longValue() + right.longValue());
+    }
+
+    @Override
+    public ByteBuffer substract(Number left, Number right)
+    {
+        return ByteBufferUtil.bytes(left.longValue() - right.longValue());
+    }
+
+    @Override
+    public ByteBuffer multiply(Number left, Number right)
+    {
+        return ByteBufferUtil.bytes(left.longValue() * right.longValue());
+    }
+
+    @Override
+    public ByteBuffer divide(Number left, Number right)
+    {
+        return ByteBufferUtil.bytes(left.longValue() / right.longValue());
+    }
+
+    @Override
+    public ByteBuffer mod(Number left, Number right)
+    {
+        return ByteBufferUtil.bytes(left.longValue() % right.longValue());
+    }
+
+    public ByteBuffer negate(Number input)
+    {
+        return ByteBufferUtil.bytes(-input.longValue());
+    }
+
+    @Override
+    public ByteBuffer abs(Number input)
+    {
+        return ByteBufferUtil.bytes(Math.abs(input.longValue()));
+    }
+
+    @Override
+    public ByteBuffer exp(Number input)
+    {
+        return ByteBufferUtil.bytes((long) Math.exp(input.longValue()));
+    }
+
+    @Override
+    public ByteBuffer log(Number input)
+    {
+        return ByteBufferUtil.bytes((long) Math.log(input.longValue()));
+    }
+
+    @Override
+    public ByteBuffer log10(Number input)
+    {
+        return ByteBufferUtil.bytes((long) Math.log10(input.longValue()));
+    }
+
+    @Override
+    public ByteBuffer round(Number input)
+    {
+        return decompose(input.longValue());
+    }
+
+    @Override
+    public ByteBuffer getMaskedValue()
+    {
+        return MASKED_VALUE;
     }
 }

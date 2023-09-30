@@ -18,7 +18,7 @@
 */
 package org.apache.cassandra.db.commitlog;
 
-import java.io.File;
+import org.apache.cassandra.io.util.File;
 import java.io.IOException;
 
 import com.google.common.base.Predicate;
@@ -26,7 +26,7 @@ import org.junit.Assert;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.Mutation;
-import org.apache.cassandra.db.rows.SerializationHelper;
+import org.apache.cassandra.db.rows.DeserializationHelper;
 import org.apache.cassandra.io.util.DataInputBuffer;
 import org.apache.cassandra.io.util.RebufferingInputStream;
 
@@ -48,7 +48,7 @@ public class CommitLogTestReplayer extends CommitLogReplayer
 
     public void examineCommitLog() throws IOException
     {
-        replayFiles(new File(DatabaseDescriptor.getCommitLogLocation()).listFiles());
+        replayFiles(new File(DatabaseDescriptor.getCommitLogLocation()).tryList());
     }
 
     private class CommitLogTestReader extends CommitLogReader
@@ -65,7 +65,7 @@ public class CommitLogTestReplayer extends CommitLogReplayer
             Mutation mutation;
             try
             {
-                mutation = Mutation.serializer.deserialize(bufIn, desc.getMessagingVersion(), SerializationHelper.Flag.LOCAL);
+                mutation = Mutation.serializer.deserialize(bufIn, desc.getMessagingVersion(), DeserializationHelper.Flag.LOCAL);
                 Assert.assertTrue(processor.apply(mutation));
             }
             catch (IOException e)

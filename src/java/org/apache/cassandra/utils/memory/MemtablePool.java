@@ -19,16 +19,23 @@
 package org.apache.cassandra.utils.memory;
 
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLongFieldUpdater;
 
 import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Preconditions;
 
+import com.codahale.metrics.Gauge;
 import com.codahale.metrics.Timer;
 import org.apache.cassandra.metrics.CassandraMetricsRegistry;
 import org.apache.cassandra.metrics.DefaultNameFactory;
 import org.apache.cassandra.utils.concurrent.WaitQueue;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.apache.cassandra.utils.ExecutorUtils;
+
+import static org.apache.cassandra.utils.concurrent.WaitQueue.newWaitQueue;
+
 
 /**
  * Represents an amount of memory used for a given purpose, that can be allocated to specific tasks through
@@ -46,18 +53,21 @@ public abstract class MemtablePool
     public long continueWriteSize = 0;
 
     public final Timer blockedOnAllocating;
+    public final Gauge<Long> numPendingTasks;
 
-    final WaitQueue hasRoom = new WaitQueue();
+    final WaitQueue hasRoom = newWaitQueue();
 
-    MemtablePool(long maxOnHeapMemory, long maxOffHeapMemory, float cleanThreshold, Runnable cleaner)
+    MemtablePool(long maxOnHeapMemory, long maxOffHeapMemory, float cleanThreshold, MemtableCleaner cleaner)
     {
+        Preconditions.checkArgument(cleaner != null, "Cleaner should not be null");
+
         this.onHeap = getSubPool(maxOnHeapMemory, cleanThreshold);
         this.offHeap = getSubPool(maxOffHeapMemory, cleanThreshold);
         this.cleaner = getCleaner(cleaner);
-        blockedOnAllocating = CassandraMetricsRegistry.Metrics.timer(new DefaultNameFactory("MemtablePool")
-                                                                         .createMetricName("BlockedOnAllocation"));
-        if (this.cleaner != null)
-            this.cleaner.start();
+        DefaultNameFactory nameFactory = new DefaultNameFactory("MemtablePool");
+        blockedOnAllocating = CassandraMetricsRegistry.Metrics.timer(nameFactory.createMetricName("BlockedOnAllocation"));
+        numPendingTasks = CassandraMetricsRegistry.Metrics.register(nameFactory.createMetricName("PendingFlushTasks"),
+                                                                    () -> (long) this.cleaner.numPendingTasks());
     }
 
     SubPool getSubPool(long limit, float cleanThreshold)
@@ -65,19 +75,28 @@ public abstract class MemtablePool
         return new SubPool(limit, cleanThreshold);
     }
 
-    MemtableCleanerThread<?> getCleaner(Runnable cleaner)
+    MemtableCleanerThread<?> getCleaner(MemtableCleaner cleaner)
     {
         return cleaner == null ? null : new MemtableCleanerThread<>(this, cleaner);
     }
 
     @VisibleForTesting
-    public void shutdown() throws InterruptedException
+    public void shutdownAndWait(long timeout, TimeUnit unit) throws InterruptedException, TimeoutException
     {
-        cleaner.shutdown();
-        cleaner.awaitTermination(60, TimeUnit.SECONDS);
+        ExecutorUtils.shutdownNowAndWait(timeout, unit, cleaner);
     }
 
-    public abstract MemtableAllocator newAllocator();
+    public abstract MemtableAllocator newAllocator(String table);
+
+    public boolean needsCleaning()
+    {
+        return onHeap.needsCleaning() || offHeap.needsCleaning();
+    }
+
+    public Long getNumPendingtasks()
+    {
+        return numPendingTasks.getValue();
+    }
 
     /**
      * Note the difference between acquire() and allocate(); allocate() makes more resources available to all owners,
@@ -176,7 +195,7 @@ public abstract class MemtablePool
             maybeClean();
         }
 
-        void acquired(long size)
+        void acquired()
         {
             /*continueWriteSize += size;
             if(continueWriteSize > 504857600){
@@ -190,8 +209,7 @@ public abstract class MemtablePool
 
         void released(long size)
         {
-            //logger.debug("######released MemTable, size:{}, allocated:{}", size, allocated); 
-            assert size >= 0;
+            assert size >= 0 : "Negative released: " + size;
             adjustAllocated(-size);
             //logger.debug("######after released MemTable, size:{}, allocated:{}", size, allocated); 
             hasRoom.signalAll();
@@ -219,6 +237,11 @@ public abstract class MemtablePool
         public long used()
         {
             return allocated;       
+        }
+
+        public long getReclaiming()
+        {
+            return reclaiming;
         }
 
         public float reclaimingRatio()

@@ -17,35 +17,65 @@
  */
 package org.apache.cassandra.db;
 
-import java.io.File;
-import java.io.FileFilter;
 import java.io.IOError;
 import java.io.IOException;
+import java.nio.file.FileStore;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.*;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.Spliterator;
 import java.util.concurrent.ThreadLocalRandom;
-import java.util.function.BiFunction;
+import java.util.function.BiPredicate;
+import java.util.function.Function;
+import java.util.function.Supplier;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+import java.util.stream.StreamSupport;
 
 import com.google.common.annotations.VisibleForTesting;
-import com.google.common.base.Predicate;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Iterables;
-
+import com.google.common.collect.Maps;
+import com.google.common.util.concurrent.RateLimiter;
 import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.config.*;
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
 import org.apache.cassandra.io.FSDiskFullWriteError;
 import org.apache.cassandra.io.FSError;
+import org.apache.cassandra.io.FSNoDiskAvailableForWriteError;
+import org.apache.cassandra.io.FSReadError;
 import org.apache.cassandra.io.FSWriteError;
+import org.apache.cassandra.io.sstable.Component;
+import org.apache.cassandra.io.sstable.Descriptor;
+import org.apache.cassandra.io.sstable.SSTable;
+import org.apache.cassandra.io.sstable.SSTableId;
+import org.apache.cassandra.io.sstable.SSTableIdFactory;
+import org.apache.cassandra.io.util.File;
+import org.apache.cassandra.io.util.FileStoreUtils;
 import org.apache.cassandra.io.util.FileUtils;
-import org.apache.cassandra.io.sstable.*;
+import org.apache.cassandra.io.util.PathUtils;
+import org.apache.cassandra.schema.SchemaConstants;
+import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.service.snapshot.SnapshotManifest;
+import org.apache.cassandra.service.snapshot.TableSnapshot;
 import org.apache.cassandra.utils.DirectorySizeCalculator;
-import org.apache.cassandra.utils.ByteBufferUtil;
-import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.JVMStabilityInspector;
 import org.apache.cassandra.utils.Pair;
 
 /**
@@ -60,13 +90,13 @@ import org.apache.cassandra.utils.Pair;
  * } </pre>
  *
  * Until v2.0, {@code <cf dir>} is just column family name.
- * Since v2.1, {@code <cf dir>} has column family ID(cfId) added to its end.
+ * Since v2.1, {@code <cf dir>} has column family ID(tableId) added to its end.
  *
  * SSTables from secondary indexes were put in the same directory as their parent.
  * Since v2.2, they have their own directory under the parent directory whose name is index name.
  * Upon startup, those secondary index files are moved to new directory when upgrading.
  *
- * For backward compatibility, Directories can use directory without cfId if exists.
+ * For backward compatibility, Directories can use directory without tableId if exists.
  *
  * In addition, more that one 'root' data directory can be specified so that
  * {@code <path_to_data_dir>} potentially represents multiple locations.
@@ -90,15 +120,11 @@ public class Directories
     public static final String TMP_SUBDIR = "tmp";
     public static final String SECONDARY_INDEX_NAME_SEPARATOR = ".";
 
-    public static final DataDirectory[] dataDirectories;
-
-    static
-    {
-        String[] locations = DatabaseDescriptor.getAllDataFileLocations();
-        dataDirectories = new DataDirectory[locations.length];
-        for (int i = 0; i < locations.length; ++i)
-            dataDirectories[i] = new DataDirectory(new File(locations[i]));
-    }
+    /**
+     * The directories used to store keyspaces data.
+     */
+    public static final DataDirectories dataDirectories = new DataDirectories(DatabaseDescriptor.getNonLocalSystemKeyspacesDataFileLocations(),
+                                                                              DatabaseDescriptor.getLocalSystemKeyspacesDataFileLocations());
 
     /**
      * Checks whether Cassandra has RWX permissions to the specified directory.  Logs an error with
@@ -149,41 +175,42 @@ public class Directories
             switch (action)
             {
                 case X:
-                    privilege = file.canExecute();
+                    privilege = file.isExecutable();
                     break;
                 case W:
-                    privilege = file.canWrite();
+                    privilege = file.isWritable();
                     break;
                 case XW:
-                    privilege = file.canExecute() && file.canWrite();
+                    privilege = file.isExecutable() && file.isWritable();
                     break;
                 case R:
-                    privilege = file.canRead();
+                    privilege = file.isReadable();
                     break;
                 case XR:
-                    privilege = file.canExecute() && file.canRead();
+                    privilege = file.isExecutable() && file.isReadable();
                     break;
                 case RW:
-                    privilege = file.canRead() && file.canWrite();
+                    privilege = file.isReadable() && file.isWritable();
                     break;
                 case XRW:
-                    privilege = file.canExecute() && file.canRead() && file.canWrite();
+                    privilege = file.isExecutable() && file.isReadable() && file.isWritable();
                     break;
             }
             return privilege;
         }
     }
 
-    private final CFMetaData metadata;
+    private final TableMetadata metadata;
     private final DataDirectory[] paths;
     private final File[] dataPaths;
+    private final ImmutableMap<Path, DataDirectory> canonicalPathToDD;
 
-    public Directories(final CFMetaData metadata)
+    public Directories(final TableMetadata metadata)
     {
-        this(metadata, dataDirectories);
+        this(metadata, dataDirectories.getDataDirectoriesFor(metadata));
     }
 
-    public Directories(final CFMetaData metadata, Collection<DataDirectory> paths)
+    public Directories(final TableMetadata metadata, Collection<DataDirectory> paths)
     {
         this(metadata, paths.toArray(new DataDirectory[paths.size()]));
     }
@@ -194,43 +221,49 @@ public class Directories
      *
      * @param metadata metadata of ColumnFamily
      */
-    public Directories(final CFMetaData metadata, DataDirectory[] paths)
+    public Directories(final TableMetadata metadata, DataDirectory[] paths)
     {
         this.metadata = metadata;
         this.paths = paths;
-
-        String cfId = ByteBufferUtil.bytesToHex(ByteBufferUtil.bytes(metadata.cfId));
-        int idx = metadata.cfName.indexOf(SECONDARY_INDEX_NAME_SEPARATOR);
-        String cfName = idx >= 0 ? metadata.cfName.substring(0, idx) : metadata.cfName;
-        String indexNameWithDot = idx >= 0 ? metadata.cfName.substring(idx) : null;
+        ImmutableMap.Builder<Path, DataDirectory> canonicalPathsBuilder = ImmutableMap.builder();
+        String tableId = metadata.id.toHexString();
+        int idx = metadata.name.indexOf(SECONDARY_INDEX_NAME_SEPARATOR);
+        String cfName = idx >= 0 ? metadata.name.substring(0, idx) : metadata.name;
+        String indexNameWithDot = idx >= 0 ? metadata.name.substring(idx) : null;
 
         this.dataPaths = new File[paths.length];
         // If upgraded from version less than 2.1, use existing directories
-        String oldSSTableRelativePath = join(metadata.ksName, cfName);
+        String oldSSTableRelativePath = join(metadata.keyspace, cfName);
         for (int i = 0; i < paths.length; ++i)
         {
             // check if old SSTable directory exists
-            dataPaths[i] = new File(paths[i].location, oldSSTableRelativePath);
+            File dataPath = new File(paths[i].location, oldSSTableRelativePath);
+            dataPaths[i] = dataPath;
+            canonicalPathsBuilder.put(dataPath.toCanonical().toPath(), paths[i]);
         }
-        boolean olderDirectoryExists = Iterables.any(Arrays.asList(dataPaths), new Predicate<File>()
-        {
-            public boolean apply(File file)
-            {
-                return file.exists();
-            }
-        });
+        boolean olderDirectoryExists = Iterables.any(Arrays.asList(dataPaths), File::exists);
         if (!olderDirectoryExists)
         {
+            canonicalPathsBuilder = ImmutableMap.builder();
             // use 2.1+ style
-            String newSSTableRelativePath = join(metadata.ksName, cfName + '-' + cfId);
+            String newSSTableRelativePath = join(metadata.keyspace, cfName + '-' + tableId);
             for (int i = 0; i < paths.length; ++i)
-                dataPaths[i] = new File(paths[i].location, newSSTableRelativePath);
+            {
+                File dataPath = new File(paths[i].location, newSSTableRelativePath);
+                dataPaths[i] = dataPath;
+                canonicalPathsBuilder.put(dataPath.toCanonical().toPath(), paths[i]);
+            }
         }
         // if index, then move to its own directory
         if (indexNameWithDot != null)
         {
+            canonicalPathsBuilder = ImmutableMap.builder();
             for (int i = 0; i < paths.length; ++i)
-                dataPaths[i] = new File(dataPaths[i], indexNameWithDot);
+            {
+                File dataPath = new File(dataPaths[i], indexNameWithDot);
+                dataPaths[i] = dataPath;
+                canonicalPathsBuilder.put(dataPath.toCanonical().toPath(), paths[i]);
+            }
         }
 
         for (File dir : dataPaths)
@@ -243,7 +276,7 @@ public class Directories
             {
                 // don't just let the default exception handler do this, we need the create loop to continue
                 logger.error("Failed to create {} directory", dir);
-                FileUtils.handleFSError(e);
+                JVMStabilityInspector.inspectThrowable(e);
             }
         }
 
@@ -252,28 +285,22 @@ public class Directories
         {
             for (File dataPath : dataPaths)
             {
-                File[] indexFiles = dataPath.getParentFile().listFiles(new FileFilter()
-                {
-                    @Override
-                    public boolean accept(File file)
-                    {
-                        if (file.isDirectory())
-                            return false;
+                File[] indexFiles = dataPath.parent().tryList(file -> {
+                    if (file.isDirectory())
+                        return false;
 
-                        Pair<Descriptor, Component> pair = SSTable.tryComponentFromFilename(file.getParentFile(),
-                                                                                            file.getName());
-                        return pair != null && pair.left.ksname.equals(metadata.ksName) && pair.left.cfname.equals(metadata.cfName);
-
-                    }
+                    Descriptor desc = SSTable.tryDescriptorFromFile(file);
+                    return desc != null && desc.ksname.equals(metadata.keyspace) && desc.cfname.equals(metadata.name);
                 });
                 for (File indexFile : indexFiles)
                 {
-                    File destFile = new File(dataPath, indexFile.getName());
+                    File destFile = new File(dataPath, indexFile.name());
                     logger.trace("Moving index file {} to {}", indexFile, destFile);
                     FileUtils.renameWithConfirm(indexFile, destFile);
                 }
             }
         }
+        canonicalPathToDD = canonicalPathsBuilder.build();
     }
 
     /**
@@ -286,21 +313,20 @@ public class Directories
     {
         if (dataDirectory != null)
             for (File dir : dataPaths)
-                if (dir.getAbsolutePath().startsWith(dataDirectory.location.getAbsolutePath()))
+            {
+                // Note that we must compare absolute paths (not canonical) here since keyspace directories might be symlinks
+                Path dirPath = dir.toAbsolute().toPath();
+                Path locationPath = dataDirectory.location.toAbsolute().toPath();
+                if (dirPath.startsWith(locationPath))
                     return dir;
+            }
         return null;
     }
 
-    public DataDirectory getDataDirectoryForFile(File directory)
+    public DataDirectory getDataDirectoryForFile(Descriptor descriptor)
     {
-        if (directory != null)
-        {
-            for (DataDirectory dataDirectory : paths)
-            {
-                if (directory.getAbsolutePath().startsWith(dataDirectory.location.getAbsolutePath()))
-                    return dataDirectory;
-            }
-        }
+        if (descriptor != null)
+            return canonicalPathToDD.get(descriptor.directory.toPath());
         return null;
     }
 
@@ -308,18 +334,19 @@ public class Directories
     {
         for (File dir : dataPaths)
         {
-            if (new File(dir, filename).exists())
-                return Descriptor.fromFilename(dir, filename).left;
+            File file = new File(dir, filename);
+            if (file.exists())
+                return Descriptor.fromFileWithComponent(file, false).left;
         }
         return null;
     }
 
     /**
      * Basically the same as calling {@link #getWriteableLocationAsFile(long)} with an unknown size ({@code -1L}),
-     * which may return any non-blacklisted directory - even a data directory that has no usable space.
+     * which may return any allowed directory - even a data directory that has no usable space.
      * Do not use this method in production code.
      *
-     * @throws FSWriteError if all directories are blacklisted.
+     * @throws FSWriteError if all directories are disallowed.
      */
     public File getDirectoryForNewSSTables()
     {
@@ -327,9 +354,9 @@ public class Directories
     }
 
     /**
-     * Returns a non-blacklisted data directory that _currently_ has {@code writeSize} bytes as usable space.
+     * Returns an allowed directory that _currently_ has {@code writeSize} bytes as usable space.
      *
-     * @throws FSWriteError if all directories are blacklisted.
+     * @throws FSWriteError if all directories are disallowed.
      */
     public File getWriteableLocationAsFile(long writeSize)
     {
@@ -340,11 +367,46 @@ public class Directories
     }
 
     /**
-     * Returns a temporary subdirectory on non-blacklisted data directory
+     * Returns a data directory to load the file {@code sourceFile}. If the sourceFile is on same disk partition as any
+     * data directory then use that one as data directory otherwise use {@link #getWriteableLocationAsFile(long)} to
+     * find suitable data directory.
+     *
+     * Also makes sure returned directory is not disallowed.
+     *
+     * @throws FSWriteError if all directories are disallowed.
+     */
+    public File getWriteableLocationToLoadFile(final File sourceFile)
+    {
+        try
+        {
+            final FileStore srcFileStore = Files.getFileStore(sourceFile.toPath());
+            for (final File dataPath : dataPaths)
+            {
+                if (DisallowedDirectories.isUnwritable(dataPath))
+                {
+                    continue;
+                }
+
+                if (Files.getFileStore(dataPath.toPath()).equals(srcFileStore))
+                {
+                    return dataPath;
+                }
+            }
+        }
+        catch (final IOException e)
+        {
+            // pass exceptions in finding filestore. This is best effort anyway. Fall back on getWriteableLocationAsFile()
+        }
+
+        return getWriteableLocationAsFile(sourceFile.length());
+    }
+
+    /**
+     * Returns a temporary subdirectory on allowed data directory
      * that _currently_ has {@code writeSize} bytes as usable space.
      * This method does not create the temporary directory.
      *
-     * @throws IOError if all directories are blacklisted.
+     * @throws IOError if all directories are disallowed.
      */
     public File getTemporaryWriteableDirectoryAsFile(long writeSize)
     {
@@ -368,10 +430,9 @@ public class Directories
     }
 
     /**
-     * Returns a non-blacklisted data directory that _currently_ has {@code writeSize} bytes as usable space, null if
-     * there is not enough space left in all directories.
+     * Returns an allowed data directory that _currently_ has {@code writeSize} bytes as usable space.
      *
-     * @throws FSWriteError if all directories are blacklisted.
+     * @throws FSWriteError if all directories are disallowed.
      */
     public DataDirectory getWriteableLocation(long writeSize)
     {
@@ -379,13 +440,13 @@ public class Directories
 
         long totalAvailable = 0L;
 
-        // pick directories with enough space and so that resulting sstable dirs aren't blacklisted for writes.
+        // pick directories with enough space and so that resulting sstable dirs aren't disallowed for writes.
         boolean tooBig = false;
         for (DataDirectory dataDir : paths)
         {
-            if (BlacklistedDirectories.isUnwritable(getLocationForDisk(dataDir)))
+            if (DisallowedDirectories.isUnwritable(getLocationForDisk(dataDir)))
             {
-                logger.trace("removing blacklisted candidate {}", dataDir.location);
+                logger.trace("removing disallowed candidate {}", dataDir.location);
                 continue;
             }
             DataDirectoryCandidate candidate = new DataDirectoryCandidate(dataDir);
@@ -401,10 +462,12 @@ public class Directories
         }
 
         if (candidates.isEmpty())
+        {
             if (tooBig)
-                throw new FSDiskFullWriteError(new IOException("Insufficient disk space to write " + writeSize + " bytes"), "");
-            else
-                throw new FSWriteError(new IOException("All configured data directories have been blacklisted as unwritable for erroring out"), "");
+                throw new FSDiskFullWriteError(metadata.keyspace, writeSize);
+
+            throw new FSNoDiskAvailableForWriteError(metadata.keyspace);
+        }
 
         // shortcut for single data directory systems
         if (candidates.size() == 1)
@@ -442,42 +505,117 @@ public class Directories
         Collections.sort(candidates);
     }
 
-    public boolean hasAvailableDiskSpace(long estimatedSSTables, long expectedTotalWriteSize)
+    /**
+     * Sums up the space required for ongoing streams + compactions + expected new write size per FileStore and checks
+     * if there is enough space available.
+     *
+     * @param expectedNewWriteSizes where we expect to write the new compactions
+     * @param totalCompactionWriteRemaining approximate amount of data current compactions are writing - keyed by
+     *                                      the file store they are writing to (or, reading from actually, but since
+     *                                      CASSANDRA-6696 we expect compactions to read and written from the same dir)
+     * @return true if we expect to be able to write expectedNewWriteSizes to the available file stores
+     */
+    public boolean hasDiskSpaceForCompactionsAndStreams(Map<File, Long> expectedNewWriteSizes,
+                                                        Map<File, Long> totalCompactionWriteRemaining)
     {
-        long writeSize = expectedTotalWriteSize / estimatedSSTables;
-        long totalAvailable = 0L;
+        return hasDiskSpaceForCompactionsAndStreams(expectedNewWriteSizes, totalCompactionWriteRemaining, Directories::getFileStore);
+    }
 
-        for (DataDirectory dataDir : paths)
+    @VisibleForTesting
+    public static boolean hasDiskSpaceForCompactionsAndStreams(Map<File, Long> expectedNewWriteSizes,
+                                                               Map<File, Long> totalCompactionWriteRemaining,
+                                                               Function<File, FileStore> filestoreMapper)
+    {
+        Map<FileStore, Long> newWriteSizesPerFileStore = perFileStore(expectedNewWriteSizes, filestoreMapper);
+        Map<FileStore, Long> compactionsRemainingPerFileStore = perFileStore(totalCompactionWriteRemaining, filestoreMapper);
+
+        Map<FileStore, Long> totalPerFileStore = new HashMap<>();
+        for (Map.Entry<FileStore, Long> entry : newWriteSizesPerFileStore.entrySet())
         {
-            if (BlacklistedDirectories.isUnwritable(getLocationForDisk(dataDir)))
-                continue;
-            DataDirectoryCandidate candidate = new DataDirectoryCandidate(dataDir);
-            // exclude directory if its total writeSize does not fit to data directory
-            if (candidate.availableSpace < writeSize)
-                continue;
-            totalAvailable += candidate.availableSpace;
+            long addedForFilestore = entry.getValue() + compactionsRemainingPerFileStore.getOrDefault(entry.getKey(), 0L);
+            totalPerFileStore.merge(entry.getKey(), addedForFilestore, Long::sum);
         }
-        return totalAvailable > expectedTotalWriteSize;
+        return hasDiskSpaceForCompactionsAndStreams(totalPerFileStore);
+    }
+
+    /**
+     * Checks if there is enough space on all file stores to write the given amount of data.
+     * The data to write should be the total amount, ongoing writes + new writes.
+     */
+    public static boolean hasDiskSpaceForCompactionsAndStreams(Map<FileStore, Long> totalToWrite)
+    {
+        boolean hasSpace = true;
+        for (Map.Entry<FileStore, Long> toWrite : totalToWrite.entrySet())
+        {
+            long availableForCompaction = getAvailableSpaceForCompactions(toWrite.getKey());
+            logger.debug("FileStore {} has {} bytes available, checking if we can write {} bytes", toWrite.getKey(), availableForCompaction, toWrite.getValue());
+            if (availableForCompaction < toWrite.getValue())
+            {
+                logger.warn("FileStore {} has only {} available, but {} is needed",
+                            toWrite.getKey(),
+                            FileUtils.stringifyFileSize(availableForCompaction),
+                            FileUtils.stringifyFileSize((long) toWrite.getValue()));
+                hasSpace = false;
+            }
+        }
+        return hasSpace;
+    }
+
+    public static long getAvailableSpaceForCompactions(FileStore fileStore)
+    {
+        long availableSpace = 0;
+        availableSpace = FileStoreUtils.tryGetSpace(fileStore, FileStore::getUsableSpace, e -> { throw new FSReadError(e, fileStore.name()); })
+                         - DatabaseDescriptor.getMinFreeSpacePerDriveInBytes();
+        return Math.max(0L, Math.round(availableSpace * DatabaseDescriptor.getMaxSpaceForCompactionsPerDrive()));
+    }
+
+    public static Map<FileStore, Long> perFileStore(Map<File, Long> perDirectory, Function<File, FileStore> filestoreMapper)
+    {
+        return perDirectory.entrySet()
+                           .stream()
+                           .collect(Collectors.toMap(entry -> filestoreMapper.apply(entry.getKey()),
+                                                     Map.Entry::getValue,
+                                                     Long::sum));
+    }
+
+    public Set<FileStore> allFileStores(Function<File, FileStore> filestoreMapper)
+    {
+        return Arrays.stream(getWriteableLocations())
+                     .map(this::getLocationForDisk)
+                     .map(filestoreMapper)
+                     .collect(Collectors.toSet());
+    }
+
+    /**
+     * Gets the filestore for the actual directory where the sstables are stored.
+     * Handles the fact that an operator can symlink a table directory to a different filestore.
+     */
+    public static FileStore getFileStore(File directory)
+    {
+        try
+        {
+            return Files.getFileStore(directory.toPath());
+        }
+        catch (IOException e)
+        {
+            throw new FSReadError(e, directory);
+        }
     }
 
     public DataDirectory[] getWriteableLocations()
     {
-        List<DataDirectory> nonBlacklistedDirs = new ArrayList<>();
+        List<DataDirectory> allowedDirs = new ArrayList<>(paths.length);
         for (DataDirectory dir : paths)
         {
-            if (!BlacklistedDirectories.isUnwritable(dir.location))
-                nonBlacklistedDirs.add(dir);
+            if (!DisallowedDirectories.isUnwritable(dir.location))
+                allowedDirs.add(dir);
         }
 
-        Collections.sort(nonBlacklistedDirs, new Comparator<DataDirectory>()
-        {
-            @Override
-            public int compare(DataDirectory o1, DataDirectory o2)
-            {
-                return o1.location.compareTo(o2.location);
-            }
-        });
-        return nonBlacklistedDirs.toArray(new DataDirectory[nonBlacklistedDirs.size()]);
+        if (allowedDirs.isEmpty())
+            throw new FSNoDiskAvailableForWriteError(metadata.keyspace);
+
+        allowedDirs.sort(Comparator.comparing(o -> o.location));
+        return allowedDirs.toArray(new DataDirectory[allowedDirs.size()]);
     }
 
     public static File getSnapshotDirectory(Descriptor desc, String snapshotName)
@@ -498,9 +636,9 @@ public class Directories
      */
     public static File getSnapshotDirectory(File location, String snapshotName)
     {
-        if (location.getName().startsWith(SECONDARY_INDEX_NAME_SEPARATOR))
+        if (isSecondaryIndexFolder(location))
         {
-            return getOrCreate(location.getParentFile(), SNAPSHOT_SUBDIR, snapshotName, location.getName());
+            return getOrCreate(location.parent(), SNAPSHOT_SUBDIR, snapshotName, location.name());
         }
         else
         {
@@ -511,24 +649,23 @@ public class Directories
     public File getSnapshotManifestFile(String snapshotName)
     {
         File snapshotDir = getSnapshotDirectory(getDirectoryForNewSSTables(), snapshotName);
+        return getSnapshotManifestFile(snapshotDir);
+    }
+
+    public static File getSnapshotManifestFile(File snapshotDir)
+    {
         return new File(snapshotDir, "manifest.json");
     }
 
     public File getSnapshotSchemaFile(String snapshotName)
     {
         File snapshotDir = getSnapshotDirectory(getDirectoryForNewSSTables(), snapshotName);
+        return getSnapshotSchemaFile(snapshotDir);
+    }
+
+    public static File getSnapshotSchemaFile(File snapshotDir)
+    {
         return new File(snapshotDir, "schema.cql");
-    }
-
-    public File getNewEphemeralSnapshotMarkerFile(String snapshotName)
-    {
-        File snapshotDir = new File(getWriteableLocationAsFile(1L), join(SNAPSHOT_SUBDIR, snapshotName));
-        return getEphemeralSnapshotMarkerFile(snapshotDir);
-    }
-
-    private static File getEphemeralSnapshotMarkerFile(File snapshotDirectory)
-    {
-        return new File(snapshotDirectory, "ephemeral.snapshot");
     }
 
     public static File getBackupsDirectory(Descriptor desc)
@@ -538,9 +675,9 @@ public class Directories
 
     public static File getBackupsDirectory(File location)
     {
-        if (location.getName().startsWith(SECONDARY_INDEX_NAME_SEPARATOR))
+        if (isSecondaryIndexFolder(location))
         {
-            return getOrCreate(location.getParentFile(), BACKUPS_SUBDIR, location.getName());
+            return getOrCreate(location.parent(), BACKUPS_SUBDIR, location.name());
         }
         else
         {
@@ -548,19 +685,54 @@ public class Directories
         }
     }
 
+    /**
+     * Checks if the specified table should be stored with local system data.
+     *
+     * <p> To minimize the risk of failures, SSTables for local system keyspaces must be stored in a single data
+     * directory. The only exception to this are some of the system table as the server can continue operating even
+     *  if those tables loose some data.</p>
+     *
+     * @param keyspace the keyspace name
+     * @param table the table name
+     * @return {@code true} if the specified table should be stored with local system data, {@code false} otherwise.
+     */
+    public static boolean isStoredInLocalSystemKeyspacesDataLocation(String keyspace, String table)
+    {
+        String keyspaceName = keyspace.toLowerCase();
+
+        return SchemaConstants.LOCAL_SYSTEM_KEYSPACE_NAMES.contains(keyspaceName)
+                && !(SchemaConstants.SYSTEM_KEYSPACE_NAME.equals(keyspaceName)
+                        && SystemKeyspace.TABLES_SPLIT_ACROSS_MULTIPLE_DISKS.contains(table.toLowerCase()));
+    }
+
     public static class DataDirectory
     {
         public final File location;
+
+        public DataDirectory(String location)
+        {
+            this(new File(location));
+        }
 
         public DataDirectory(File location)
         {
             this.location = location;
         }
 
+        public DataDirectory(Path location)
+        {
+            this.location = new File(location);
+        }
+
         public long getAvailableSpace()
         {
-            long availableSpace = FileUtils.getUsableSpace(location) - DatabaseDescriptor.getMinFreeSpacePerDriveInBytes();
+            long availableSpace = PathUtils.tryGetSpace(location.toPath(), FileStore::getUsableSpace) - DatabaseDescriptor.getMinFreeSpacePerDriveInBytes();
             return availableSpace > 0 ? availableSpace : 0;
+        }
+
+        public long getRawSize()
+        {
+            return FileUtils.folderSize(location);
         }
 
         @Override
@@ -584,6 +756,90 @@ public class Directories
         {
             return "DataDirectory{" +
                    "location=" + location +
+                   '}';
+        }
+    }
+
+    /**
+     * Data directories used to store keyspace data.
+     */
+    public static final class DataDirectories implements Iterable<DataDirectory>
+    {
+        /**
+         * The directories for storing the local system keyspaces.
+         */
+        private final DataDirectory[] localSystemKeyspaceDataDirectories;
+
+        /**
+         * The directories where the data of the non local system keyspaces should be stored.
+         */
+        private final DataDirectory[] nonLocalSystemKeyspacesDirectories;
+
+
+        public DataDirectories(String[] locationsForNonSystemKeyspaces, String[] locationsForSystemKeyspace)
+        {
+            nonLocalSystemKeyspacesDirectories = toDataDirectories(locationsForNonSystemKeyspaces);
+            localSystemKeyspaceDataDirectories = toDataDirectories(locationsForSystemKeyspace);
+        }
+
+        private static DataDirectory[] toDataDirectories(String... locations)
+        {
+            DataDirectory[] directories = new DataDirectory[locations.length];
+            for (int i = 0; i < locations.length; ++i)
+                directories[i] = new DataDirectory(new File(locations[i]));
+            return directories;
+        }
+
+        /**
+         * Returns the data directories for the specified table.
+         *
+         * @param table the table metadata
+         * @return the data directories for the specified table
+         */
+        public DataDirectory[] getDataDirectoriesFor(TableMetadata table)
+        {
+            return isStoredInLocalSystemKeyspacesDataLocation(table.keyspace, table.name) ? localSystemKeyspaceDataDirectories
+                                                                                          : nonLocalSystemKeyspacesDirectories;
+        }
+
+        @Override
+        public Iterator<DataDirectory> iterator()
+        {
+            return getAllDirectories().iterator();
+        }
+
+        public Set<DataDirectory> getAllDirectories()
+        {
+            Set<DataDirectory> directories = new LinkedHashSet<>(nonLocalSystemKeyspacesDirectories.length + localSystemKeyspaceDataDirectories.length);
+            Collections.addAll(directories, nonLocalSystemKeyspacesDirectories);
+            Collections.addAll(directories, localSystemKeyspaceDataDirectories);
+            return directories;
+        }
+
+        @Override
+        public boolean equals(Object o)
+        {
+            if (this == o) return true;
+            if (o == null || getClass() != o.getClass()) return false;
+
+            DataDirectories that = (DataDirectories) o;
+
+            return Arrays.equals(this.localSystemKeyspaceDataDirectories, that.localSystemKeyspaceDataDirectories)
+                && Arrays.equals(this.nonLocalSystemKeyspacesDirectories, that.nonLocalSystemKeyspacesDirectories);
+        }
+
+        @Override
+        public int hashCode()
+        {
+            return Objects.hash(localSystemKeyspaceDataDirectories, nonLocalSystemKeyspacesDirectories);
+        }
+
+        @Override
+        public String toString()
+        {
+            return "DataDirectories {" +
+                   "systemKeyspaceDataDirectories=" + Arrays.toString(localSystemKeyspaceDataDirectories) +
+                   ", nonSystemKeyspacesDirectories=" + Arrays.toString(nonLocalSystemKeyspacesDirectories) +
                    '}';
         }
     }
@@ -618,6 +874,16 @@ public class Directories
             // last resort
             return System.identityHashCode(this) - System.identityHashCode(o);
         }
+
+        @Override
+        public String toString()
+        {
+            return "DataDirectoryCandidate{" +
+                   "dataDirectory=" + dataDirectory +
+                   ", availableSpace=" + availableSpace +
+                   ", perc=" + perc +
+                   '}';
+        }
     }
 
     /** The type of files that can be listed by SSTableLister, we never return txn logs,
@@ -649,10 +915,15 @@ public class Directories
 
     public SSTableLister sstableLister(OnTxnErr onTxnErr)
     {
-        return new SSTableLister(onTxnErr);
+        return new SSTableLister(this.dataPaths, this.metadata, onTxnErr);
     }
 
-    public class SSTableLister
+    public SSTableLister sstableLister(File directory, OnTxnErr onTxnErr)
+    {
+        return new SSTableLister(new File[]{directory}, metadata, onTxnErr);
+    }
+
+    public static class SSTableLister
     {
         private final OnTxnErr onTxnErr;
         private boolean skipTemporary;
@@ -662,9 +933,13 @@ public class Directories
         private final Map<Descriptor, Set<Component>> components = new HashMap<>();
         private boolean filtered;
         private String snapshotName;
+        private final File[] dataPaths;
+        private final TableMetadata metadata;
 
-        private SSTableLister(OnTxnErr onTxnErr)
+        private SSTableLister(File[] dataPaths, TableMetadata metadata, OnTxnErr onTxnErr)
         {
+            this.dataPaths = dataPaths;
+            this.metadata = metadata;
             this.onTxnErr = onTxnErr;
         }
 
@@ -707,6 +982,18 @@ public class Directories
             return ImmutableMap.copyOf(components);
         }
 
+        /**
+         * Returns a sorted version of the {@code list} method.
+         * Descriptors are sorted by generation.
+         * @return a List of descriptors to their components.
+         */
+        public List<Map.Entry<Descriptor, Set<Component>>> sortedList()
+        {
+            List<Map.Entry<Descriptor, Set<Component>>> sortedEntries = new ArrayList<>(list().entrySet());
+            sortedEntries.sort((o1, o2) -> SSTableIdFactory.COMPARATOR.compare(o1.getKey().id, o2.getKey().id));
+            return sortedEntries;
+        }
+
         public List<File> listFiles()
         {
             filter();
@@ -715,7 +1002,7 @@ public class Directories
             {
                 for (Component c : entry.getValue())
                 {
-                    l.add(new File(entry.getKey().filenameFor(c)));
+                    l.add(entry.getKey().fileFor(c));
                 }
             }
             return l;
@@ -728,7 +1015,7 @@ public class Directories
 
             for (File location : dataPaths)
             {
-                if (BlacklistedDirectories.isUnreadable(location))
+                if (DisallowedDirectories.isUnreadable(location))
                     continue;
 
                 if (snapshotName != null)
@@ -747,7 +1034,7 @@ public class Directories
             filtered = true;
         }
 
-        private BiFunction<File, FileType, Boolean> getFilter()
+        private BiPredicate<File, FileType> getFilter()
         {
             // This function always return false since it adds to the components map
             return (file, type) ->
@@ -761,12 +1048,12 @@ public class Directories
                             return false;
 
                     case FINAL:
-                        Pair<Descriptor, Component> pair = SSTable.tryComponentFromFilename(file.getParentFile(), file.getName());
+                        Pair<Descriptor, Component> pair = SSTable.tryComponentFromFilename(file);
                         if (pair == null)
                             return false;
 
                         // we are only interested in the SSTable files that belong to the specific ColumnFamily
-                        if (!pair.left.ksname.equals(metadata.ksName) || !pair.left.cfname.equals(metadata.cfName))
+                        if (!pair.left.ksname.equals(metadata.keyspace) || !pair.left.cfname.equals(metadata.name))
                             return false;
 
                         Set<Component> previous = components.get(pair.left);
@@ -774,24 +1061,6 @@ public class Directories
                         {
                             previous = new HashSet<>();
                             components.put(pair.left, previous);
-                        }
-                        else if (pair.right.type == Component.Type.DIGEST)
-                        {
-                            if (pair.right != pair.left.digestComponent)
-                            {
-                                // Need to update the DIGEST component as it might be set to another
-                                // digest type as a guess. This may happen if the first component is
-                                // not the DIGEST (but the Data component for example), so the digest
-                                // type is _guessed_ from the Version.
-                                // Although the Version explicitly defines the digest type, it doesn't
-                                // seem to be true under all circumstances. Generated sstables from a
-                                // post 2.1.8 snapshot produced Digest.sha1 files although Version
-                                // defines Adler32.
-                                // TL;DR this piece of code updates the digest component to be "correct".
-                                components.remove(pair.left);
-                                Descriptor updated = pair.left.withDigestComponent(pair.right);
-                                components.put(updated, previous);
-                            }
                         }
                         previous.add(pair.right);
                         nbFiles++;
@@ -804,62 +1073,89 @@ public class Directories
         }
     }
 
-    /**
-     *
-     * @return  Return a map of all snapshots to space being used
-     * The pair for a snapshot has size on disk and true size.
-     */
-    public Map<String, Pair<Long, Long>> getSnapshotDetails()
+    public Map<String, TableSnapshot> listSnapshots()
     {
-        final Map<String, Pair<Long, Long>> snapshotSpaceMap = new HashMap<>();
-        for (File snapshot : listSnapshots())
+        Map<String, Set<File>> snapshotDirsByTag = listSnapshotDirsByTag();
+
+        Map<String, TableSnapshot> snapshots = Maps.newHashMapWithExpectedSize(snapshotDirsByTag.size());
+
+        for (Map.Entry<String, Set<File>> entry : snapshotDirsByTag.entrySet())
         {
-            final long sizeOnDisk = FileUtils.folderSize(snapshot);
-            final long trueSize = getTrueAllocatedSizeIn(snapshot);
-            Pair<Long, Long> spaceUsed = snapshotSpaceMap.get(snapshot.getName());
-            if (spaceUsed == null)
-                spaceUsed =  Pair.create(sizeOnDisk,trueSize);
-            else
-                spaceUsed = Pair.create(spaceUsed.left + sizeOnDisk, spaceUsed.right + trueSize);
-            snapshotSpaceMap.put(snapshot.getName(), spaceUsed);
+            String tag = entry.getKey();
+            Set<File> snapshotDirs = entry.getValue();
+            SnapshotManifest manifest = maybeLoadManifest(metadata.keyspace, metadata.name, tag, snapshotDirs);
+            snapshots.put(tag, buildSnapshot(tag, manifest, snapshotDirs));
         }
-        return snapshotSpaceMap;
+
+        return snapshots;
     }
 
-    public List<String> listEphemeralSnapshots()
+    private TableSnapshot buildSnapshot(String tag, SnapshotManifest manifest, Set<File> snapshotDirs)
     {
-        final List<String> ephemeralSnapshots = new LinkedList<>();
-        for (File snapshot : listSnapshots())
-        {
-            if (getEphemeralSnapshotMarkerFile(snapshot).exists())
-                ephemeralSnapshots.add(snapshot.getName());
-        }
-        return ephemeralSnapshots;
+        boolean ephemeral = manifest != null ? manifest.isEphemeral() : isLegacyEphemeralSnapshot(snapshotDirs);
+        Instant createdAt = manifest == null ? null : manifest.createdAt;
+        Instant expiresAt = manifest == null ? null : manifest.expiresAt;
+        return new TableSnapshot(metadata.keyspace, metadata.name, metadata.id.asUUID(), tag, createdAt, expiresAt,
+                                 snapshotDirs, ephemeral);
     }
 
-    private List<File> listSnapshots()
+    private static boolean isLegacyEphemeralSnapshot(Set<File> snapshotDirs)
     {
-        final List<File> snapshots = new LinkedList<>();
+        return snapshotDirs.stream().map(d -> new File(d, "ephemeral.snapshot")).anyMatch(File::exists);
+    }
+
+    @VisibleForTesting
+    protected static SnapshotManifest maybeLoadManifest(String keyspace, String table, String tag, Set<File> snapshotDirs)
+    {
+        List<File> manifests = snapshotDirs.stream().map(d -> new File(d, "manifest.json"))
+                                           .filter(File::exists).collect(Collectors.toList());
+
+        if (manifests.isEmpty())
+        {
+            logger.warn("No manifest found for snapshot {} of table {}.{}.", tag, keyspace, table);
+            return null;
+        }
+
+        if (manifests.size() > 1) {
+            logger.warn("Found multiple manifests for snapshot {} of table {}.{}", tag, keyspace, table);
+        }
+
+        try
+        {
+            return SnapshotManifest.deserializeFromJsonFile(manifests.get(0));
+        }
+        catch (IOException e)
+        {
+            logger.warn("Cannot read manifest file {} of snapshot {}.", manifests, tag, e);
+        }
+
+        return null;
+    }
+
+    @VisibleForTesting
+    protected Map<String, Set<File>> listSnapshotDirsByTag()
+    {
+        Map<String, Set<File>> snapshotDirsByTag = new HashMap<>();
         for (final File dir : dataPaths)
         {
-            File snapshotDir = dir.getName().startsWith(SECONDARY_INDEX_NAME_SEPARATOR) ?
-                                       new File(dir.getParent(), SNAPSHOT_SUBDIR) :
-                                       new File(dir, SNAPSHOT_SUBDIR);
+            File snapshotDir = isSecondaryIndexFolder(dir)
+                               ? new File(dir.parentPath(), SNAPSHOT_SUBDIR)
+                               : new File(dir, SNAPSHOT_SUBDIR);
             if (snapshotDir.exists() && snapshotDir.isDirectory())
             {
-                final File[] snapshotDirs  = snapshotDir.listFiles();
+                final File[] snapshotDirs  = snapshotDir.tryList();
                 if (snapshotDirs != null)
                 {
                     for (final File snapshot : snapshotDirs)
                     {
-                        if (snapshot.isDirectory())
-                            snapshots.add(snapshot);
+                        if (snapshot.isDirectory()) {
+                            snapshotDirsByTag.computeIfAbsent(snapshot.name(), k -> new LinkedHashSet<>()).add(snapshot.toAbsolute());
+                        }
                     }
                 }
             }
         }
-
-        return snapshots;
+        return snapshotDirsByTag;
     }
 
     public boolean snapshotExists(String snapshotName)
@@ -867,9 +1163,9 @@ public class Directories
         for (File dir : dataPaths)
         {
             File snapshotDir;
-            if (dir.getName().startsWith(SECONDARY_INDEX_NAME_SEPARATOR))
+            if (isSecondaryIndexFolder(dir))
             {
-                snapshotDir = new File(dir.getParentFile(), join(SNAPSHOT_SUBDIR, snapshotName, dir.getName()));
+                snapshotDir = new File(dir.parent(), join(SNAPSHOT_SUBDIR, snapshotName, dir.name()));
             }
             else
             {
@@ -881,41 +1177,33 @@ public class Directories
         return false;
     }
 
-    public static void clearSnapshot(String snapshotName, List<File> snapshotDirectories)
+    public static void clearSnapshot(String snapshotName, List<File> tableDirectories, RateLimiter snapshotRateLimiter)
     {
         // If snapshotName is empty or null, we will delete the entire snapshot directory
         String tag = snapshotName == null ? "" : snapshotName;
-        for (File dir : snapshotDirectories)
+        for (File tableDir : tableDirectories)
         {
-            File snapshotDir = new File(dir, join(SNAPSHOT_SUBDIR, tag));
-            if (snapshotDir.exists())
-            {
-                logger.trace("Removing snapshot directory {}", snapshotDir);
-                try
-                {
-                    FileUtils.deleteRecursive(snapshotDir);
-                }
-                catch (FSWriteError e)
-                {
-                    if (FBUtilities.isWindows)
-                        SnapshotDeletingTask.addFailedSnapshot(snapshotDir);
-                    else
-                        throw e;
-                }
-            }
+            File snapshotDir = new File(tableDir, join(SNAPSHOT_SUBDIR, tag));
+            removeSnapshotDirectory(snapshotRateLimiter, snapshotDir);
         }
     }
 
-    // The snapshot must exist
-    public long snapshotCreationTime(String snapshotName)
+    public static void removeSnapshotDirectory(RateLimiter snapshotRateLimiter, File snapshotDir)
     {
-        for (File dir : dataPaths)
+        if (snapshotDir.exists())
         {
-            File snapshotDir = getSnapshotDirectory(dir, snapshotName);
-            if (snapshotDir.exists())
-                return snapshotDir.lastModified();
+            logger.trace("Removing snapshot directory {}", snapshotDir);
+            try
+            {
+                FileUtils.deleteRecursiveWithThrottle(snapshotDir, snapshotRateLimiter);
+            }
+            catch (RuntimeException ex)
+            {
+                if (!snapshotDir.exists())
+                    return; // ignore
+                throw ex;
+            }
         }
-        throw new RuntimeException("Snapshot " + snapshotName + " doesn't exist");
     }
 
     /**
@@ -926,9 +1214,9 @@ public class Directories
         long result = 0L;
         for (File dir : dataPaths)
         {
-            File snapshotDir = dir.getName().startsWith(SECONDARY_INDEX_NAME_SEPARATOR) ?
-                                       new File(dir.getParent(), SNAPSHOT_SUBDIR) :
-                                       new File(dir, SNAPSHOT_SUBDIR);
+            File snapshotDir = isSecondaryIndexFolder(dir)
+                               ? new File(dir.parentPath(), SNAPSHOT_SUBDIR)
+                               : new File(dir, SNAPSHOT_SUBDIR);
             result += getTrueAllocatedSizeIn(snapshotDir);
         }
         return result;
@@ -947,38 +1235,32 @@ public class Directories
         return totalAllocatedSize;
     }
 
-    public long getTrueAllocatedSizeIn(File input)
+    public long getTrueAllocatedSizeIn(File snapshotDir)
     {
-        if (!input.isDirectory())
+        if (!snapshotDir.isDirectory())
             return 0;
 
-        SSTableSizeSummer visitor = new SSTableSizeSummer(input, sstableLister(Directories.OnTxnErr.THROW).listFiles());
+        SSTableSizeSummer visitor = new SSTableSizeSummer(sstableLister(OnTxnErr.THROW).listFiles());
         try
         {
-            Files.walkFileTree(input.toPath(), visitor);
+            Files.walkFileTree(snapshotDir.toPath(), visitor);
         }
         catch (IOException e)
         {
-            logger.error("Could not calculate the size of {}. {}", input, e);
+            logger.error("Could not calculate the size of {}. {}", snapshotDir, e.getMessage());
         }
 
         return visitor.getAllocatedSize();
     }
 
+    // Recursively finds all the sub directories in the KS directory.
     public static List<File> getKSChildDirectories(String ksName)
     {
-        return getKSChildDirectories(ksName, dataDirectories);
-
-    }
-
-    // Recursively finds all the sub directories in the KS directory.
-    public static List<File> getKSChildDirectories(String ksName, DataDirectory[] directories)
-    {
         List<File> result = new ArrayList<>();
-        for (DataDirectory dataDirectory : directories)
+        for (DataDirectory dataDirectory : dataDirectories.getAllDirectories())
         {
             File ksDir = new File(dataDirectory.location, ksName);
-            File[] cfDirs = ksDir.listFiles();
+            File[] cfDirs = ksDir.tryList();
             if (cfDirs == null)
                 continue;
             for (File cfDir : cfDirs)
@@ -988,6 +1270,16 @@ public class Directories
             }
         }
         return result;
+    }
+
+    public static boolean isSecondaryIndexFolder(File dir)
+    {
+        return dir.name().startsWith(SECONDARY_INDEX_NAME_SEPARATOR);
+    }
+
+    public static boolean isSecondaryIndexFolder(Path dir)
+    {
+        return PathUtils.filename(dir).startsWith(SECONDARY_INDEX_NAME_SEPARATOR);
     }
 
     public List<File> getCFDirectories()
@@ -1001,6 +1293,24 @@ public class Directories
         return result;
     }
 
+    /**
+     * Initializes the sstable unique identifier generator using a provided builder for this instance of directories.
+     * If the id builder needs that, sstables in these directories are listed to provide the existing identifiers to
+     * the builder. The listing is done lazily so if the builder does not require that, listing is skipped.
+     */
+    public <T extends SSTableId> Supplier<T> getUIDGenerator(SSTableId.Builder<T> builder)
+    {
+        // this stream is evaluated lazily - if the generator does not need the existing ids, we do not even call #sstableLister
+        Stream<SSTableId> curIds = StreamSupport.stream(() -> sstableLister(Directories.OnTxnErr.IGNORE)
+                                                              .includeBackups(true)
+                                                              .list()
+                                                              .keySet()
+                                                              .spliterator(), Spliterator.DISTINCT, false)
+                                                .map(d -> d.id);
+
+        return builder.generator(curIds);
+    }
+
     private static File getOrCreate(File base, String... subdirs)
     {
         File dir = subdirs == null || subdirs.length == 0 ? base : new File(base, join(subdirs));
@@ -1009,7 +1319,7 @@ public class Directories
             if (!dir.isDirectory())
                 throw new AssertionError(String.format("Invalid directory path %s: path exists but is not a directory", dir));
         }
-        else if (!dir.mkdirs() && !(dir.exists() && dir.isDirectory()))
+        else if (!dir.tryCreateDirectories() && !(dir.exists() && dir.isDirectory()))
         {
             throw new FSWriteError(new IOException("Unable to create directory " + dir), dir);
         }
@@ -1018,42 +1328,27 @@ public class Directories
 
     private static String join(String... s)
     {
-        return StringUtils.join(s, File.separator);
-    }
-
-    @VisibleForTesting
-    static void overrideDataDirectoriesForTest(String loc)
-    {
-        for (int i = 0; i < dataDirectories.length; ++i)
-            dataDirectories[i] = new DataDirectory(new File(loc));
-    }
-
-    @VisibleForTesting
-    static void resetDataDirectoriesAfterTest()
-    {
-        String[] locations = DatabaseDescriptor.getAllDataFileLocations();
-        for (int i = 0; i < locations.length; ++i)
-            dataDirectories[i] = new DataDirectory(new File(locations[i]));
+        return StringUtils.join(s, File.pathSeparator());
     }
 
     private class SSTableSizeSummer extends DirectorySizeCalculator
     {
-        private final HashSet<File> toSkip;
-        SSTableSizeSummer(File path, List<File> files)
+        private final Set<String> toSkip;
+        SSTableSizeSummer(List<File> files)
         {
-            super(path);
-            toSkip = new HashSet<>(files);
+            toSkip = files.stream().map(File::name).collect(Collectors.toSet());
         }
 
         @Override
         public boolean isAcceptable(Path path)
         {
-            File file = path.toFile();
-            Pair<Descriptor, Component> pair = SSTable.tryComponentFromFilename(path.getParent().toFile(), file.getName());
-            return pair != null
-                    && pair.left.ksname.equals(metadata.ksName)
-                    && pair.left.cfname.equals(metadata.cfName)
-                    && !toSkip.contains(file);
+            File file = new File(path);
+            Descriptor desc = SSTable.tryDescriptorFromFile(file);
+            return desc != null
+                && desc.ksname.equals(metadata.keyspace)
+                && desc.cfname.equals(metadata.name)
+                && !toSkip.contains(file.name());
         }
     }
+
 }

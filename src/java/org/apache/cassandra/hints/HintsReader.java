@@ -18,7 +18,6 @@
 package org.apache.cassandra.hints;
 
 import java.io.EOFException;
-import java.io.File;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.Iterator;
@@ -28,15 +27,16 @@ import javax.annotation.Nullable;
 import com.google.common.primitives.Ints;
 import com.google.common.util.concurrent.RateLimiter;
 
+import org.apache.cassandra.io.util.File;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.db.UnknownColumnFamilyException;
+import org.apache.cassandra.exceptions.UnknownTableException;
 import org.apache.cassandra.io.FSReadError;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.AbstractIterator;
-import org.apache.cassandra.utils.ByteBufferUtil;
-import org.apache.cassandra.utils.NativeLibrary;
+
+import static org.apache.cassandra.utils.Clock.Global.currentTimeMillis;
 
 /**
  * A paged non-compressed hints reader that provides two iterators:
@@ -53,7 +53,7 @@ class HintsReader implements AutoCloseable, Iterable<HintsReader.Page>
 {
     private static final Logger logger = LoggerFactory.getLogger(HintsReader.class);
 
-    // don't read more than 512 KB of hints at a time.
+    // don't read more than 512 KiB of hints at a time.
     private static final int PAGE_SIZE = 512 << 10;
 
     private final HintsDescriptor descriptor;
@@ -166,6 +166,7 @@ class HintsReader implements AutoCloseable, Iterable<HintsReader.Page>
     final class HintsIterator extends AbstractIterator<Hint>
     {
         private final InputPosition offset;
+        private final long now = currentTimeMillis();
 
         HintsIterator(InputPosition offset)
         {
@@ -212,6 +213,14 @@ class HintsReader implements AutoCloseable, Iterable<HintsReader.Page>
             input.resetLimit();
 
             int size = input.readInt();
+            if (size == 0)
+            {
+                // Avoid throwing IOException when a hint file ends with a run of zeros - this
+                // can happen when hard-rebooting unresponsive machines.
+                if (!verifyAllZeros(input))
+                    throw new IOException("Corrupt hint file found");
+                throw new EOFException("Unexpected end of file (size == 0)");
+            }
 
             // if we cannot corroborate the size via crc, then we cannot safely skip this hint
             if (!input.checkCrc())
@@ -229,15 +238,15 @@ class HintsReader implements AutoCloseable, Iterable<HintsReader.Page>
             Hint hint;
             try
             {
-                hint = Hint.serializer.deserialize(input, descriptor.messagingVersion());
+                hint = Hint.serializer.deserializeIfLive(input, now, size, descriptor.messagingVersion());
                 input.checkLimit(0);
             }
-            catch (UnknownColumnFamilyException e)
+            catch (UnknownTableException e)
             {
                 logger.warn("Failed to read a hint for {}: {} - table with id {} is unknown in file {}",
                             StorageService.instance.getEndpointForHostId(descriptor.hostId),
                             descriptor.hostId,
-                            e.cfId,
+                            e.id,
                             descriptor.fileName());
                 input.skipBytes(Ints.checkedCast(size - input.bytesPastLimit()));
 
@@ -263,6 +272,7 @@ class HintsReader implements AutoCloseable, Iterable<HintsReader.Page>
     final class BuffersIterator extends AbstractIterator<ByteBuffer>
     {
         private final InputPosition offset;
+        private final long now = currentTimeMillis();
 
         BuffersIterator(InputPosition offset)
         {
@@ -309,6 +319,14 @@ class HintsReader implements AutoCloseable, Iterable<HintsReader.Page>
             input.resetLimit();
 
             int size = input.readInt();
+            if (size == 0)
+            {
+                // Avoid throwing IOException when a hint file ends with a run of zeros - this
+                // can happen when hard-rebooting unresponsive machines.
+                if (!verifyAllZeros(input))
+                    throw new IOException("Corrupt hint file found");
+                throw new EOFException("Unexpected end of file (size == 0)");
+            }
 
             // if we cannot corroborate the size via crc, then we cannot safely skip this hint
             if (!input.checkCrc())
@@ -323,7 +341,7 @@ class HintsReader implements AutoCloseable, Iterable<HintsReader.Page>
                 rateLimiter.acquire(size);
             input.limit(size);
 
-            ByteBuffer buffer = ByteBufferUtil.read(input, size);
+            ByteBuffer buffer = Hint.serializer.readBufferIfLive(input, now, size, descriptor.messagingVersion());
             if (input.checkCrc())
                 return buffer;
 
@@ -334,5 +352,15 @@ class HintsReader implements AutoCloseable, Iterable<HintsReader.Page>
                         descriptor.fileName());
             return null;
         }
+    }
+
+    private static boolean verifyAllZeros(ChecksummedDataInput input) throws IOException
+    {
+        while (!input.isEOF())
+        {
+            if (input.readByte() != 0)
+                return false;
+        }
+        return true;
     }
 }

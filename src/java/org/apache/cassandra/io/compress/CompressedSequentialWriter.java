@@ -19,7 +19,6 @@ package org.apache.cassandra.io.compress;
 
 import java.io.DataOutputStream;
 import java.io.EOFException;
-import java.io.File;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.Channels;
@@ -30,8 +29,14 @@ import org.apache.cassandra.io.FSReadError;
 import org.apache.cassandra.io.FSWriteError;
 import org.apache.cassandra.io.sstable.CorruptSSTableException;
 import org.apache.cassandra.io.sstable.metadata.MetadataCollector;
-import org.apache.cassandra.io.util.*;
+import org.apache.cassandra.io.util.ChecksumWriter;
+import org.apache.cassandra.io.util.DataPosition;
+import org.apache.cassandra.io.util.File;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.io.util.SequentialWriter;
+import org.apache.cassandra.io.util.SequentialWriterOption;
 import org.apache.cassandra.schema.CompressionParams;
+import org.apache.cassandra.utils.ByteBufferUtil;
 
 import static org.apache.cassandra.utils.Throwables.merge;
 
@@ -60,18 +65,20 @@ public class CompressedSequentialWriter extends SequentialWriter
     private final ByteBuffer crcCheckBuffer = ByteBuffer.allocate(4);
     private final Optional<File> digestFile;
 
+    private final int maxCompressedLength;
+
     /**
      * Create CompressedSequentialWriter without digest file.
      *
      * @param file File to write
-     * @param offsetsPath File name to write compression metadata
+     * @param offsetsFile File to write compression metadata
      * @param digestFile File to write digest
      * @param option Write option (buffer size and type will be set the same as compression params)
      * @param parameters Compression mparameters
      * @param sstableMetadataCollector Metadata collector
      */
     public CompressedSequentialWriter(File file,
-                                      String offsetsPath,
+                                      File offsetsFile,
                                       File digestFile,
                                       SequentialWriterOption option,
                                       CompressionParams parameters,
@@ -90,8 +97,10 @@ public class CompressedSequentialWriter extends SequentialWriter
         // buffer for compression should be the same size as buffer itself
         compressed = compressor.preferredBufferType().allocate(compressor.initialCompressedBufferLength(buffer.capacity()));
 
+        maxCompressedLength = parameters.maxCompressedLength();
+
         /* Index File (-CompressionInfo.db component) and it's header */
-        metadataWriter = CompressionMetadata.Writer.open(parameters, offsetsPath);
+        metadataWriter = CompressionMetadata.Writer.open(parameters, offsetsFile);
 
         this.sstableMetadataCollector = sstableMetadataCollector;
         crcMetadata = new ChecksumWriter(new DataOutputStream(Channels.newOutputStream(channel)));
@@ -144,8 +153,28 @@ public class CompressedSequentialWriter extends SequentialWriter
             throw new RuntimeException("Compression exception", e); // shouldn't happen
         }
 
+        int uncompressedLength = buffer.position();
         int compressedLength = compressed.position();
-        uncompressedSize += buffer.position();
+        uncompressedSize += uncompressedLength;
+        ByteBuffer toWrite = compressed;
+        if (compressedLength >= maxCompressedLength)
+        {
+            toWrite = buffer;
+            if (uncompressedLength >= maxCompressedLength)
+            {
+                compressedLength = uncompressedLength;
+            }
+            else
+            {
+                // Pad the uncompressed data so that it reaches the max compressed length.
+                // This could make the chunk appear longer, but this path is only reached at the end of the file, where
+                // we use the file size to limit the buffer on reading.
+                assert maxCompressedLength <= buffer.capacity();   // verified by CompressionParams.validate
+                buffer.limit(maxCompressedLength);
+                ByteBufferUtil.writeZeroes(buffer, maxCompressedLength - uncompressedLength);
+                compressedLength = maxCompressedLength;
+            }
+        }
         compressedSize += compressedLength;
 
         try
@@ -155,18 +184,20 @@ public class CompressedSequentialWriter extends SequentialWriter
             chunkCount++;
 
             // write out the compressed data
-            compressed.flip();
-            channel.write(compressed);
+            toWrite.flip();
+            channel.write(toWrite);
 
             // write corresponding checksum
-            compressed.rewind();
-            crcMetadata.appendDirect(compressed, true);
+            toWrite.rewind();
+            crcMetadata.appendDirect(toWrite, true);
             lastFlushOffset = uncompressedSize;
         }
         catch (IOException e)
         {
             throw new FSWriteError(e, getPath());
         }
+        if (toWrite == buffer)
+            buffer.position(uncompressedLength);
 
         // next chunk should be written right after current + length of the checksum (int)
         chunkOffset += compressedLength + 4;
@@ -214,7 +245,10 @@ public class CompressedSequentialWriter extends SequentialWriter
         // compressed chunk size (- 4 bytes reserved for checksum)
         int chunkSize = (int) (metadataWriter.chunkOffsetBy(realMark.nextChunkIndex) - chunkOffset - 4);
         if (compressed.capacity() < chunkSize)
+        {
+            FileUtils.clean(compressed);
             compressed = compressor.preferredBufferType().allocate(chunkSize);
+        }
 
         try
         {
@@ -228,7 +262,10 @@ public class CompressedSequentialWriter extends SequentialWriter
                 // Repopulate buffer from compressed data
                 buffer.clear();
                 compressed.flip();
-                compressor.uncompress(compressed, buffer);
+                if (chunkSize < maxCompressedLength)
+                    compressor.uncompress(compressed, buffer);
+                else
+                    buffer.put(compressed);
             }
             catch (IOException e)
             {
@@ -298,6 +335,41 @@ public class CompressedSequentialWriter extends SequentialWriter
                 throw new FSReadError(e, getPath());
             }
         }
+    }
+
+    // Page management using chunk boundaries
+
+    @Override
+    public int maxBytesInPage()
+    {
+        return buffer.capacity();
+    }
+
+    @Override
+    public void padToPageBoundary()
+    {
+        if (buffer.position() == 0)
+            return;
+
+        int padLength = bytesLeftInPage();
+
+        // Flush as much as we have
+        doFlush(0);
+        // But pretend we had a whole chunk
+        bufferOffset += padLength;
+        lastFlushOffset += padLength;
+    }
+
+    @Override
+    public int bytesLeftInPage()
+    {
+        return buffer.remaining();
+    }
+
+    @Override
+    public long paddedPosition()
+    {
+        return position() + (buffer.position() == 0 ? 0 : buffer.remaining());
     }
 
     protected class TransactionalProxy extends SequentialWriter.TransactionalProxy

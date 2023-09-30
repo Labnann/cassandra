@@ -83,6 +83,16 @@ public class PartitionGenerator
         return !(index < 0 || index < clusteringComponents.size());
     }
 
+    public List<Generator> getPartitionKey()
+    {
+        return Collections.unmodifiableList(partitionKey);
+    }
+
+    public List<Generator> getClusteringComponents()
+    {
+        return Collections.unmodifiableList(clusteringComponents);
+    }
+
     public int indexOf(String name)
     {
         Integer i = indexMap.get(name);
@@ -94,10 +104,10 @@ public class PartitionGenerator
     public ByteBuffer convert(int c, Object v)
     {
         if (c < 0)
-            return partitionKey.get(-1-c).type.decompose(v);
+            return partitionKey.get(-1-c).type.decomposeUntyped(v);
         if (c < clusteringComponents.size())
-            return clusteringComponents.get(c).type.decompose(v);
-        return valueComponents.get(c - clusteringComponents.size()).type.decompose(v);
+            return clusteringComponents.get(c).type.decomposeUntyped(v);
+        return valueComponents.get(c - clusteringComponents.size()).type.decomposeUntyped(v);
     }
 
     public Object convert(int c, ByteBuffer v)

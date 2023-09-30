@@ -23,6 +23,8 @@ import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.MoreObjects;
 import com.google.common.base.Objects;
 
+import org.apache.cassandra.service.ClientState;
+
 /**
  * An immutable class representing keyspace parameters (durability and replication).
  */
@@ -31,8 +33,8 @@ public final class KeyspaceParams
     public static final boolean DEFAULT_DURABLE_WRITES = true;
 
     /**
-     * This determines durable writes for the {@link org.apache.cassandra.config.SchemaConstants#SCHEMA_KEYSPACE_NAME}
-     * and {@link org.apache.cassandra.config.SchemaConstants#SYSTEM_KEYSPACE_NAME} keyspaces,
+     * This determines durable writes for the {@link org.apache.cassandra.schema.SchemaConstants#SCHEMA_KEYSPACE_NAME}
+     * and {@link org.apache.cassandra.schema.SchemaConstants#SYSTEM_KEYSPACE_NAME} keyspaces,
      * the only reason it is not final is for commitlog unit tests. It should only be changed for testing purposes.
      */
     @VisibleForTesting
@@ -74,6 +76,11 @@ public final class KeyspaceParams
         return new KeyspaceParams(true, ReplicationParams.simple(replicationFactor));
     }
 
+    public static KeyspaceParams simple(String replicationFactor)
+    {
+        return new KeyspaceParams(true, ReplicationParams.simple(replicationFactor));
+    }
+
     public static KeyspaceParams simpleTransient(int replicationFactor)
     {
         return new KeyspaceParams(false, ReplicationParams.simple(replicationFactor));
@@ -84,9 +91,9 @@ public final class KeyspaceParams
         return new KeyspaceParams(true, ReplicationParams.nts(args));
     }
 
-    public void validate(String name)
+    public void validate(String name, ClientState state)
     {
-        replication.validate(name);
+        replication.validate(name, state);
     }
 
     @Override

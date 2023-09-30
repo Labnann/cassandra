@@ -25,8 +25,6 @@ import java.nio.channels.WritableByteChannel;
 
 import org.apache.cassandra.utils.memory.MemoryUtil;
 
-import com.google.common.base.Function;
-
 /**
  * Base class for DataOutput implementations that does not have an optimized implementations of Plus methods
  * and does no buffering.
@@ -371,15 +369,4 @@ public abstract class UnbufferedDataOutputStreamPlus extends DataOutputStreamPlu
         }
     }
 
-    public void write(Memory memory, long offset, long length) throws IOException
-    {
-        for (ByteBuffer buffer : memory.asByteBuffers(offset, length))
-            write(buffer);
-    }
-
-    @Override
-    public <R> R applyToChannel(Function<WritableByteChannel, R> f) throws IOException
-    {
-        return f.apply(channel);
-    }
 }

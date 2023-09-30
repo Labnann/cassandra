@@ -20,7 +20,6 @@ package org.apache.cassandra.dht.tokenallocator;
 
 import java.util.Collections;
 import java.util.List;
-import java.util.Map;
 import java.util.NavigableMap;
 import java.util.PriorityQueue;
 import java.util.Random;
@@ -29,11 +28,13 @@ import com.google.common.collect.Maps;
 import org.apache.commons.math3.stat.descriptive.SummaryStatistics;
 import org.junit.Test;
 
-import junit.framework.Assert;
+import org.junit.Assert;
 import org.apache.cassandra.dht.IPartitioner;
 import org.apache.cassandra.dht.Murmur3Partitioner;
 import org.apache.cassandra.dht.RandomPartitioner;
 import org.apache.cassandra.dht.Token;
+
+import static org.apache.cassandra.utils.Clock.Global.currentTimeMillis;
 
 public class NoReplicationTokenAllocatorTest extends TokenAllocatorTestBase
 {
@@ -150,7 +151,7 @@ public class NoReplicationTokenAllocatorTest extends TokenAllocatorTestBase
         if (size < targetClusterSize)
         {
             System.out.format("Adding %d unit(s) using %s...", targetClusterSize - size, t.toString());
-            long time = System.currentTimeMillis();
+            long time = currentTimeMillis();
 
             while (size < targetClusterSize)
             {
@@ -161,7 +162,7 @@ public class NoReplicationTokenAllocatorTest extends TokenAllocatorTestBase
                 if (verifyMetrics)
                     updateSummary(t, su, st, false);
             }
-            System.out.format(" Done in %.3fs\n", (System.currentTimeMillis() - time) / 1000.0);
+            System.out.format(" Done in %.3fs\n", (currentTimeMillis() - time) / 1000.0);
 
             if (verifyMetrics)
             {
@@ -184,7 +185,7 @@ public class NoReplicationTokenAllocatorTest extends TokenAllocatorTestBase
         {
             unitStat.addValue(wu.weight * size / t.tokensInUnits.get(wu.value.unit).size());
         }
-        su.update(unitStat);
+        su.update(unitStat, t.sortedUnits.size());
 
         SummaryStatistics tokenStat = new SummaryStatistics();
         for (PriorityQueue<TokenAllocatorBase.Weighted<TokenAllocatorBase.TokenInfo>> tokens : t.tokensInUnits.values())
@@ -194,7 +195,7 @@ public class NoReplicationTokenAllocatorTest extends TokenAllocatorTestBase
                 tokenStat.addValue(token.weight);
             }
         }
-        st.update(tokenStat);
+        st.update(tokenStat, t.sortedUnits.size());
 
         if (print)
         {

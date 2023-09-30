@@ -20,14 +20,16 @@ package org.apache.cassandra.cql3.restrictions;
 import java.nio.ByteBuffer;
 import java.util.*;
 
-import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.db.guardrails.Guardrails;
+import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.cql3.QueryOptions;
 import org.apache.cassandra.cql3.statements.Bound;
 import org.apache.cassandra.db.ClusteringComparator;
 import org.apache.cassandra.db.ClusteringPrefix;
 import org.apache.cassandra.db.MultiCBuilder;
 import org.apache.cassandra.db.filter.RowFilter;
-import org.apache.cassandra.index.SecondaryIndexManager;
+import org.apache.cassandra.index.IndexRegistry;
+import org.apache.cassandra.service.ClientState;
 
 /**
  * A set of single restrictions on the partition key.
@@ -40,7 +42,7 @@ final class PartitionKeySingleRestrictionSet extends RestrictionSetWrapper imple
     /**
      * The composite type.
      */
-    protected final ClusteringComparator comparator;
+    private final ClusteringComparator comparator;
 
     public PartitionKeySingleRestrictionSet(ClusteringComparator comparator)
     {
@@ -59,7 +61,12 @@ final class PartitionKeySingleRestrictionSet extends RestrictionSetWrapper imple
     {
         List<ByteBuffer> l = new ArrayList<>(clusterings.size());
         for (ClusteringPrefix clustering : clusterings)
-            l.add(CFMetaData.serializePartitionKey(clustering));
+        {
+            // Can not use QueryProcessor.validateKey here to validate each column as that validates that empty are not allowed
+            // but composite partition keys actually allow empty!
+            clustering.validate();
+            l.add(clustering.serializeAsPartitionKey());
+        }
         return l;
     }
 
@@ -78,12 +85,16 @@ final class PartitionKeySingleRestrictionSet extends RestrictionSetWrapper imple
     }
 
     @Override
-    public List<ByteBuffer> values(QueryOptions options)
+    public List<ByteBuffer> values(QueryOptions options, ClientState state)
     {
         MultiCBuilder builder = MultiCBuilder.create(comparator, hasIN());
         for (SingleRestriction r : restrictions)
         {
             r.appendTo(builder, options);
+
+            if (hasIN() && Guardrails.inSelectCartesianProduct.enabled(state))
+                Guardrails.inSelectCartesianProduct.guard(builder.buildSize(), "partition key", false, state);
+
             if (builder.hasMissingElements())
                 break;
         }
@@ -120,40 +131,35 @@ final class PartitionKeySingleRestrictionSet extends RestrictionSetWrapper imple
     }
 
     @Override
-    public void addRowFilterTo(RowFilter filter,
-                               SecondaryIndexManager indexManager,
+    public void addToRowFilter(RowFilter filter,
+                               IndexRegistry indexRegistry,
                                QueryOptions options)
     {
         for (SingleRestriction restriction : restrictions)
         {
-             restriction.addRowFilterTo(filter, indexManager, options);
+             restriction.addToRowFilter(filter, indexRegistry, options);
         }
     }
 
     @Override
-    public boolean needFiltering(CFMetaData cfm)
+    public boolean needFiltering(TableMetadata table)
     {
         if (isEmpty())
             return false;
 
         // slice or has unrestricted key component
-        return hasUnrestrictedPartitionKeyComponents(cfm) || hasSlice() || hasContains();
+        return hasUnrestrictedPartitionKeyComponents(table) || hasSlice() || hasContains();
     }
 
     @Override
-    public boolean hasUnrestrictedPartitionKeyComponents(CFMetaData cfm)
+    public boolean hasUnrestrictedPartitionKeyComponents(TableMetadata table)
     {
-        return size() < cfm.partitionKeyColumns().size();
+        return size() < table.partitionKeyColumns().size();
     }
 
     @Override
     public boolean hasSlice()
     {
-        for (SingleRestriction restriction : restrictions)
-        {
-            if (restriction.isSlice())
-                return true;
-        }
-        return false;
+        return restrictions.hasSlice();
     }
 }

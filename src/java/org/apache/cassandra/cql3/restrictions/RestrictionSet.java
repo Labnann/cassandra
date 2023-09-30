@@ -21,13 +21,15 @@ import java.util.*;
 
 import com.google.common.collect.AbstractIterator;
 
-import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.index.Index;
+import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.cql3.QueryOptions;
 import org.apache.cassandra.cql3.functions.Function;
-import org.apache.cassandra.cql3.restrictions.SingleColumnRestriction.ContainsRestriction;
 import org.apache.cassandra.db.filter.RowFilter;
 import org.apache.cassandra.exceptions.InvalidRequestException;
-import org.apache.cassandra.index.SecondaryIndexManager;
+import org.apache.cassandra.index.IndexRegistry;
+import org.apache.commons.lang3.builder.ToStringBuilder;
+import org.apache.commons.lang3.builder.ToStringStyle;
 
 /**
  * Sets of column restrictions.
@@ -39,49 +41,88 @@ final class RestrictionSet implements Restrictions, Iterable<SingleRestriction>
     /**
      * The comparator used to sort the <code>Restriction</code>s.
      */
-    private static final Comparator<ColumnDefinition> COLUMN_DEFINITION_COMPARATOR = new Comparator<ColumnDefinition>()
+    private static final Comparator<ColumnMetadata> COLUMN_DEFINITION_COMPARATOR = new Comparator<ColumnMetadata>()
     {
         @Override
-        public int compare(ColumnDefinition column, ColumnDefinition otherColumn)
+        public int compare(ColumnMetadata column, ColumnMetadata otherColumn)
         {
             int value = Integer.compare(column.position(), otherColumn.position());
             return value != 0 ? value : column.name.bytes.compareTo(otherColumn.name.bytes);
         }
     };
 
+    private static final TreeMap<ColumnMetadata, SingleRestriction> EMPTY = new TreeMap<>(COLUMN_DEFINITION_COMPARATOR);
+
     /**
      * The restrictions per column.
      */
-    protected final TreeMap<ColumnDefinition, SingleRestriction> restrictions;
+    private final TreeMap<ColumnMetadata, SingleRestriction> restrictions;
 
     /**
      * {@code true} if it contains multi-column restrictions, {@code false} otherwise.
      */
     private final boolean hasMultiColumnRestrictions;
 
+    private final boolean hasIn;
+    private final boolean hasContains;
+    private final boolean hasSlice;
+    private final boolean hasOnlyEqualityRestrictions;
+
     public RestrictionSet()
     {
-        this(new TreeMap<ColumnDefinition, SingleRestriction>(COLUMN_DEFINITION_COMPARATOR), false);
+        this(EMPTY, false,
+             false,
+             false,
+             false,
+             true);
     }
 
-    private RestrictionSet(TreeMap<ColumnDefinition, SingleRestriction> restrictions,
-                           boolean hasMultiColumnRestrictions)
+    private RestrictionSet(TreeMap<ColumnMetadata, SingleRestriction> restrictions,
+                           boolean hasMultiColumnRestrictions,
+                           boolean hasIn,
+                           boolean hasContains,
+                           boolean hasSlice,
+                           boolean hasOnlyEqualityRestrictions)
     {
         this.restrictions = restrictions;
         this.hasMultiColumnRestrictions = hasMultiColumnRestrictions;
+        this.hasIn = hasIn;
+        this.hasContains = hasContains;
+        this.hasSlice = hasSlice;
+        this.hasOnlyEqualityRestrictions = hasOnlyEqualityRestrictions;
     }
 
     @Override
-    public void addRowFilterTo(RowFilter filter, SecondaryIndexManager indexManager, QueryOptions options) throws InvalidRequestException
+    public void addToRowFilter(RowFilter filter, IndexRegistry indexRegistry, QueryOptions options) throws InvalidRequestException
     {
         for (Restriction restriction : restrictions.values())
-            restriction.addRowFilterTo(filter, indexManager, options);
+            restriction.addToRowFilter(filter, indexRegistry, options);
     }
 
     @Override
-    public List<ColumnDefinition> getColumnDefs()
+    public boolean needsFiltering(Index.Group indexGroup)
+    {
+        for (SingleRestriction restriction : restrictions.values())
+        {
+            if (restriction.needsFiltering(indexGroup))
+                return true;
+        }
+        return false;
+    }
+
+    @Override
+    public List<ColumnMetadata> getColumnDefs()
     {
         return new ArrayList<>(restrictions.keySet());
+    }
+
+    /**
+     * @return a direct reference to the key set from {@link #restrictions} with no defenseive copying
+     */
+    @Override
+    public Collection<ColumnMetadata> getColumnDefinitions()
+    {
+        return restrictions.keySet();
     }
 
     @Override
@@ -108,9 +149,9 @@ final class RestrictionSet implements Restrictions, Iterable<SingleRestriction>
      * @param kind the column kind
      * @return {@code true} if one of the restrictions applies to a column of the specific kind, {@code false} otherwise.
      */
-    public boolean hasRestrictionFor(ColumnDefinition.Kind kind)
+    public boolean hasRestrictionFor(ColumnMetadata.Kind kind)
     {
-        for (ColumnDefinition column : restrictions.keySet())
+        for (ColumnMetadata column : restrictions.keySet())
         {
             if (column.kind == kind)
                 return true;
@@ -127,19 +168,30 @@ final class RestrictionSet implements Restrictions, Iterable<SingleRestriction>
     public RestrictionSet addRestriction(SingleRestriction restriction)
     {
         // RestrictionSet is immutable so we need to clone the restrictions map.
-        TreeMap<ColumnDefinition, SingleRestriction> newRestrictions = new TreeMap<>(this.restrictions);
-        return new RestrictionSet(mergeRestrictions(newRestrictions, restriction), hasMultiColumnRestrictions || restriction.isMultiColumn());
+        TreeMap<ColumnMetadata, SingleRestriction> newRestricitons = new TreeMap<>(this.restrictions);
+
+        boolean newHasIn = hasIn || restriction.isIN();
+        boolean newHasContains = hasContains || restriction.isContains();
+        boolean newHasSlice = hasSlice || restriction.isSlice();
+        boolean newHasOnlyEqualityRestrictions = hasOnlyEqualityRestrictions && (restriction.isEQ() || restriction.isIN());
+
+        return new RestrictionSet(mergeRestrictions(newRestricitons, restriction),
+                                  hasMultiColumnRestrictions || restriction.isMultiColumn(),
+                                  newHasIn,
+                                  newHasContains,
+                                  newHasSlice,
+                                  newHasOnlyEqualityRestrictions);
     }
 
-    private TreeMap<ColumnDefinition, SingleRestriction> mergeRestrictions(TreeMap<ColumnDefinition, SingleRestriction> restrictions,
-                                                                           SingleRestriction restriction)
+    private TreeMap<ColumnMetadata, SingleRestriction> mergeRestrictions(TreeMap<ColumnMetadata, SingleRestriction> restrictions,
+                                                                         SingleRestriction restriction)
     {
-        Collection<ColumnDefinition> columnDefs = restriction.getColumnDefs();
+        Collection<ColumnMetadata> columnDefs = restriction.getColumnDefs();
         Set<SingleRestriction> existingRestrictions = getRestrictions(columnDefs);
 
         if (existingRestrictions.isEmpty())
         {
-            for (ColumnDefinition columnDef : columnDefs)
+            for (ColumnMetadata columnDef : columnDefs)
                 restrictions.put(columnDef, restriction);
         }
         else
@@ -148,7 +200,7 @@ final class RestrictionSet implements Restrictions, Iterable<SingleRestriction>
             {
                 SingleRestriction newRestriction = mergeRestrictions(existing, restriction);
 
-                for (ColumnDefinition columnDef : columnDefs)
+                for (ColumnMetadata columnDef : columnDefs)
                     restrictions.put(columnDef, newRestriction);
             }
         }
@@ -157,7 +209,7 @@ final class RestrictionSet implements Restrictions, Iterable<SingleRestriction>
     }
 
     @Override
-    public Set<Restriction> getRestrictions(ColumnDefinition columnDef)
+    public Set<Restriction> getRestrictions(ColumnMetadata columnDef)
     {
         Restriction existing = restrictions.get(columnDef);
         return existing == null ? Collections.emptySet() : Collections.singleton(existing);
@@ -169,10 +221,10 @@ final class RestrictionSet implements Restrictions, Iterable<SingleRestriction>
      * @param columnDefs the column definitions
      * @return all the restrictions applied to the specified columns
      */
-    private Set<SingleRestriction> getRestrictions(Collection<ColumnDefinition> columnDefs)
+    private Set<SingleRestriction> getRestrictions(Collection<ColumnMetadata> columnDefs)
     {
         Set<SingleRestriction> set = new HashSet<>();
-        for (ColumnDefinition columnDef : columnDefs)
+        for (ColumnMetadata columnDef : columnDefs)
         {
             SingleRestriction existing = restrictions.get(columnDef);
             if (existing != null)
@@ -182,11 +234,11 @@ final class RestrictionSet implements Restrictions, Iterable<SingleRestriction>
     }
 
     @Override
-    public final boolean hasSupportingIndex(SecondaryIndexManager indexManager)
+    public boolean hasSupportingIndex(IndexRegistry indexRegistry)
     {
         for (Restriction restriction : restrictions.values())
         {
-            if (restriction.hasSupportingIndex(indexManager))
+            if (restriction.hasSupportingIndex(indexRegistry))
                 return true;
         }
         return false;
@@ -198,19 +250,19 @@ final class RestrictionSet implements Restrictions, Iterable<SingleRestriction>
      * @param columnDef the column for which the next one need to be found
      * @return the column after the specified one.
      */
-    ColumnDefinition nextColumn(ColumnDefinition columnDef)
+    ColumnMetadata nextColumn(ColumnMetadata columnDef)
     {
         return restrictions.tailMap(columnDef, false).firstKey();
     }
 
     @Override
-    public ColumnDefinition getFirstColumn()
+    public ColumnMetadata getFirstColumn()
     {
         return isEmpty() ? null : this.restrictions.firstKey();
     }
 
     @Override
-    public ColumnDefinition getLastColumn()
+    public ColumnMetadata getLastColumn()
     {
         return isEmpty() ? null : this.restrictions.lastKey();
     }
@@ -240,26 +292,6 @@ final class RestrictionSet implements Restrictions, Iterable<SingleRestriction>
                                    : restriction.mergeWith(otherRestriction);
     }
 
-    /**
-     * Checks if the restrictions contains multiple contains, contains key, or map[key] = value.
-     *
-     * @return <code>true</code> if the restrictions contains multiple contains, contains key, or ,
-     * map[key] = value; <code>false</code> otherwise
-     */
-    public final boolean hasMultipleContains()
-    {
-        int numberOfContains = 0;
-        for (SingleRestriction restriction : restrictions.values())
-        {
-            if (restriction.isContains())
-            {
-                ContainsRestriction contains = (ContainsRestriction) restriction;
-                numberOfContains += (contains.numberOfValues() + contains.numberOfKeys() + contains.numberOfEntries());
-            }
-        }
-        return numberOfContains > 1;
-    }
-
     @Override
     public Iterator<SingleRestriction> iterator()
     {
@@ -273,32 +305,17 @@ final class RestrictionSet implements Restrictions, Iterable<SingleRestriction>
      */
     public final boolean hasIN()
     {
-        for (SingleRestriction restriction : this)
-        {
-            if (restriction.isIN())
-                return true;
-        }
-        return false;
+        return hasIn;
     }
 
     public boolean hasContains()
     {
-        for (SingleRestriction restriction : this)
-        {
-            if (restriction.isContains())
-                return true;
-        }
-        return false;
+        return hasContains;
     }
 
     public final boolean hasSlice()
     {
-        for (SingleRestriction restriction : this)
-        {
-            if (restriction.isSlice())
-                return true;
-        }
-        return false;
+        return hasSlice;
     }
 
     /**
@@ -309,18 +326,12 @@ final class RestrictionSet implements Restrictions, Iterable<SingleRestriction>
      */
     public final boolean hasOnlyEqualityRestrictions()
     {
-        for (SingleRestriction restriction : this)
-        {
-            if (!restriction.isEQ() && !restriction.isIN())
-                return false;
-        }
-        return true;
+        return hasOnlyEqualityRestrictions;
     }
 
     /**
      * {@code Iterator} decorator that removes duplicates in an ordered one.
      *
-     * @param iterator the decorated iterator
      * @param <E> the iterator element type.
      */
     private static final class DistinctIterator<E> extends AbstractIterator<E>
@@ -353,5 +364,11 @@ final class RestrictionSet implements Restrictions, Iterable<SingleRestriction>
             }
             return endOfData();
         }
+    }
+    
+    @Override
+    public String toString()
+    {
+        return ToStringBuilder.reflectionToString(this, ToStringStyle.SHORT_PREFIX_STYLE);
     }
 }

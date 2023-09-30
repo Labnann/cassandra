@@ -26,10 +26,14 @@ import com.google.common.primitives.UnsignedLongs;
 import org.apache.cassandra.cql3.CQL3Type;
 import org.apache.cassandra.cql3.Constants;
 import org.apache.cassandra.cql3.Term;
+import org.apache.cassandra.cql3.functions.ArgumentDeserializer;
 import org.apache.cassandra.serializers.TypeSerializer;
 import org.apache.cassandra.serializers.MarshalException;
 import org.apache.cassandra.serializers.UUIDSerializer;
 import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.bytecomparable.ByteComparable;
+import org.apache.cassandra.utils.bytecomparable.ByteSource;
+import org.apache.cassandra.utils.bytecomparable.ByteSourceInverse;
 import org.apache.cassandra.utils.UUIDGen;
 
 /**
@@ -46,6 +50,10 @@ public class UUIDType extends AbstractType<UUID>
 {
     public static final UUIDType instance = new UUIDType();
 
+    private static final ArgumentDeserializer ARGUMENT_DESERIALIZER = new DefaultArgumentDeserializer(instance);
+
+    private static final ByteBuffer MASKED_VALUE = instance.decompose(UUID.fromString("00000000-0000-0000-0000-000000000000"));
+
     UUIDType()
     {
         super(ComparisonType.CUSTOM);
@@ -56,24 +64,22 @@ public class UUIDType extends AbstractType<UUID>
         return true;
     }
 
-    public int compareCustom(ByteBuffer b1, ByteBuffer b2)
+    public <VL, VR> int compareCustom(VL left, ValueAccessor<VL> accessorL, VR right, ValueAccessor<VR> accessorR)
     {
-        // Compare for length
-        int s1 = b1.position(), s2 = b2.position();
-        int l1 = b1.limit(), l2 = b2.limit();
 
-        // should we assert exactly 16 bytes (or 0)? seems prudent
-        boolean p1 = l1 - s1 == 16, p2 = l2 - s2 == 16;
+        // Compare for length
+        boolean p1 = accessorL.size(left) == 16, p2 = accessorR.size(right) == 16;
         if (!(p1 & p2))
         {
-            assert p1 | (l1 == s1);
-            assert p2 | (l2 == s2);
+            // should we assert exactly 16 bytes (or 0)? seems prudent
+            assert p1 || accessorL.isEmpty(left);
+            assert p2 || accessorR.isEmpty(right);
             return p1 ? 1 : p2 ? -1 : 0;
         }
 
         // Compare versions
-        long msb1 = b1.getLong(s1);
-        long msb2 = b2.getLong(s2);
+        long msb1 = accessorL.getLong(left, 0);
+        long msb2 = accessorR.getLong(right, 0);
 
         int version1 = (int) ((msb1 >>> 12) & 0xf);
         int version2 = (int) ((msb2 >>> 12) & 0xf);
@@ -98,7 +104,69 @@ public class UUIDType extends AbstractType<UUID>
                 return c;
         }
 
-        return UnsignedLongs.compare(b1.getLong(s1 + 8), b2.getLong(s2 + 8));
+        // Amusingly (or not so much), although UUIDType freely takes time UUIDs (UUIDs with version 1), it compares
+        // them differently than TimeUUIDType. This is evident in the least significant bytes comparison (the code
+        // below for UUIDType), where UUIDType treats them as unsigned bytes, while TimeUUIDType compares the bytes
+        // signed. See CASSANDRA-8730 for details around this discrepancy.
+        return UnsignedLongs.compare(accessorL.getLong(left, 8), accessorR.getLong(right, 8));
+    }
+
+    @Override
+    public <V> ByteSource asComparableBytes(ValueAccessor<V> accessor, V data, ByteComparable.Version v)
+    {
+        if (accessor.isEmpty(data))
+            return null;
+
+        long msb = accessor.getLong(data, 0);
+        long version = ((msb >>> 12) & 0xf);
+        ByteBuffer swizzled = ByteBuffer.allocate(16);
+
+        if (version == 1)
+            swizzled.putLong(0, TimeUUIDType.reorderTimestampBytes(msb));
+        else
+            swizzled.putLong(0, (version << 60) | ((msb >>> 4) & 0x0FFFFFFFFFFFF000L) | (msb & 0xFFFL));
+
+        swizzled.putLong(8, accessor.getLong(data, 8));
+
+        // fixed-length thus prefix-free
+        return ByteSource.fixedLength(swizzled);
+    }
+
+    @Override
+    public <V> V fromComparableBytes(ValueAccessor<V> accessor, ByteSource.Peekable comparableBytes, ByteComparable.Version version)
+    {
+        // Optional-style encoding of empty values as null sources
+        if (comparableBytes == null)
+            return accessor.empty();
+
+        // The UUID bits are stored as an unsigned fixed-length 128-bit integer.
+        long hiBits = ByteSourceInverse.getUnsignedFixedLengthAsLong(comparableBytes, 8);
+        long loBits = ByteSourceInverse.getUnsignedFixedLengthAsLong(comparableBytes, 8);
+
+        long uuidVersion = hiBits >>> 60 & 0xF;
+        if (uuidVersion == 1)
+        {
+            // If the version bits are set to 1, this is a time-based UUID, and its high bits are significantly more
+            // shuffled than in other UUIDs. Revert the shuffle.
+            hiBits = TimeUUIDType.reorderBackTimestampBytes(hiBits);
+        }
+        else
+        {
+            // For non-time UUIDs, the only thing that's needed is to put the version bits back where they were originally.
+            hiBits = hiBits << 4 & 0xFFFFFFFFFFFF0000L
+                     | uuidVersion << 12
+                     | hiBits & 0x0000000000000FFFL;
+        }
+
+        return makeUuidBytes(accessor, hiBits, loBits);
+    }
+
+    static <V> V makeUuidBytes(ValueAccessor<V> accessor, long high, long low)
+    {
+        V buffer = accessor.allocate(16);
+        accessor.putLong(buffer, 0, high);
+        accessor.putLong(buffer, 8, low);
+        return buffer;
     }
 
     @Override
@@ -124,9 +192,16 @@ public class UUIDType extends AbstractType<UUID>
         return CQL3Type.Native.UUID;
     }
 
+    @Override
     public TypeSerializer<UUID> getSerializer()
     {
         return UUIDSerializer.instance;
+    }
+
+    @Override
+    public ArgumentDeserializer getArgumentDeserializer()
+    {
+        return ARGUMENT_DESERIALIZER;
     }
 
     static final Pattern regexPattern = Pattern.compile("[A-Fa-f0-9]{8}\\-[A-Fa-f0-9]{4}\\-[A-Fa-f0-9]{4}\\-[A-Fa-f0-9]{4}\\-[A-Fa-f0-9]{12}");
@@ -171,8 +246,14 @@ public class UUIDType extends AbstractType<UUID>
     }
 
     @Override
-    protected int valueLengthIfFixed()
+    public int valueLengthIfFixed()
     {
         return 16;
+    }
+
+    @Override
+    public ByteBuffer getMaskedValue()
+    {
+        return MASKED_VALUE;
     }
 }

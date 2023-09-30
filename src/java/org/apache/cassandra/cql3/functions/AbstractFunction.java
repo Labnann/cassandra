@@ -17,14 +17,21 @@
  */
 package org.apache.cassandra.cql3.functions;
 
+import java.nio.ByteBuffer;
 import java.util.List;
 
 import com.google.common.base.Objects;
 
 import org.apache.cassandra.cql3.AssignmentTestable;
+import org.apache.cassandra.cql3.CQL3Type;
+import org.apache.cassandra.cql3.CQL3Type.Tuple;
 import org.apache.cassandra.cql3.ColumnSpecification;
+import org.apache.cassandra.cql3.CqlBuilder;
 import org.apache.cassandra.db.marshal.AbstractType;
+
 import org.apache.commons.lang3.text.StrBuilder;
+
+import static java.util.stream.Collectors.toList;
 
 /**
  * Base class for our native/hardcoded functions.
@@ -57,6 +64,14 @@ public abstract class AbstractFunction implements Function
         return returnType;
     }
 
+    public List<String> argumentsList()
+    {
+        return argTypes().stream()
+                         .map(AbstractType::asCQL3Type)
+                         .map(CQL3Type::toString)
+                         .collect(toList());
+    }
+
     @Override
     public boolean equals(Object o)
     {
@@ -74,7 +89,7 @@ public abstract class AbstractFunction implements Function
         functions.add(this);
     }
 
-    public boolean hasReferenceTo(Function function)
+    public boolean referencesUserType(ByteBuffer name)
     {
         return false;
     }
@@ -103,18 +118,49 @@ public abstract class AbstractFunction implements Function
     }
 
     @Override
+    public AbstractType<?> getCompatibleTypeIfKnown(String keyspace)
+    {
+        return returnType();
+    }
+
+    @Override
     public String toString()
     {
-        StringBuilder sb = new StringBuilder();
-        sb.append(name).append(" : (");
-        for (int i = 0; i < argTypes.size(); i++)
-        {
-            if (i > 0)
-                sb.append(", ");
-            sb.append(argTypes.get(i).asCQL3Type());
-        }
-        sb.append(") -> ").append(returnType.asCQL3Type());
-        return sb.toString();
+        return new CqlBuilder().append(name)
+                              .append(" : (")
+                              .appendWithSeparators(argTypes, (b, t) -> b.append(toCqlString(t)), ", ")
+                              .append(") -> ")
+                              .append(returnType)
+                              .toString();
+    }
+
+    public String elementKeyspace()
+    {
+        return name.keyspace;
+    }
+
+    public String elementName()
+    {
+        return new CqlBuilder().append(name.name)
+                               .append('(')
+                               .appendWithSeparators(argTypes, (b, t) -> b.append(toCqlString(t)), ", ")
+                               .append(')')
+                               .toString();
+    }
+
+    /**
+     * Converts the specified type into its CQL representation.
+     *
+     * <p>For user function and aggregates tuples need to be handle in a special way as they are frozen by nature
+     * but the frozen keyword should not appear in their CQL definition.</p>
+     *
+     * @param type the type
+     * @return the CQL representation of the specified type
+     */
+    protected String toCqlString(AbstractType<?> type)
+    {
+        return type.isTuple() ? ((Tuple) type.asCQL3Type()).toString(false)
+                              : type.asCQL3Type().toString();
     }
 
     @Override
@@ -124,5 +170,35 @@ public abstract class AbstractFunction implements Function
                                                 .appendWithSeparators(columnNames, ", ")
                                                 .append(')')
                                                 .toString();
+    }
+
+    /*
+     * We need to compare the CQL3 representation of the type because comparing
+     * the AbstractType will fail for example if a UDT has been changed.
+     * Reason is that UserType.equals() takes the field names and types into account.
+     * Example CQL sequence that would fail when comparing AbstractType:
+     *    CREATE TYPE foo ...
+     *    CREATE FUNCTION bar ( par foo ) RETURNS foo ...
+     *    ALTER TYPE foo ADD ...
+     * or
+     *    ALTER TYPE foo ALTER ...
+     * or
+     *    ALTER TYPE foo RENAME ...
+     */
+    public boolean typesMatch(List<AbstractType<?>> types)
+    {
+        if (argTypes().size() != types.size())
+            return false;
+
+        for (int i = 0; i < argTypes().size(); i++)
+            if (!typesMatch(argTypes().get(i), types.get(i)))
+                return false;
+
+        return true;
+    }
+
+    private static boolean typesMatch(AbstractType<?> t1, AbstractType<?> t2)
+    {
+        return t1.freeze().asCQL3Type().toString().equals(t2.freeze().asCQL3Type().toString());
     }
 }

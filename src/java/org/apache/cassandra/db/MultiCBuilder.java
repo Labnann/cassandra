@@ -23,7 +23,7 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.NavigableSet;
 
-import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.btree.BTreeSet;
 
@@ -130,6 +130,13 @@ public abstract class MultiCBuilder
     }
 
     /**
+     * Returns the current number of results when {@link #build()} is called
+     *
+     * @return the current number of build results
+     */
+    public abstract int buildSize();
+
+    /**
      * Checks if the clusterings contains null elements.
      *
      * @return <code>true</code> if the clusterings contains <code>null</code> elements, <code>false</code> otherwise.
@@ -163,7 +170,7 @@ public abstract class MultiCBuilder
      *
      * @return the clusterings
      */
-    public abstract NavigableSet<Clustering> build();
+    public abstract NavigableSet<Clustering<?>> build();
 
     /**
      * Builds the <code>ClusteringBound</code>s for slice restrictions.
@@ -174,10 +181,10 @@ public abstract class MultiCBuilder
      * @param columnDefs the columns of the slice restriction
      * @return the <code>ClusteringBound</code>s
      */
-    public abstract NavigableSet<ClusteringBound> buildBoundForSlice(boolean isStart,
-                                                                 boolean isInclusive,
-                                                                 boolean isOtherBoundInclusive,
-                                                                 List<ColumnDefinition> columnDefs);
+    public abstract NavigableSet<ClusteringBound<?>> buildBoundForSlice(boolean isStart,
+                                                                        boolean isInclusive,
+                                                                        boolean isOtherBoundInclusive,
+                                                                        List<ColumnMetadata> columnDefs);
 
     /**
      * Builds the <code>ClusteringBound</code>s
@@ -186,7 +193,7 @@ public abstract class MultiCBuilder
      * @param isInclusive specify if the bound is inclusive or not
      * @return the <code>ClusteringBound</code>s
      */
-    public abstract NavigableSet<ClusteringBound> buildBound(boolean isStart, boolean isInclusive);
+    public abstract NavigableSet<ClusteringBound<?>> buildBound(boolean isStart, boolean isInclusive);
 
     /**
      * Checks if some elements can still be added to the clusterings.
@@ -252,7 +259,13 @@ public abstract class MultiCBuilder
             return addEachElementToAll(values.get(0));
         }
 
-        public NavigableSet<Clustering> build()
+        @Override
+        public int buildSize()
+        {
+            return hasMissingElements ? 0 : 1;
+        }
+
+        public NavigableSet<Clustering<?>> build()
         {
             built = true;
 
@@ -263,15 +276,15 @@ public abstract class MultiCBuilder
         }
 
         @Override
-        public NavigableSet<ClusteringBound> buildBoundForSlice(boolean isStart,
-                                                                boolean isInclusive,
-                                                                boolean isOtherBoundInclusive,
-                                                                List<ColumnDefinition> columnDefs)
+        public NavigableSet<ClusteringBound<?>> buildBoundForSlice(boolean isStart,
+                                                                   boolean isInclusive,
+                                                                   boolean isOtherBoundInclusive,
+                                                                   List<ColumnMetadata> columnDefs)
         {
             return buildBound(isStart, columnDefs.get(0).isReversedType() ? isOtherBoundInclusive : isInclusive);
         }
 
-        public NavigableSet<ClusteringBound> buildBound(boolean isStart, boolean isInclusive)
+        public NavigableSet<ClusteringBound<?>> buildBound(boolean isStart, boolean isInclusive)
         {
             built = true;
 
@@ -279,13 +292,13 @@ public abstract class MultiCBuilder
                 return BTreeSet.empty(comparator);
 
             if (size == 0)
-                return BTreeSet.of(comparator, isStart ? ClusteringBound.BOTTOM : ClusteringBound.TOP);
+                return BTreeSet.of(comparator, isStart ? BufferClusteringBound.BOTTOM : BufferClusteringBound.TOP);
 
             ByteBuffer[] newValues = size == elements.length
                                    ? elements
                                    : Arrays.copyOf(elements, size);
 
-            return BTreeSet.of(comparator, ClusteringBound.create(ClusteringBound.boundKind(isStart, isInclusive), newValues));
+            return BTreeSet.of(comparator, BufferClusteringBound.create(ClusteringBound.boundKind(isStart, isInclusive), newValues));
         }
     }
 
@@ -309,7 +322,7 @@ public abstract class MultiCBuilder
             checkUpdateable();
 
             if (elementsList.isEmpty())
-                elementsList.add(new ArrayList<ByteBuffer>());
+                elementsList.add(new ArrayList<>());
 
             if (value == null)
                 containsNull = true;
@@ -328,7 +341,7 @@ public abstract class MultiCBuilder
             checkUpdateable();
 
             if (elementsList.isEmpty())
-                elementsList.add(new ArrayList<ByteBuffer>());
+                elementsList.add(new ArrayList<>());
 
             if (values.isEmpty())
             {
@@ -365,7 +378,7 @@ public abstract class MultiCBuilder
             checkUpdateable();
 
             if (elementsList.isEmpty())
-                elementsList.add(new ArrayList<ByteBuffer>());
+                elementsList.add(new ArrayList<>());
 
             if (values.isEmpty())
             {
@@ -397,7 +410,13 @@ public abstract class MultiCBuilder
             return this;
         }
 
-        public NavigableSet<Clustering> build()
+        @Override
+        public int buildSize()
+        {
+            return hasMissingElements ? 0 : elementsList.size();
+        }
+
+        public NavigableSet<Clustering<?>> build()
         {
             built = true;
 
@@ -409,7 +428,7 @@ public abstract class MultiCBuilder
             if (elementsList.isEmpty())
                 return BTreeSet.of(builder.comparator(), builder.build());
 
-            BTreeSet.Builder<Clustering> set = BTreeSet.builder(builder.comparator());
+            BTreeSet.Builder<Clustering<?>> set = BTreeSet.builder(builder.comparator());
             for (int i = 0, m = elementsList.size(); i < m; i++)
             {
                 List<ByteBuffer> elements = elementsList.get(i);
@@ -418,10 +437,10 @@ public abstract class MultiCBuilder
             return set.build();
         }
 
-        public NavigableSet<ClusteringBound> buildBoundForSlice(boolean isStart,
-                                                            boolean isInclusive,
-                                                            boolean isOtherBoundInclusive,
-                                                            List<ColumnDefinition> columnDefs)
+        public NavigableSet<ClusteringBound<?>> buildBoundForSlice(boolean isStart,
+                                                                   boolean isInclusive,
+                                                                   boolean isOtherBoundInclusive,
+                                                                   List<ColumnMetadata> columnDefs)
         {
             built = true;
 
@@ -434,7 +453,7 @@ public abstract class MultiCBuilder
                 return BTreeSet.of(comparator, builder.buildBound(isStart, isInclusive));
 
             // Use a TreeSet to sort and eliminate duplicates
-            BTreeSet.Builder<ClusteringBound> set = BTreeSet.builder(comparator);
+            BTreeSet.Builder<ClusteringBound<?>> set = BTreeSet.builder(comparator);
 
             // The first column of the slice might not be the first clustering column (e.g. clustering_0 = ? AND (clustering_1, clustering_2) >= (?, ?)
             int offset = columnDefs.get(0).position();
@@ -454,7 +473,7 @@ public abstract class MultiCBuilder
                 // For example: if we have clustering_0 DESC and clustering_1 ASC a slice like (clustering_0, clustering_1) > (1, 2)
                 // will produce 2 slices: [BOTTOM, 1) and (1.2, 1]
                 // So, the END bound will return 2 bounds with the same values 1
-                ColumnDefinition lastColumn = columnDefs.get(columnDefs.size() - 1);
+                ColumnMetadata lastColumn = columnDefs.get(columnDefs.size() - 1);
                 if (elements.size() <= lastColumn.position() && i < m - 1 && elements.equals(elementsList.get(i + 1)))
                 {
                     set.add(builder.buildBoundWith(elements, isStart, false));
@@ -463,13 +482,13 @@ public abstract class MultiCBuilder
                 }
 
                 // Handle the normal bounds
-                ColumnDefinition column = columnDefs.get(elements.size() - 1 - offset);
+                ColumnMetadata column = columnDefs.get(elements.size() - 1 - offset);
                 set.add(builder.buildBoundWith(elements, isStart, column.isReversedType() ? isOtherBoundInclusive : isInclusive));
             }
             return set.build();
         }
 
-        public NavigableSet<ClusteringBound> buildBound(boolean isStart, boolean isInclusive)
+        public NavigableSet<ClusteringBound<?>> buildBound(boolean isStart, boolean isInclusive)
         {
             built = true;
 
@@ -482,7 +501,7 @@ public abstract class MultiCBuilder
                 return BTreeSet.of(comparator, builder.buildBound(isStart, isInclusive));
 
             // Use a TreeSet to sort and eliminate duplicates
-            BTreeSet.Builder<ClusteringBound> set = BTreeSet.builder(comparator);
+            BTreeSet.Builder<ClusteringBound<?>> set = BTreeSet.builder(comparator);
 
             for (int i = 0, m = elementsList.size(); i < m; i++)
             {

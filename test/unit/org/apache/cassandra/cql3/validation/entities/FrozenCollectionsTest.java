@@ -26,6 +26,7 @@ import org.junit.Assert;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
+import org.apache.cassandra.ServerTestUtils;
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.restrictions.StatementRestrictions;
 import org.apache.cassandra.db.marshal.*;
@@ -43,6 +44,7 @@ public class FrozenCollectionsTest extends CQLTester
     @BeforeClass
     public static void setUpClass()     // overrides CQLTester.setUpClass()
     {
+        ServerTestUtils.daemonInitialization();
         // Selecting partitioner for a table is not exposed on CREATE TABLE.
         StorageService.instance.setPartitionerUnsafe(ByteOrderedPartitioner.instance);
 
@@ -50,63 +52,92 @@ public class FrozenCollectionsTest extends CQLTester
     }
 
     @Test
-    public void testPartitionKeyUsage() throws Throwable
+    public void testPartitionKeyUsageSet() throws Throwable
     {
-        createTable("CREATE TABLE %s (k frozen<set<int>> PRIMARY KEY, v int)");
+        testPartitionKeyUsage("set<int>",
+                              set(),
+                              set(1, 2, 3),
+                              set(4, 5, 6),
+                              set(7, 8, 9));
+    }
 
-        execute("INSERT INTO %s (k, v) VALUES (?, ?)", set(), 1);
-        execute("INSERT INTO %s (k, v) VALUES (?, ?)", set(1, 2, 3), 1);
-        execute("INSERT INTO %s (k, v) VALUES (?, ?)", set(4, 5, 6), 0);
-        execute("INSERT INTO %s (k, v) VALUES (?, ?)", set(7, 8, 9), 0);
+    @Test
+    public void testPartitionKeyUsageList() throws Throwable
+    {
+        testPartitionKeyUsage("list<int>",
+                              list(),
+                              list(1, 2, 3),
+                              list(4, 5, 6),
+                              list(7, 8, 9));
+    }
+
+    @Test
+    public void testPartitionKeyUsageMap() throws Throwable
+    {
+        testPartitionKeyUsage("map<int, int>",
+                              map(),
+                              map(1, 10, 2, 20, 3, 30),
+                              map(4, 40, 5, 50, 6, 60),
+                              map(7, 70, 8, 80, 9, 90));
+    }
+
+    private void testPartitionKeyUsage(String type, Object v1, Object v2, Object v3, Object v4) throws Throwable
+    {
+        createTable("CREATE TABLE %s (k frozen<" + type + "> PRIMARY KEY, v int)");
+
+        execute("INSERT INTO %s (k, v) VALUES (?, ?)", v1, 1);
+        execute("INSERT INTO %s (k, v) VALUES (?, ?)", v2, 1);
+        execute("INSERT INTO %s (k, v) VALUES (?, ?)", v3, 0);
+        execute("INSERT INTO %s (k, v) VALUES (?, ?)", v4, 0);
 
         // overwrite with an update
-        execute("UPDATE %s SET v=? WHERE k=?", 0, set());
-        execute("UPDATE %s SET v=? WHERE k=?", 0, set(1, 2, 3));
+        execute("UPDATE %s SET v=? WHERE k=?", 0, v1);
+        execute("UPDATE %s SET v=? WHERE k=?", 0, v2);
 
         assertRows(execute("SELECT * FROM %s"),
-            row(set(), 0),
-            row(set(1, 2, 3), 0),
-            row(set(4, 5, 6), 0),
-            row(set(7, 8, 9), 0)
+                   row(v1, 0),
+                   row(v2, 0),
+                   row(v3, 0),
+                   row(v4, 0)
         );
 
         assertRows(execute("SELECT k FROM %s"),
-            row(set()),
-            row(set(1, 2, 3)),
-            row(set(4, 5, 6)),
-            row(set(7, 8, 9))
+                   row(v1),
+                   row(v2),
+                   row(v3),
+                   row(v4)
         );
 
         assertRows(execute("SELECT * FROM %s LIMIT 2"),
-                row(set(), 0),
-                row(set(1, 2, 3), 0)
+                   row(v1, 0),
+                   row(v2, 0)
         );
 
-        assertRows(execute("SELECT * FROM %s WHERE k=?", set(4, 5, 6)),
-            row(set(4, 5, 6), 0)
+        assertRows(execute("SELECT * FROM %s WHERE k=?", v3),
+                   row(v3, 0)
         );
 
-        assertRows(execute("SELECT * FROM %s WHERE k=?", set()),
-                row(set(), 0)
+        assertRows(execute("SELECT * FROM %s WHERE k=?", v1),
+                   row(v1, 0)
         );
 
-        assertRows(execute("SELECT * FROM %s WHERE k IN ?", list(set(4, 5, 6), set())),
-                   row(set(), 0),
-                   row(set(4, 5, 6), 0)
+        assertRows(execute("SELECT * FROM %s WHERE k IN ?", list(v3, v1)),
+                   row(v1, 0),
+                   row(v3, 0)
         );
 
-        assertRows(execute("SELECT * FROM %s WHERE token(k) >= token(?)", set(4, 5, 6)),
-                row(set(4, 5, 6), 0),
-                row(set(7, 8, 9), 0)
+        assertRows(execute("SELECT * FROM %s WHERE token(k) >= token(?)", v3),
+                   row(v3, 0),
+                   row(v4, 0)
         );
 
         assertInvalid("INSERT INTO %s (k, v) VALUES (null, 0)");
 
-        execute("DELETE FROM %s WHERE k=?", set());
-        execute("DELETE FROM %s WHERE k=?", set(4, 5, 6));
+        execute("DELETE FROM %s WHERE k=?", v1);
+        execute("DELETE FROM %s WHERE k=?", v3);
         assertRows(execute("SELECT * FROM %s"),
-            row(set(1, 2, 3), 0),
-            row(set(7, 8, 9), 0)
+                   row(v2, 0),
+                   row(v4, 0)
         );
     }
 
@@ -181,274 +212,514 @@ public class FrozenCollectionsTest extends CQLTester
     }
 
     @Test
-    public void testClusteringKeyUsage() throws Throwable
+    public void testClusteringKeyUsageSet() throws Throwable
     {
-        for (String option : Arrays.asList("", " WITH COMPACT STORAGE"))
-        {
-            createTable("CREATE TABLE %s (a int, b frozen<set<int>>, c int, PRIMARY KEY (a, b))" + option);
+        testClusteringKeyUsage("set<int>",
+                               set(),
+                               set(1, 2, 3),
+                               set(4, 5, 6),
+                               set(7, 8, 9));
+    }
 
-            execute("INSERT INTO %s (a, b, c) VALUES (?, ?, ?)", 0, set(), 1);
-            execute("INSERT INTO %s (a, b, c) VALUES (?, ?, ?)", 0, set(1, 2, 3), 1);
-            execute("INSERT INTO %s (a, b, c) VALUES (?, ?, ?)", 0, set(4, 5, 6), 0);
-            execute("INSERT INTO %s (a, b, c) VALUES (?, ?, ?)", 0, set(7, 8, 9), 0);
+    @Test
+    public void testClusteringKeyUsageList() throws Throwable
+    {
+        testClusteringKeyUsage("list<int>",
+                               list(),
+                               list(1, 2, 3),
+                               list(4, 5, 6),
+                               list(7, 8, 9));
+    }
 
-            // overwrite with an update
-            execute("UPDATE %s SET c=? WHERE a=? AND b=?", 0, 0, set());
-            execute("UPDATE %s SET c=? WHERE a=? AND b=?", 0, 0, set(1, 2, 3));
+    @Test
+    public void testClusteringKeyUsageMap() throws Throwable
+    {
+        testClusteringKeyUsage("map<int, int>",
+                               map(),
+                               map(1, 10, 2, 20, 3, 30),
+                               map(4, 40, 5, 50, 6, 60),
+                               map(7, 70, 8, 80, 9, 90));
+    }
 
-            assertRows(execute("SELECT * FROM %s"),
-                row(0, set(), 0),
-                row(0, set(1, 2, 3), 0),
-                row(0, set(4, 5, 6), 0),
-                row(0, set(7, 8, 9), 0)
-            );
+    private void testClusteringKeyUsage(String type, Object v1, Object v2, Object v3, Object v4) throws Throwable
+    {
+        createTable(String.format("CREATE TABLE %%s (a int, b frozen<%s>, c int, PRIMARY KEY (a, b))", type));
 
-            assertRows(execute("SELECT b FROM %s"),
-                row(set()),
-                row(set(1, 2, 3)),
-                row(set(4, 5, 6)),
-                row(set(7, 8, 9))
-            );
+        execute("INSERT INTO %s (a, b, c) VALUES (?, ?, ?)", 0, v1, 1);
+        execute("INSERT INTO %s (a, b, c) VALUES (?, ?, ?)", 0, v2, 1);
+        execute("INSERT INTO %s (a, b, c) VALUES (?, ?, ?)", 0, v3, 0);
+        execute("INSERT INTO %s (a, b, c) VALUES (?, ?, ?)", 0, v4, 0);
 
-            assertRows(execute("SELECT * FROM %s LIMIT 2"),
-                row(0, set(), 0),
-                row(0, set(1, 2, 3), 0)
-            );
+        // overwrite with an update
+        execute("UPDATE %s SET c=? WHERE a=? AND b=?", 0, 0, v1);
+        execute("UPDATE %s SET c=? WHERE a=? AND b=?", 0, 0, v2);
 
-            assertRows(execute("SELECT * FROM %s WHERE a=? AND b=?", 0, set(4, 5, 6)),
-                row(0, set(4, 5, 6), 0)
-            );
+        assertRows(execute("SELECT * FROM %s"),
+                   row(0, v1, 0),
+                   row(0, v2, 0),
+                   row(0, v3, 0),
+                   row(0, v4, 0)
+        );
 
-            assertRows(execute("SELECT * FROM %s WHERE a=? AND b=?", 0, set()),
-                row(0, set(), 0)
-            );
+        assertRows(execute("SELECT b FROM %s"),
+                   row(v1),
+                   row(v2),
+                   row(v3),
+                   row(v4)
+        );
 
-            assertRows(execute("SELECT * FROM %s WHERE a=? AND b IN ?", 0, list(set(4, 5, 6), set())),
-                row(0, set(), 0),
-                row(0, set(4, 5, 6), 0)
-            );
+        assertRows(execute("SELECT * FROM %s LIMIT 2"),
+                   row(0, v1, 0),
+                   row(0, v2, 0)
+        );
 
-            assertRows(execute("SELECT * FROM %s WHERE a=? AND b > ?", 0, set(4, 5, 6)),
-                row(0, set(7, 8, 9), 0)
-            );
+        assertRows(execute("SELECT * FROM %s WHERE a=? AND b=?", 0, v3),
+                   row(0, v3, 0)
+        );
 
-            assertRows(execute("SELECT * FROM %s WHERE a=? AND b >= ?", 0, set(4, 5, 6)),
-                row(0, set(4, 5, 6), 0),
-                row(0, set(7, 8, 9), 0)
-            );
+        assertRows(execute("SELECT * FROM %s WHERE a=? AND b=?", 0, v1),
+                   row(0, v1, 0)
+        );
 
-            assertRows(execute("SELECT * FROM %s WHERE a=? AND b < ?", 0, set(4, 5, 6)),
-                row(0, set(), 0),
-                row(0, set(1, 2, 3), 0)
-            );
+        assertRows(execute("SELECT * FROM %s WHERE a=? AND b IN ?", 0, list(v3, v1)),
+                   row(0, v1, 0),
+                   row(0, v3, 0)
+        );
 
-            assertRows(execute("SELECT * FROM %s WHERE a=? AND b <= ?", 0, set(4, 5, 6)),
-                row(0, set(), 0),
-                row(0, set(1, 2, 3), 0),
-                row(0, set(4, 5, 6), 0)
-            );
+        assertRows(execute("SELECT * FROM %s WHERE a=? AND b > ?", 0, v3),
+                   row(0, v4, 0)
+        );
 
-            assertRows(execute("SELECT * FROM %s WHERE a=? AND b > ? AND b <= ?", 0, set(1, 2, 3), set(4, 5, 6)),
-                row(0, set(4, 5, 6), 0)
-            );
+        assertRows(execute("SELECT * FROM %s WHERE a=? AND b >= ?", 0, v3),
+                   row(0, v3, 0),
+                   row(0, v4, 0)
+        );
 
-            execute("DELETE FROM %s WHERE a=? AND b=?", 0, set());
-            execute("DELETE FROM %s WHERE a=? AND b=?", 0, set(4, 5, 6));
-            assertRows(execute("SELECT * FROM %s"),
-                row(0, set(1, 2, 3), 0),
-                row(0, set(7, 8, 9), 0)
-            );
-        }
+        assertRows(execute("SELECT * FROM %s WHERE a=? AND b < ?", 0, v3),
+                   row(0, v1, 0),
+                   row(0, v2, 0)
+        );
+
+        assertRows(execute("SELECT * FROM %s WHERE a=? AND b <= ?", 0, v3),
+                   row(0, v1, 0),
+                   row(0, v2, 0),
+                   row(0, v3, 0)
+        );
+
+        assertRows(execute("SELECT * FROM %s WHERE a=? AND b > ? AND b <= ?", 0, v2, v3),
+                   row(0, v3, 0)
+        );
+
+        execute("DELETE FROM %s WHERE a=? AND b=?", 0, v1);
+        execute("DELETE FROM %s WHERE a=? AND b=?", 0, v3);
+        assertRows(execute("SELECT * FROM %s"),
+                   row(0, v2, 0),
+                   row(0, v4, 0)
+        );
+    }
+
+    @Test
+    public void testClusteringKeyUsageWithReverseOrderSet() throws Throwable
+    {
+        testClusteringKeyUsageWithReverseOrder("set<int>",
+                                               set(),
+                                               set(1, 2, 3),
+                                               set(4, 5, 6),
+                                               set(7, 8, 9));
+    }
+
+    @Test
+    public void testClusteringKeyUsageWithReverseOrderList() throws Throwable
+    {
+        testClusteringKeyUsageWithReverseOrder("list<int>",
+                                               list(),
+                                               list(1, 2, 3),
+                                               list(4, 5, 6),
+                                               list(7, 8, 9));
+    }
+
+    @Test
+    public void testClusteringKeyUsageWithReverseOrderMap() throws Throwable
+    {
+        testClusteringKeyUsageWithReverseOrder("map<int, int>",
+                                               map(),
+                                               map(1, 10, 2, 20, 3, 30),
+                                               map(4, 40, 5, 50, 6, 60),
+                                               map(7, 70, 8, 80, 9, 90));
+    }
+
+    private void testClusteringKeyUsageWithReverseOrder(String type, Object v1, Object v2, Object v3, Object v4) throws Throwable
+    {
+        createTable(String.format("CREATE TABLE %%s (a int, b frozen<%s>, c int, PRIMARY KEY (a, b)) " +
+                                  "WITH CLUSTERING ORDER BY (b DESC)", type));
+
+        execute("INSERT INTO %s (a, b, c) VALUES (?, ?, ?)", 0, v1, 1);
+        execute("INSERT INTO %s (a, b, c) VALUES (?, ?, ?)", 0, v2, 1);
+        execute("INSERT INTO %s (a, b, c) VALUES (?, ?, ?)", 0, v3, 0);
+        execute("INSERT INTO %s (a, b, c) VALUES (?, ?, ?)", 0, v4, 0);
+
+        // overwrite with an update
+        execute("UPDATE %s SET c=? WHERE a=? AND b=?", 0, 0, v1);
+        execute("UPDATE %s SET c=? WHERE a=? AND b=?", 0, 0, v2);
+
+        assertRows(execute("SELECT * FROM %s"),
+                   row(0, v4, 0),
+                   row(0, v3, 0),
+                   row(0, v2, 0),
+                   row(0, v1, 0)
+        );
+
+        assertRows(execute("SELECT b FROM %s"),
+                   row(v4),
+                   row(v3),
+                   row(v2),
+                   row(v1)
+        );
+
+        assertRows(execute("SELECT * FROM %s LIMIT 2"),
+                   row(0, v4, 0),
+                   row(0, v3, 0)
+        );
+
+        assertRows(execute("SELECT * FROM %s WHERE a=? AND b=?", 0, v3),
+                   row(0, v3, 0)
+        );
+
+        assertRows(execute("SELECT * FROM %s WHERE a=? AND b=?", 0, v1),
+                   row(0, v1, 0)
+        );
+
+        assertRows(execute("SELECT * FROM %s WHERE a=? AND b IN ?", 0, list(v3, v1)),
+                   row(0, v3, 0),
+                   row(0, v1, 0)
+        );
+
+        assertRows(execute("SELECT * FROM %s WHERE a=? AND b > ?", 0, v3),
+                   row(0, v4, 0)
+        );
+
+        assertRows(execute("SELECT * FROM %s WHERE a=? AND b >= ?", 0, v3),
+                   row(0, v4, 0),
+                   row(0, v3, 0)
+        );
+
+        assertRows(execute("SELECT * FROM %s WHERE a=? AND b < ?", 0, v3),
+                   row(0, v2, 0),
+                   row(0, v1, 0)
+        );
+
+        assertRows(execute("SELECT * FROM %s WHERE a=? AND b <= ?", 0, v3),
+                   row(0, v3, 0),
+                   row(0, v2, 0),
+                   row(0, v1, 0)
+        );
+
+        assertRows(execute("SELECT * FROM %s WHERE a=? AND b > ? AND b <= ?", 0, v2, v3),
+                   row(0, v3, 0)
+        );
+
+        execute("DELETE FROM %s WHERE a=? AND b=?", 0, v1);
+        execute("DELETE FROM %s WHERE a=? AND b=?", 0, v3);
+        assertRows(execute("SELECT * FROM %s"),
+                   row(0, v4, 0),
+                   row(0, v2, 0)
+        );
     }
 
     @Test
     public void testNestedClusteringKeyUsage() throws Throwable
     {
-        for (String option : Arrays.asList("", " WITH COMPACT STORAGE"))
-        {
-            createTable("CREATE TABLE %s (a int, b frozen<map<set<int>, list<int>>>, c frozen<set<int>>, d int, PRIMARY KEY (a, b, c))" + option);
+        createTable("CREATE TABLE %s (a int, b frozen<map<set<int>, list<int>>>, c frozen<set<int>>, d int, PRIMARY KEY (a, b, c))");
 
-            execute("INSERT INTO %s (a, b, c, d) VALUES (?, ?, ?, ?)", 0, map(), set(), 0);
-            execute("INSERT INTO %s (a, b, c, d) VALUES (?, ?, ?, ?)", 0, map(set(), list(1, 2, 3)), set(), 0);
-            execute("INSERT INTO %s (a, b, c, d) VALUES (?, ?, ?, ?)", 0, map(set(1, 2, 3), list(1, 2, 3)), set(1, 2, 3), 0);
-            execute("INSERT INTO %s (a, b, c, d) VALUES (?, ?, ?, ?)", 0, map(set(4, 5, 6), list(1, 2, 3)), set(1, 2, 3), 0);
-            execute("INSERT INTO %s (a, b, c, d) VALUES (?, ?, ?, ?)", 0, map(set(7, 8, 9), list(1, 2, 3)), set(1, 2, 3), 0);
+        execute("INSERT INTO %s (a, b, c, d) VALUES (?, ?, ?, ?)", 0, map(), set(), 0);
+        execute("INSERT INTO %s (a, b, c, d) VALUES (?, ?, ?, ?)", 0, map(set(), list(1, 2, 3)), set(), 0);
+        execute("INSERT INTO %s (a, b, c, d) VALUES (?, ?, ?, ?)", 0, map(set(1, 2, 3), list(1, 2, 3)), set(1, 2, 3), 0);
+        execute("INSERT INTO %s (a, b, c, d) VALUES (?, ?, ?, ?)", 0, map(set(4, 5, 6), list(1, 2, 3)), set(1, 2, 3), 0);
+        execute("INSERT INTO %s (a, b, c, d) VALUES (?, ?, ?, ?)", 0, map(set(7, 8, 9), list(1, 2, 3)), set(1, 2, 3), 0);
 
-            assertRows(execute("SELECT * FROM %s"),
-                row(0, map(), set(), 0),
-                row(0, map(set(), list(1, 2, 3)), set(), 0),
-                row(0, map(set(1, 2, 3), list(1, 2, 3)), set(1, 2, 3), 0),
-                row(0, map(set(4, 5, 6), list(1, 2, 3)), set(1, 2, 3), 0),
-                row(0, map(set(7, 8, 9), list(1, 2, 3)), set(1, 2, 3), 0)
-            );
+        assertRows(execute("SELECT * FROM %s"),
+                   row(0, map(), set(), 0),
+                   row(0, map(set(), list(1, 2, 3)), set(), 0),
+                   row(0, map(set(1, 2, 3), list(1, 2, 3)), set(1, 2, 3), 0),
+                   row(0, map(set(4, 5, 6), list(1, 2, 3)), set(1, 2, 3), 0),
+                   row(0, map(set(7, 8, 9), list(1, 2, 3)), set(1, 2, 3), 0)
+        );
 
-            assertRows(execute("SELECT b FROM %s"),
-                row(map()),
-                row(map(set(), list(1, 2, 3))),
-                row(map(set(1, 2, 3), list(1, 2, 3))),
-                row(map(set(4, 5, 6), list(1, 2, 3))),
-                row(map(set(7, 8, 9), list(1, 2, 3)))
-            );
+        assertRows(execute("SELECT b FROM %s"),
+                   row(map()),
+                   row(map(set(), list(1, 2, 3))),
+                   row(map(set(1, 2, 3), list(1, 2, 3))),
+                   row(map(set(4, 5, 6), list(1, 2, 3))),
+                   row(map(set(7, 8, 9), list(1, 2, 3)))
+        );
 
-            assertRows(execute("SELECT c FROM %s"),
-                row(set()),
-                row(set()),
-                row(set(1, 2, 3)),
-                row(set(1, 2, 3)),
-                row(set(1, 2, 3))
-            );
+        assertRows(execute("SELECT c FROM %s"),
+                   row(set()),
+                   row(set()),
+                   row(set(1, 2, 3)),
+                   row(set(1, 2, 3)),
+                   row(set(1, 2, 3))
+        );
 
-            assertRows(execute("SELECT * FROM %s LIMIT 3"),
-                row(0, map(), set(), 0),
-                row(0, map(set(), list(1, 2, 3)), set(), 0),
-                row(0, map(set(1, 2, 3), list(1, 2, 3)), set(1, 2, 3), 0)
-            );
+        assertRows(execute("SELECT * FROM %s LIMIT 3"),
+                   row(0, map(), set(), 0),
+                   row(0, map(set(), list(1, 2, 3)), set(), 0),
+                   row(0, map(set(1, 2, 3), list(1, 2, 3)), set(1, 2, 3), 0)
+        );
 
-            assertRows(execute("SELECT * FROM %s WHERE a=0 ORDER BY b DESC LIMIT 4"),
-                row(0, map(set(7, 8, 9), list(1, 2, 3)), set(1, 2, 3), 0),
-                row(0, map(set(4, 5, 6), list(1, 2, 3)), set(1, 2, 3), 0),
-                row(0, map(set(1, 2, 3), list(1, 2, 3)), set(1, 2, 3), 0),
-                row(0, map(set(), list(1, 2, 3)), set(), 0)
-            );
+        assertRows(execute("SELECT * FROM %s WHERE a=0 ORDER BY b DESC LIMIT 4"),
+                   row(0, map(set(7, 8, 9), list(1, 2, 3)), set(1, 2, 3), 0),
+                   row(0, map(set(4, 5, 6), list(1, 2, 3)), set(1, 2, 3), 0),
+                   row(0, map(set(1, 2, 3), list(1, 2, 3)), set(1, 2, 3), 0),
+                   row(0, map(set(), list(1, 2, 3)), set(), 0)
+        );
 
-            assertRows(execute("SELECT * FROM %s WHERE a=? AND b=?", 0, map()),
-                row(0, map(), set(), 0)
-            );
+        assertRows(execute("SELECT * FROM %s WHERE a=? AND b=?", 0, map()),
+                   row(0, map(), set(), 0)
+        );
 
-            assertRows(execute("SELECT * FROM %s WHERE a=? AND b=?", 0, map(set(), list(1, 2, 3))),
-                row(0, map(set(), list(1, 2, 3)), set(), 0)
-            );
+        assertRows(execute("SELECT * FROM %s WHERE a=? AND b=?", 0, map(set(), list(1, 2, 3))),
+                   row(0, map(set(), list(1, 2, 3)), set(), 0)
+        );
 
-            assertRows(execute("SELECT * FROM %s WHERE a=? AND b=?", 0, map(set(1, 2, 3), list(1, 2, 3))),
-                row(0, map(set(1, 2, 3), list(1, 2, 3)), set(1, 2, 3), 0)
-            );
+        assertRows(execute("SELECT * FROM %s WHERE a=? AND b=?", 0, map(set(1, 2, 3), list(1, 2, 3))),
+                   row(0, map(set(1, 2, 3), list(1, 2, 3)), set(1, 2, 3), 0)
+        );
 
-            assertRows(execute("SELECT * FROM %s WHERE a=? AND b=? AND c=?", 0, map(set(), list(1, 2, 3)), set()),
-                    row(0, map(set(), list(1, 2, 3)), set(), 0)
-            );
+        assertRows(execute("SELECT * FROM %s WHERE a=? AND b=? AND c=?", 0, map(set(), list(1, 2, 3)), set()),
+                   row(0, map(set(), list(1, 2, 3)), set(), 0)
+        );
 
-            assertRows(execute("SELECT * FROM %s WHERE a=? AND (b, c) IN ?", 0, list(tuple(map(set(4, 5, 6), list(1, 2, 3)), set(1, 2, 3)),
-                                                                                     tuple(map(), set()))),
-                row(0, map(), set(), 0),
-                row(0, map(set(4, 5, 6), list(1, 2, 3)), set(1, 2, 3), 0)
-            );
+        assertRows(execute("SELECT * FROM %s WHERE a=? AND (b, c) IN ?", 0, list(tuple(map(set(4, 5, 6), list(1, 2, 3)), set(1, 2, 3)),
+                                                                                 tuple(map(), set()))),
+                   row(0, map(), set(), 0),
+                   row(0, map(set(4, 5, 6), list(1, 2, 3)), set(1, 2, 3), 0)
+        );
 
-            assertRows(execute("SELECT * FROM %s WHERE a=? AND b > ?", 0, map(set(4, 5, 6), list(1, 2, 3))),
-                row(0, map(set(7, 8, 9), list(1, 2, 3)), set(1, 2, 3), 0)
-            );
+        assertRows(execute("SELECT * FROM %s WHERE a=? AND b > ?", 0, map(set(4, 5, 6), list(1, 2, 3))),
+                   row(0, map(set(7, 8, 9), list(1, 2, 3)), set(1, 2, 3), 0)
+        );
 
-            assertRows(execute("SELECT * FROM %s WHERE a=? AND b >= ?", 0, map(set(4, 5, 6), list(1, 2, 3))),
-                row(0, map(set(4, 5, 6), list(1, 2, 3)), set(1, 2, 3), 0),
-                row(0, map(set(7, 8, 9), list(1, 2, 3)), set(1, 2, 3), 0)
-            );
+        assertRows(execute("SELECT * FROM %s WHERE a=? AND b >= ?", 0, map(set(4, 5, 6), list(1, 2, 3))),
+                   row(0, map(set(4, 5, 6), list(1, 2, 3)), set(1, 2, 3), 0),
+                   row(0, map(set(7, 8, 9), list(1, 2, 3)), set(1, 2, 3), 0)
+        );
 
-            assertRows(execute("SELECT * FROM %s WHERE a=? AND b < ?", 0, map(set(4, 5, 6), list(1, 2, 3))),
-                row(0, map(), set(), 0),
-                row(0, map(set(), list(1, 2, 3)), set(), 0),
-                row(0, map(set(1, 2, 3), list(1, 2, 3)), set(1, 2, 3), 0)
-            );
+        assertRows(execute("SELECT * FROM %s WHERE a=? AND b < ?", 0, map(set(4, 5, 6), list(1, 2, 3))),
+                   row(0, map(), set(), 0),
+                   row(0, map(set(), list(1, 2, 3)), set(), 0),
+                   row(0, map(set(1, 2, 3), list(1, 2, 3)), set(1, 2, 3), 0)
+        );
 
-            assertRows(execute("SELECT * FROM %s WHERE a=? AND b <= ?", 0, map(set(4, 5, 6), list(1, 2, 3))),
-                row(0, map(), set(), 0),
-                row(0, map(set(), list(1, 2, 3)), set(), 0),
-                row(0, map(set(1, 2, 3), list(1, 2, 3)), set(1, 2, 3), 0),
-                row(0, map(set(4, 5, 6), list(1, 2, 3)), set(1, 2, 3), 0)
-            );
+        assertRows(execute("SELECT * FROM %s WHERE a=? AND b <= ?", 0, map(set(4, 5, 6), list(1, 2, 3))),
+                   row(0, map(), set(), 0),
+                   row(0, map(set(), list(1, 2, 3)), set(), 0),
+                   row(0, map(set(1, 2, 3), list(1, 2, 3)), set(1, 2, 3), 0),
+                   row(0, map(set(4, 5, 6), list(1, 2, 3)), set(1, 2, 3), 0)
+        );
 
-            assertRows(execute("SELECT * FROM %s WHERE a=? AND b > ? AND b <= ?", 0, map(set(1, 2, 3), list(1, 2, 3)), map(set(4, 5, 6), list(1, 2, 3))),
-                row(0, map(set(4, 5, 6), list(1, 2, 3)), set(1, 2, 3), 0)
-            );
+        assertRows(execute("SELECT * FROM %s WHERE a=? AND b > ? AND b <= ?", 0, map(set(1, 2, 3), list(1, 2, 3)), map(set(4, 5, 6), list(1, 2, 3))),
+                   row(0, map(set(4, 5, 6), list(1, 2, 3)), set(1, 2, 3), 0)
+        );
 
-            execute("DELETE FROM %s WHERE a=? AND b=? AND c=?", 0, map(), set());
-            assertEmpty(execute("SELECT * FROM %s WHERE a=? AND b=? AND c=?", 0, map(), set()));
+        execute("DELETE FROM %s WHERE a=? AND b=? AND c=?", 0, map(), set());
+        assertEmpty(execute("SELECT * FROM %s WHERE a=? AND b=? AND c=?", 0, map(), set()));
 
-            execute("DELETE FROM %s WHERE a=? AND b=? AND c=?", 0, map(set(), list(1, 2, 3)), set());
-            assertEmpty(execute("SELECT * FROM %s WHERE a=? AND b=? AND c=?", 0, map(set(), list(1, 2, 3)), set()));
+        execute("DELETE FROM %s WHERE a=? AND b=? AND c=?", 0, map(set(), list(1, 2, 3)), set());
+        assertEmpty(execute("SELECT * FROM %s WHERE a=? AND b=? AND c=?", 0, map(set(), list(1, 2, 3)), set()));
 
-            execute("DELETE FROM %s WHERE a=? AND b=? AND c=?", 0, map(set(4, 5, 6), list(1, 2, 3)), set(1, 2, 3));
-            assertEmpty(execute("SELECT * FROM %s WHERE a=? AND b=? AND c=?", 0, map(set(4, 5, 6), list(1, 2, 3)), set(1, 2, 3)));
+        execute("DELETE FROM %s WHERE a=? AND b=? AND c=?", 0, map(set(4, 5, 6), list(1, 2, 3)), set(1, 2, 3));
+        assertEmpty(execute("SELECT * FROM %s WHERE a=? AND b=? AND c=?", 0, map(set(4, 5, 6), list(1, 2, 3)), set(1, 2, 3)));
 
-            assertRows(execute("SELECT * FROM %s"),
-                    row(0, map(set(1, 2, 3), list(1, 2, 3)), set(1, 2, 3), 0),
-                    row(0, map(set(7, 8, 9), list(1, 2, 3)), set(1, 2, 3), 0)
-            );
-        }
+        assertRows(execute("SELECT * FROM %s"),
+                   row(0, map(set(1, 2, 3), list(1, 2, 3)), set(1, 2, 3), 0),
+                   row(0, map(set(7, 8, 9), list(1, 2, 3)), set(1, 2, 3), 0)
+        );
+    }
+
+    @Test
+    public void testNestedClusteringKeyUsageWithReverseOrder() throws Throwable
+    {
+        createTable("CREATE TABLE %s (a int, b frozen<map<set<int>, list<int>>>, c frozen<set<int>>, d int, " +
+                    "PRIMARY KEY (a, b, c)) WITH CLUSTERING ORDER BY (b DESC)");
+
+        execute("INSERT INTO %s (a, b, c, d) VALUES (?, ?, ?, ?)", 0, map(), set(), 0);
+        execute("INSERT INTO %s (a, b, c, d) VALUES (?, ?, ?, ?)", 0, map(set(), list(1, 2, 3)), set(), 0);
+        execute("INSERT INTO %s (a, b, c, d) VALUES (?, ?, ?, ?)", 0, map(set(1, 2, 3), list(1, 2, 3)), set(1, 2, 3), 0);
+        execute("INSERT INTO %s (a, b, c, d) VALUES (?, ?, ?, ?)", 0, map(set(4, 5, 6), list(1, 2, 3)), set(1, 2, 3), 0);
+        execute("INSERT INTO %s (a, b, c, d) VALUES (?, ?, ?, ?)", 0, map(set(7, 8, 9), list(1, 2, 3)), set(1, 2, 3), 0);
+
+        assertRows(execute("SELECT * FROM %s"),
+                   row(0, map(set(7, 8, 9), list(1, 2, 3)), set(1, 2, 3), 0),
+                   row(0, map(set(4, 5, 6), list(1, 2, 3)), set(1, 2, 3), 0),
+                   row(0, map(set(1, 2, 3), list(1, 2, 3)), set(1, 2, 3), 0),
+                   row(0, map(set(), list(1, 2, 3)), set(), 0),
+                   row(0, map(), set(), 0)
+        );
+
+        assertRows(execute("SELECT b FROM %s"),
+                   row(map(set(7, 8, 9), list(1, 2, 3))),
+                   row(map(set(4, 5, 6), list(1, 2, 3))),
+                   row(map(set(1, 2, 3), list(1, 2, 3))),
+                   row(map(set(), list(1, 2, 3))),
+                   row(map())
+        );
+
+        assertRows(execute("SELECT c FROM %s"),
+                   row(set(1, 2, 3)),
+                   row(set(1, 2, 3)),
+                   row(set(1, 2, 3)),
+                   row(set()),
+                   row(set())
+        );
+
+        assertRows(execute("SELECT * FROM %s LIMIT 3"),
+                   row(0, map(set(7, 8, 9), list(1, 2, 3)), set(1, 2, 3), 0),
+                   row(0, map(set(4, 5, 6), list(1, 2, 3)), set(1, 2, 3), 0),
+                   row(0, map(set(1, 2, 3), list(1, 2, 3)), set(1, 2, 3), 0)
+        );
+
+        assertRows(execute("SELECT * FROM %s WHERE a=0 ORDER BY b DESC LIMIT 4"),
+                   row(0, map(set(7, 8, 9), list(1, 2, 3)), set(1, 2, 3), 0),
+                   row(0, map(set(4, 5, 6), list(1, 2, 3)), set(1, 2, 3), 0),
+                   row(0, map(set(1, 2, 3), list(1, 2, 3)), set(1, 2, 3), 0),
+                   row(0, map(set(), list(1, 2, 3)), set(), 0)
+        );
+
+        assertRows(execute("SELECT * FROM %s WHERE a=? AND b=?", 0, map()),
+                   row(0, map(), set(), 0)
+        );
+
+        assertRows(execute("SELECT * FROM %s WHERE a=? AND b=?", 0, map(set(), list(1, 2, 3))),
+                   row(0, map(set(), list(1, 2, 3)), set(), 0)
+        );
+
+        assertRows(execute("SELECT * FROM %s WHERE a=? AND b=?", 0, map(set(1, 2, 3), list(1, 2, 3))),
+                   row(0, map(set(1, 2, 3), list(1, 2, 3)), set(1, 2, 3), 0)
+        );
+
+        assertRows(execute("SELECT * FROM %s WHERE a=? AND b=? AND c=?", 0, map(set(), list(1, 2, 3)), set()),
+                   row(0, map(set(), list(1, 2, 3)), set(), 0)
+        );
+
+        assertRows(execute("SELECT * FROM %s WHERE a=? AND (b, c) IN ?", 0, list(tuple(map(set(4, 5, 6), list(1, 2, 3)), set(1, 2, 3)),
+                                                                                 tuple(map(), set()))),
+                   row(0, map(set(4, 5, 6), list(1, 2, 3)), set(1, 2, 3), 0),
+                   row(0, map(), set(), 0)
+        );
+
+        assertRows(execute("SELECT * FROM %s WHERE a=? AND b > ?", 0, map(set(4, 5, 6), list(1, 2, 3))),
+                   row(0, map(set(7, 8, 9), list(1, 2, 3)), set(1, 2, 3), 0)
+        );
+
+        assertRows(execute("SELECT * FROM %s WHERE a=? AND b >= ?", 0, map(set(4, 5, 6), list(1, 2, 3))),
+                   row(0, map(set(7, 8, 9), list(1, 2, 3)), set(1, 2, 3), 0),
+                   row(0, map(set(4, 5, 6), list(1, 2, 3)), set(1, 2, 3), 0)
+        );
+
+        assertRows(execute("SELECT * FROM %s WHERE a=? AND b < ?", 0, map(set(4, 5, 6), list(1, 2, 3))),
+                   row(0, map(set(1, 2, 3), list(1, 2, 3)), set(1, 2, 3), 0),
+                   row(0, map(set(), list(1, 2, 3)), set(), 0),
+                   row(0, map(), set(), 0)
+        );
+
+        assertRows(execute("SELECT * FROM %s WHERE a=? AND b <= ?", 0, map(set(4, 5, 6), list(1, 2, 3))),
+                   row(0, map(set(4, 5, 6), list(1, 2, 3)), set(1, 2, 3), 0),
+                   row(0, map(set(1, 2, 3), list(1, 2, 3)), set(1, 2, 3), 0),
+                   row(0, map(set(), list(1, 2, 3)), set(), 0),
+                   row(0, map(), set(), 0)
+        );
+
+        assertRows(execute("SELECT * FROM %s WHERE a=? AND b > ? AND b <= ?", 0, map(set(1, 2, 3), list(1, 2, 3)), map(set(4, 5, 6), list(1, 2, 3))),
+                   row(0, map(set(4, 5, 6), list(1, 2, 3)), set(1, 2, 3), 0)
+        );
+
+        execute("DELETE FROM %s WHERE a=? AND b=? AND c=?", 0, map(), set());
+        assertEmpty(execute("SELECT * FROM %s WHERE a=? AND b=? AND c=?", 0, map(), set()));
+
+        execute("DELETE FROM %s WHERE a=? AND b=? AND c=?", 0, map(set(), list(1, 2, 3)), set());
+        assertEmpty(execute("SELECT * FROM %s WHERE a=? AND b=? AND c=?", 0, map(set(), list(1, 2, 3)), set()));
+
+        execute("DELETE FROM %s WHERE a=? AND b=? AND c=?", 0, map(set(4, 5, 6), list(1, 2, 3)), set(1, 2, 3));
+        assertEmpty(execute("SELECT * FROM %s WHERE a=? AND b=? AND c=?", 0, map(set(4, 5, 6), list(1, 2, 3)), set(1, 2, 3)));
+
+        assertRows(execute("SELECT * FROM %s"),
+                   row(0, map(set(7, 8, 9), list(1, 2, 3)), set(1, 2, 3), 0),
+                   row(0, map(set(1, 2, 3), list(1, 2, 3)), set(1, 2, 3), 0)
+        );
     }
 
     @Test
     public void testNormalColumnUsage() throws Throwable
     {
-        for (String option : Arrays.asList("", " WITH COMPACT STORAGE"))
-        {
-            createTable("CREATE TABLE %s (a int PRIMARY KEY, b frozen<map<set<int>, list<int>>>, c frozen<set<int>>)" + option);
+        createTable("CREATE TABLE %s (a int PRIMARY KEY, b frozen<map<set<int>, list<int>>>, c frozen<set<int>>)");
 
-            execute("INSERT INTO %s (a, b, c) VALUES (?, ?, ?)", 0, map(), set());
-            execute("INSERT INTO %s (a, b, c) VALUES (?, ?, ?)", 1, map(set(), list(99999, 999999, 99999)), set());
-            execute("INSERT INTO %s (a, b, c) VALUES (?, ?, ?)", 2, map(set(1, 2, 3), list(1, 2, 3)), set(1, 2, 3));
-            execute("INSERT INTO %s (a, b, c) VALUES (?, ?, ?)", 3, map(set(4, 5, 6), list(1, 2, 3)), set(1, 2, 3));
-            execute("INSERT INTO %s (a, b, c) VALUES (?, ?, ?)", 4, map(set(7, 8, 9), list(1, 2, 3)), set(1, 2, 3));
+        execute("INSERT INTO %s (a, b, c) VALUES (?, ?, ?)", 0, map(), set());
+        execute("INSERT INTO %s (a, b, c) VALUES (?, ?, ?)", 1, map(set(), list(99999, 999999, 99999)), set());
+        execute("INSERT INTO %s (a, b, c) VALUES (?, ?, ?)", 2, map(set(1, 2, 3), list(1, 2, 3)), set(1, 2, 3));
+        execute("INSERT INTO %s (a, b, c) VALUES (?, ?, ?)", 3, map(set(4, 5, 6), list(1, 2, 3)), set(1, 2, 3));
+        execute("INSERT INTO %s (a, b, c) VALUES (?, ?, ?)", 4, map(set(7, 8, 9), list(1, 2, 3)), set(1, 2, 3));
 
-            // overwrite with update
-            execute ("UPDATE %s SET b=? WHERE a=?", map(set(), list(1, 2, 3)), 1);
+        // overwrite with update
+        execute("UPDATE %s SET b=? WHERE a=?", map(set(), list(1, 2, 3)), 1);
 
-            assertRows(execute("SELECT * FROM %s"),
-                row(0, map(), set()),
-                row(1, map(set(), list(1, 2, 3)), set()),
-                row(2, map(set(1, 2, 3), list(1, 2, 3)), set(1, 2, 3)),
-                row(3, map(set(4, 5, 6), list(1, 2, 3)), set(1, 2, 3)),
-                row(4, map(set(7, 8, 9), list(1, 2, 3)), set(1, 2, 3))
-            );
+        assertRows(execute("SELECT * FROM %s"),
+                   row(0, map(), set()),
+                   row(1, map(set(), list(1, 2, 3)), set()),
+                   row(2, map(set(1, 2, 3), list(1, 2, 3)), set(1, 2, 3)),
+                   row(3, map(set(4, 5, 6), list(1, 2, 3)), set(1, 2, 3)),
+                   row(4, map(set(7, 8, 9), list(1, 2, 3)), set(1, 2, 3))
+        );
 
-            assertRows(execute("SELECT b FROM %s"),
-                row(map()),
-                row(map(set(), list(1, 2, 3))),
-                row(map(set(1, 2, 3), list(1, 2, 3))),
-                row(map(set(4, 5, 6), list(1, 2, 3))),
-                row(map(set(7, 8, 9), list(1, 2, 3)))
-            );
+        assertRows(execute("SELECT b FROM %s"),
+                   row(map()),
+                   row(map(set(), list(1, 2, 3))),
+                   row(map(set(1, 2, 3), list(1, 2, 3))),
+                   row(map(set(4, 5, 6), list(1, 2, 3))),
+                   row(map(set(7, 8, 9), list(1, 2, 3)))
+        );
 
-            assertRows(execute("SELECT c FROM %s"),
-                row(set()),
-                row(set()),
-                row(set(1, 2, 3)),
-                row(set(1, 2, 3)),
-                row(set(1, 2, 3))
-            );
+        assertRows(execute("SELECT c FROM %s"),
+                   row(set()),
+                   row(set()),
+                   row(set(1, 2, 3)),
+                   row(set(1, 2, 3)),
+                   row(set(1, 2, 3))
+        );
 
-            assertRows(execute("SELECT * FROM %s WHERE a=?", 3),
-                row(3, map(set(4, 5, 6), list(1, 2, 3)), set(1, 2, 3))
-            );
+        assertRows(execute("SELECT * FROM %s WHERE a=?", 3),
+                   row(3, map(set(4, 5, 6), list(1, 2, 3)), set(1, 2, 3))
+        );
 
-            execute("UPDATE %s SET b=? WHERE a=?", null, 1);
-            assertRows(execute("SELECT * FROM %s WHERE a=?", 1),
-                row(1, null, set())
-            );
+        execute("UPDATE %s SET b=? WHERE a=?", null, 1);
+        assertRows(execute("SELECT * FROM %s WHERE a=?", 1),
+                   row(1, null, set())
+        );
 
-            execute("UPDATE %s SET b=? WHERE a=?", map(), 1);
-            assertRows(execute("SELECT * FROM %s WHERE a=?", 1),
-                row(1, map(), set())
-            );
+        execute("UPDATE %s SET b=? WHERE a=?", map(), 1);
+        assertRows(execute("SELECT * FROM %s WHERE a=?", 1),
+                   row(1, map(), set())
+        );
 
-            execute("UPDATE %s SET c=? WHERE a=?", null, 2);
-            assertRows(execute("SELECT * FROM %s WHERE a=?", 2),
-                row(2, map(set(1, 2, 3), list(1, 2, 3)), null)
-            );
+        execute("UPDATE %s SET c=? WHERE a=?", null, 2);
+        assertRows(execute("SELECT * FROM %s WHERE a=?", 2),
+                   row(2, map(set(1, 2, 3), list(1, 2, 3)), null)
+        );
 
-            execute("UPDATE %s SET c=? WHERE a=?", set(), 2);
-            assertRows(execute("SELECT * FROM %s WHERE a=?", 2),
-                    row(2, map(set(1, 2, 3), list(1, 2, 3)), set())
-            );
+        execute("UPDATE %s SET c=? WHERE a=?", set(), 2);
+        assertRows(execute("SELECT * FROM %s WHERE a=?", 2),
+                   row(2, map(set(1, 2, 3), list(1, 2, 3)), set())
+        );
 
-            execute("DELETE b FROM %s WHERE a=?", 3);
-            assertRows(execute("SELECT * FROM %s WHERE a=?", 3),
-                row(3, null, set(1, 2, 3))
-            );
+        execute("DELETE b FROM %s WHERE a=?", 3);
+        assertRows(execute("SELECT * FROM %s WHERE a=?", 3),
+                   row(3, null, set(1, 2, 3))
+        );
 
-            execute("DELETE c FROM %s WHERE a=?", 4);
-            assertRows(execute("SELECT * FROM %s WHERE a=?", 4),
-                row(4, map(set(7, 8, 9), list(1, 2, 3)), null)
-            );
-        }
+        execute("DELETE c FROM %s WHERE a=?", 4);
+        assertRows(execute("SELECT * FROM %s WHERE a=?", 4),
+                   row(4, map(set(7, 8, 9), list(1, 2, 3)), null)
+        );
     }
 
     @Test
@@ -563,10 +834,10 @@ public class FrozenCollectionsTest extends CQLTester
         createTable("CREATE TABLE %s (a frozen<map<int, text>> PRIMARY KEY, b frozen<map<int, text>>)");
 
         // for now, we don't support indexing values or keys of collections in the primary key
-        assertInvalidIndexCreationWithMessage("CREATE INDEX ON %s (full(a))", "Cannot create secondary index on partition key column");
-        assertInvalidIndexCreationWithMessage("CREATE INDEX ON %s (keys(a))", "Cannot create secondary index on partition key column");
+        assertInvalidIndexCreationWithMessage("CREATE INDEX ON %s (full(a))", "Cannot create secondary index on the only partition key column");
+        assertInvalidIndexCreationWithMessage("CREATE INDEX ON %s (keys(a))", "Cannot create secondary index on the only partition key column");
         assertInvalidIndexCreationWithMessage("CREATE INDEX ON %s (keys(b))", "Cannot create keys() index on frozen column b. " +
-                                                                              "Frozen collections only support full() indexes");
+                                                                              "Frozen collections are immutable and must be fully indexed");
 
         createTable("CREATE TABLE %s (a int, b frozen<list<int>>, c frozen<set<int>>, d frozen<map<int, text>>, PRIMARY KEY (a, b))");
 
@@ -1040,6 +1311,39 @@ public class FrozenCollectionsTest extends CQLTester
         assertRows(execute("SELECT v.a, v.b FROM %s WHERE k=?", 0),
             row(set(1, 2, 3), tuple(list(1, 2, 3)))
         );
+    }
+
+    /**
+     * Test parsing of literal lists when the column type is reversed (CASSANDRA-15814)
+     */
+    @Test
+    public void testLiteralReversedList() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int, c frozen<list<int>>, PRIMARY KEY (k, c)) WITH CLUSTERING ORDER BY (c DESC)");
+        execute("INSERT INTO %s (k, c) VALUES (0, [1, 2])");
+        assertRows(execute("SELECT c FROM %s WHERE k=0 AND c=[1, 2]"), row(list(1, 2)));
+    }
+
+    /**
+     * Test parsing of literal sets when the column type is reversed (CASSANDRA-15814)
+     */
+    @Test
+    public void testLiteralReversedSet() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int, c frozen<set<int>>, PRIMARY KEY (k, c)) WITH CLUSTERING ORDER BY (c DESC)");
+        execute("INSERT INTO %s (k, c) VALUES (0, {1, 2})");
+        assertRows(execute("SELECT c FROM %s WHERE k=0 AND c={1, 2}"), row(set(1, 2)));
+    }
+
+    /**
+     * Test parsing of literal maps when the column type is reversed (CASSANDRA-15814)
+     */
+    @Test
+    public void testLiteralReversedMap() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int, c frozen<map<int,int>>, PRIMARY KEY (k, c)) WITH CLUSTERING ORDER BY (c DESC)");
+        execute("INSERT INTO %s (k, c) VALUES (0, {1:2, 3:4})");
+        assertRows(execute("SELECT c FROM %s WHERE k=0 AND c={1:2, 3:4}"), row(map(1, 2, 3, 4)));
     }
 
     private static String clean(String classname)

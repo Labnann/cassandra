@@ -17,10 +17,10 @@
  */
 package org.apache.cassandra.db;
 
-import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.Random;
 import java.util.UUID;
+import java.util.concurrent.ThreadLocalRandom;
 
 import org.junit.Assert;
 import org.junit.BeforeClass;
@@ -29,22 +29,28 @@ import org.junit.Test;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.schema.ColumnMetadata;
+import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.ColumnIdentifier;
 import org.apache.cassandra.db.marshal.BytesType;
 import org.apache.cassandra.db.marshal.SetType;
 import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.db.rows.*;
+import org.apache.cassandra.utils.concurrent.ImmediateFuture;
 import org.apache.cassandra.utils.concurrent.OpOrder;
-import org.apache.cassandra.utils.memory.HeapAllocator;
+import org.apache.cassandra.utils.memory.HeapCloner;
 import org.apache.cassandra.utils.memory.NativeAllocator;
 import org.apache.cassandra.utils.memory.NativePool;
 
-public class NativeCellTest
+public class NativeCellTest extends CQLTester
 {
 
     private static final Logger logger = LoggerFactory.getLogger(NativeCellTest.class);
-    private static final NativeAllocator nativeAllocator = new NativePool(Integer.MAX_VALUE, Integer.MAX_VALUE, 1f, null).newAllocator();
+    private static final NativeAllocator nativeAllocator = new NativePool(Integer.MAX_VALUE,
+                                                                          Integer.MAX_VALUE,
+                                                                          1f,
+                                                                          () -> ImmediateFuture.success(true)).newAllocator(null);
+    @SuppressWarnings("resource")
     private static final OpOrder.Group group = new OpOrder().start();
     private static Random rand;
 
@@ -57,11 +63,11 @@ public class NativeCellTest
     }
 
     @Test
-    public void testCells() throws IOException
+    public void testCells()
     {
         for (int run = 0 ; run < 1000 ; run++)
         {
-            Row.Builder builder = BTreeRow.unsortedBuilder(1);
+            Row.Builder builder = BTreeRow.unsortedBuilder();
             builder.newRow(rndclustering());
             int count = 1 + rand.nextInt(10);
             for (int i = 0 ; i < count ; i++)
@@ -70,7 +76,7 @@ public class NativeCellTest
         }
     }
 
-    private static Clustering rndclustering()
+    private static Clustering<?> rndclustering()
     {
         int count = 1 + rand.nextInt(100);
         ByteBuffer[] values = new ByteBuffer[count];
@@ -92,7 +98,7 @@ public class NativeCellTest
 
     private static void rndcd(Row.Builder builder)
     {
-        ColumnDefinition col = rndcol();
+        ColumnMetadata col = rndcol();
         if (!col.isComplex())
         {
             builder.addCell(rndcell(col));
@@ -105,23 +111,24 @@ public class NativeCellTest
         }
     }
 
-    private static ColumnDefinition rndcol()
+    private static ColumnMetadata rndcol()
     {
         UUID uuid = new UUID(rand.nextLong(), rand.nextLong());
         boolean isComplex = rand.nextBoolean();
-        return new ColumnDefinition("",
-                                    "",
-                                    ColumnIdentifier.getInterned(uuid.toString(), false),
+        return new ColumnMetadata("",
+                                  "",
+                                  ColumnIdentifier.getInterned(uuid.toString(), false),
                                     isComplex ? new SetType<>(BytesType.instance, true) : BytesType.instance,
-                                    -1,
-                                    ColumnDefinition.Kind.REGULAR);
+                                  -1,
+                                  ColumnMetadata.Kind.REGULAR,
+                                  null);
     }
 
-    private static Cell rndcell(ColumnDefinition col)
+    private static Cell<?> rndcell(ColumnMetadata col)
     {
         long timestamp = rand.nextLong();
         int ttl = rand.nextInt();
-        int localDeletionTime = rand.nextInt();
+        long localDeletionTime = ThreadLocalRandom.current().nextLong(Cell.getVersionedMaxDeletiontionTime() + 1);
         byte[] value = new byte[rand.nextInt(sanesize(expdecay()))];
         rand.nextBytes(value);
         CellPath path = null;
@@ -147,8 +154,8 @@ public class NativeCellTest
 
     private static void test(Row row)
     {
-        Row nrow = clone(row, nativeAllocator.rowBuilder(group));
-        Row brow = clone(row, HeapAllocator.instance.cloningBTreeRowBuilder());
+        Row nrow = row.clone(nativeAllocator.cloner(group));
+        Row brow = row.clone(HeapCloner.instance);
         Assert.assertEquals(row, nrow);
         Assert.assertEquals(row, brow);
         Assert.assertEquals(nrow, brow);
@@ -158,14 +165,8 @@ public class NativeCellTest
         Assert.assertEquals(nrow.clustering(), brow.clustering());
 
         ClusteringComparator comparator = new ClusteringComparator(UTF8Type.instance);
-        Assert.assertTrue(comparator.compare(row.clustering(), nrow.clustering()) == 0);
-        Assert.assertTrue(comparator.compare(row.clustering(), brow.clustering()) == 0);
-        Assert.assertTrue(comparator.compare(nrow.clustering(), brow.clustering()) == 0);
+        Assert.assertEquals(0, comparator.compare(row.clustering(), nrow.clustering()));
+        Assert.assertEquals(0, comparator.compare(row.clustering(), brow.clustering()));
+        Assert.assertEquals(0, comparator.compare(nrow.clustering(), brow.clustering()));
     }
-
-    private static Row clone(Row row, Row.Builder builder)
-    {
-        return Rows.copy(row, builder).build();
-    }
-
 }

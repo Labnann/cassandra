@@ -26,14 +26,14 @@ import java.util.concurrent.atomic.AtomicReference;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.concurrent.OpOrder;
-import sun.nio.ch.DirectBuffer;
 
 /**
 + * The SlabAllocator is a bump-the-pointer allocator that allocates
-+ * large (1MB) global regions and then doles them out to threads that
-+ * request smaller sized (up to 128kb) slices into the array.
++ * large (1MiB) global regions and then doles them out to threads that
++ * request smaller sized (up to 128KiB) slices into the array.
  * <p></p>
  * The purpose of this class is to combat heap fragmentation in long lived
  * objects: by ensuring that all allocations with similar lifetimes
@@ -116,7 +116,7 @@ public class SlabAllocator extends MemtableBufferAllocator
     public void setDiscarded()
     {
         for (Region region : offHeapRegions)
-            ((DirectBuffer) region.data).cleaner().clean();
+            FileUtils.clean(region.data);
         super.setDiscarded();
     }
 
@@ -152,9 +152,9 @@ public class SlabAllocator extends MemtableBufferAllocator
         }
     }
 
-    protected AbstractAllocator allocator(OpOrder.Group writeOp)
+    public Cloner cloner(OpOrder.Group writeOp)
     {
-        return new ContextAllocator(writeOp, this);
+        return allocator(writeOp);
     }
 
     /**
@@ -179,11 +179,6 @@ public class SlabAllocator extends MemtableBufferAllocator
         private final AtomicInteger nextFreeOffset = new AtomicInteger(0);
 
         /**
-         * Total number of allocations satisfied from this buffer
-         */
-        private final AtomicInteger allocCount = new AtomicInteger();
-
-        /**
          * Create an uninitialized region. Note that memory is not allocated yet, so
          * this is cheap.
          *
@@ -201,30 +196,20 @@ public class SlabAllocator extends MemtableBufferAllocator
          */
         public ByteBuffer allocate(int size)
         {
-            while (true)
-            {
-                int oldOffset = nextFreeOffset.get();
+            int newOffset = nextFreeOffset.getAndAdd(size);
 
-                if (oldOffset + size > data.capacity()) // capacity == remaining
-                    return null;
+            if (newOffset + size > data.capacity())
+                // this region is full
+                return null;
 
-                // Try to atomically claim this region
-                if (nextFreeOffset.compareAndSet(oldOffset, oldOffset + size))
-                {
-                    // we got the alloc
-                    allocCount.incrementAndGet();
-                    return (ByteBuffer) data.duplicate().position(oldOffset).limit(oldOffset + size);
-                }
-                // we raced and lost alloc, try again
-            }
+            return (ByteBuffer) data.duplicate().position((newOffset)).limit(newOffset + size);
         }
 
         @Override
         public String toString()
         {
             return "Region@" + System.identityHashCode(this) +
-                   " allocs=" + allocCount.get() + "waste=" +
-                   (data.capacity() - nextFreeOffset.get());
+                   "waste=" + Math.max(0, data.capacity() - nextFreeOffset.get());
         }
     }
 }

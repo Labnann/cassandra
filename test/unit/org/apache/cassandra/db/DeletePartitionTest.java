@@ -23,15 +23,15 @@ import org.junit.Test;
 
 import org.apache.cassandra.SchemaLoader;
 import org.apache.cassandra.Util;
-import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.partitions.*;
 import org.apache.cassandra.schema.KeyspaceParams;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
 
-import static junit.framework.Assert.assertFalse;
-import static junit.framework.Assert.assertTrue;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
 
 public class DeletePartitionTest
 {
@@ -59,10 +59,10 @@ public class DeletePartitionTest
     public void testDeletePartition(DecoratedKey key, boolean flushBeforeRemove, boolean flushAfterRemove)
     {
         ColumnFamilyStore store = Keyspace.open(KEYSPACE1).getColumnFamilyStore(CF_STANDARD1);
-        ColumnDefinition column = store.metadata.getColumnDefinition(ByteBufferUtil.bytes("val"));
+        ColumnMetadata column = store.metadata().getColumn(ByteBufferUtil.bytes("val"));
 
         // write
-        new RowUpdateBuilder(store.metadata, 0, key.getKey())
+        new RowUpdateBuilder(store.metadata(), 0, key.getKey())
                 .clustering("Column1")
                 .add("val", "asdf")
                 .build()
@@ -75,15 +75,16 @@ public class DeletePartitionTest
         assertTrue(r.getCell(column).value().equals(ByteBufferUtil.bytes("asdf")));
 
         if (flushBeforeRemove)
-            store.forceBlockingFlush();
+            Util.flush(store);
 
         // delete the partition
-        new Mutation(KEYSPACE1, key)
-                .add(PartitionUpdate.fullPartitionDelete(store.metadata, key, 0, FBUtilities.nowInSeconds()))
+        new Mutation.PartitionUpdateCollector(KEYSPACE1, key)
+                .add(PartitionUpdate.fullPartitionDelete(store.metadata(), key, 0, FBUtilities.nowInSeconds()))
+                .build()
                 .applyUnsafe();
 
         if (flushAfterRemove)
-            store.forceBlockingFlush();
+            Util.flush(store);
 
         // validate removal
         ImmutableBTreePartition partitionUnfiltered = Util.getOnlyPartitionUnfiltered(Util.cmd(store, key).build());

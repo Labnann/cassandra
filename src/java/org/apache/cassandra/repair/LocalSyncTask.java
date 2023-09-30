@@ -17,24 +17,33 @@
  */
 package org.apache.cassandra.repair;
 
-import java.net.InetAddress;
+import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
 
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Preconditions;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.db.SystemKeyspace;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
-import org.apache.cassandra.service.ActiveRepairService;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.locator.RangesAtEndpoint;
+import org.apache.cassandra.streaming.PreviewKind;
 import org.apache.cassandra.streaming.ProgressInfo;
 import org.apache.cassandra.streaming.StreamEvent;
 import org.apache.cassandra.streaming.StreamEventHandler;
+import org.apache.cassandra.streaming.StreamOperation;
 import org.apache.cassandra.streaming.StreamPlan;
+import org.apache.cassandra.streaming.StreamSession;
 import org.apache.cassandra.streaming.StreamState;
 import org.apache.cassandra.tracing.TraceState;
 import org.apache.cassandra.tracing.Tracing;
 import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.TimeUUID;
+import org.apache.cassandra.utils.concurrent.AsyncPromise;
+import org.apache.cassandra.utils.concurrent.Promise;
 
 /**
  * LocalSyncTask performs streaming between local(coordinator) node and remote replica.
@@ -45,49 +54,81 @@ public class LocalSyncTask extends SyncTask implements StreamEventHandler
 
     private static final Logger logger = LoggerFactory.getLogger(LocalSyncTask.class);
 
-    private final long repairedAt;
+    private final TimeUUID pendingRepair;
 
-    private final boolean pullRepair;
+    @VisibleForTesting
+    public final boolean requestRanges;
+    @VisibleForTesting
+    public final boolean transferRanges;
 
-    public LocalSyncTask(RepairJobDesc desc, TreeResponse r1, TreeResponse r2, long repairedAt, boolean pullRepair)
+    private final AtomicBoolean active = new AtomicBoolean(true);
+    private final Promise<StreamPlan> planPromise = new AsyncPromise<>();
+
+    public LocalSyncTask(RepairJobDesc desc, InetAddressAndPort local, InetAddressAndPort remote,
+                         List<Range<Token>> diff, TimeUUID pendingRepair,
+                         boolean requestRanges, boolean transferRanges, PreviewKind previewKind)
     {
-        super(desc, r1, r2);
-        this.repairedAt = repairedAt;
-        this.pullRepair = pullRepair;
+        super(desc, local, remote, diff, previewKind);
+        Preconditions.checkArgument(requestRanges || transferRanges, "Nothing to do in a sync job");
+        Preconditions.checkArgument(local.equals(FBUtilities.getBroadcastAddressAndPort()));
+
+        this.pendingRepair = pendingRepair;
+        this.requestRanges = requestRanges;
+        this.transferRanges = transferRanges;
+    }
+
+    @VisibleForTesting
+    StreamPlan createStreamPlan()
+    {
+        InetAddressAndPort remote =  nodePair.peer;
+
+        StreamPlan plan = new StreamPlan(StreamOperation.REPAIR, 1, false, pendingRepair, previewKind)
+                          .listeners(this)
+                          .flushBeforeTransfer(pendingRepair == null);
+
+        if (requestRanges)
+        {
+            // see comment on RangesAtEndpoint.toDummyList for why we synthesize replicas here
+            plan.requestRanges(remote, desc.keyspace, RangesAtEndpoint.toDummyList(rangesToSync),
+                               RangesAtEndpoint.toDummyList(Collections.emptyList()), desc.columnFamily);
+        }
+
+        if (transferRanges)
+        {
+            // send ranges to the remote node if we are not performing a pull repair
+            // see comment on RangesAtEndpoint.toDummyList for why we synthesize replicas here
+            plan.transferRanges(remote, desc.keyspace, RangesAtEndpoint.toDummyList(rangesToSync), desc.columnFamily);
+        }
+
+        return plan;
     }
 
     /**
      * Starts sending/receiving our list of differences to/from the remote endpoint: creates a callback
      * that will be called out of band once the streams complete.
      */
-    protected void startSync(List<Range<Token>> differences)
+    @Override
+    protected void startSync()
     {
-        InetAddress local = FBUtilities.getBroadcastAddress();
-        // We can take anyone of the node as source or destination, however if one is localhost, we put at source to avoid a forwarding
-        InetAddress dst = r2.endpoint.equals(local) ? r1.endpoint : r2.endpoint;
-        InetAddress preferred = SystemKeyspace.getPreferredIP(dst);
-
-        String message = String.format("Performing streaming repair of %d ranges with %s", differences.size(), dst);
-        logger.info("[repair #{}] {}", desc.sessionId, message);
-        logger.debug("in LocalSyncTask， [repair #{}] {}", desc.sessionId, message);
-        boolean isIncremental = false;
-        if (desc.parentSessionId != null)
+        if (active.get())
         {
-            ActiveRepairService.ParentRepairSession prs = ActiveRepairService.instance.getParentRepairSession(desc.parentSessionId);
-            isIncremental = prs.isIncremental;
-        }
-        Tracing.traceRepair(message);
-        StreamPlan plan = new StreamPlan("Repair", repairedAt, 1, false, isIncremental, false).listeners(this)
-                                            .flushBeforeTransfer(true)
-                                            // request ranges from the remote node
-                                            .requestRanges(dst, preferred, desc.keyspace, differences, desc.columnFamily);
-        if (!pullRepair)
-        {
-            // send ranges to the remote node if we are not performing a pull repair
-            plan.transferRanges(dst, preferred, desc.keyspace, differences, desc.columnFamily);
-        }
+            InetAddressAndPort remote = nodePair.peer;
 
-        plan.execute();
+            String message = String.format("Performing streaming repair of %d ranges with %s", rangesToSync.size(), remote);
+            logger.info("{} {}", previewKind.logPrefix(desc.sessionId), message);
+            logger.debug("in LocalSyncTask， [repair #{}] {}", desc.sessionId, message);
+            Tracing.traceRepair(message);
+
+            StreamPlan plan = createStreamPlan();
+            plan.execute();
+            planPromise.setSuccess(plan);
+        }
+    }
+
+    @Override
+    public boolean isLocal()
+    {
+        return true;
     }
 
     public void handleStreamEvent(StreamEvent event)
@@ -109,23 +150,56 @@ public class LocalSyncTask extends SyncTask implements StreamEventHandler
                 state.trace("{}/{} ({}%) {} idx:{}{}",
                             new Object[] { FBUtilities.prettyPrintMemory(pi.currentBytes),
                                            FBUtilities.prettyPrintMemory(pi.totalBytes),
-                                           pi.currentBytes * 100 / pi.totalBytes,
+                                           pi.progressPercentage(),
                                            pi.direction == ProgressInfo.Direction.OUT ? "sent to" : "received from",
                                            pi.sessionIndex,
                                            pi.peer });
         }
     }
 
+    @Override
     public void onSuccess(StreamState result)
     {
-        String message = String.format("Sync complete using session %s between %s and %s on %s", desc.sessionId, r1.endpoint, r2.endpoint, desc.columnFamily);
-        logger.info("[repair #{}] {}", desc.sessionId, message);
-        Tracing.traceRepair(message);
-        set(stat);
+        if (active.compareAndSet(true, false))
+        {
+            String status = result.hasAbortedSession() ? "aborted" : "complete";
+            String message = String.format("Sync %s using session %s between %s and %s on %s",
+                                           status, desc.sessionId, nodePair.coordinator, nodePair.peer, desc.columnFamily);
+            logger.info("{} {}", previewKind.logPrefix(desc.sessionId), message);
+            Tracing.traceRepair(message);
+            trySuccess(result.hasAbortedSession() ? stat : stat.withSummaries(result.createSummaries()));
+            finished();
+        }
     }
 
+    @Override
     public void onFailure(Throwable t)
     {
-        setException(t);
+        if (active.compareAndSet(true, false))
+        {
+            tryFailure(t);
+            finished();
+        }
+    }
+
+    @Override
+    public String toString()
+    {
+        return "LocalSyncTask{" +
+               "requestRanges=" + requestRanges +
+               ", transferRanges=" + transferRanges +
+               ", rangesToSync=" + rangesToSync +
+               ", nodePair=" + nodePair +
+               '}';
+    }
+
+    @Override
+    public void abort()
+    {
+        planPromise.addCallback((plan, cause) ->
+        {
+            assert plan != null : "StreamPlan future should never be completed exceptionally";
+            plan.getCoordinator().getAllStreamSessions().forEach(StreamSession::abort);
+        });
     }
 }

@@ -17,9 +17,10 @@
  */
 package org.apache.cassandra.cql3.restrictions;
 
+import java.util.Collection;
 import java.util.Set;
 
-import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.schema.ColumnMetadata;
 
 /**
  * Sets of restrictions
@@ -32,7 +33,16 @@ public interface Restrictions extends Restriction
      * @param columnDef the column definition
      * @return the restrictions applied to the specified column
      */
-    Set<Restriction> getRestrictions(ColumnDefinition columnDef);
+    Set<Restriction> getRestrictions(ColumnMetadata columnDef);
+
+    /**
+     * This method exists in addition to {@link #getColumnDefs()} in case implementations want to
+     * provide columns definitions that are not strictly in position order.
+     */
+    default Collection<ColumnMetadata> getColumnDefinitions()
+    {
+        return getColumnDefs();
+    }
 
     /**
      * Checks if this <code>Restrictions</code> is empty or not.

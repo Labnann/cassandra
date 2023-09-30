@@ -18,34 +18,100 @@
 
 package org.apache.cassandra.tools;
 
+import java.io.IOException;
+
+import org.junit.BeforeClass;
 import org.junit.Test;
-import org.junit.runner.RunWith;
 
-import org.apache.cassandra.OrderedJUnit4ClassRunner;
+import org.apache.cassandra.tools.ToolRunner.ToolResult;
+import org.assertj.core.api.Assertions;
 
-@RunWith(OrderedJUnit4ClassRunner.class)
-public class SSTableExportTest extends ToolsTester
+import static org.hamcrest.CoreMatchers.containsStringIgnoringCase;
+import static org.hamcrest.CoreMatchers.not;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertThat;
+
+public class SSTableExportTest extends OfflineToolUtils
 {
-    @Test
-    public void testSSTableExport_NoArgs()
+    private static String sstable;
+
+    @BeforeClass
+    public static void setupTest() throws IOException
     {
-        runTool(1, "org.apache.cassandra.tools.SSTableExport");
-        assertNoUnexpectedThreadsStarted(null, OPTIONAL_THREADS_WITH_SCHEMA);
+        sstable = findOneSSTable("legacy_sstables", "legacy_ma_simple");
+    }
+
+    @Test
+    public void testNoArgsPrintsHelp()
+    {
+        ToolResult tool = ToolRunner.invokeClass(SSTableExport.class);
+        assertThat(tool.getStdout(), containsStringIgnoringCase("usage:"));
+        assertThat(tool.getCleanedStderr(), containsStringIgnoringCase("You must supply exactly one sstable"));
+        assertThat(tool.getCleanedStderr(), not(containsStringIgnoringCase("before the -k/-x options")));
+        assertEquals(1, tool.getExitCode());
+        assertPostTestEnv();
+    }
+
+    @Test
+    public void testMaybeChangeDocs()
+    {
+        // If you added, modified options or help, please update docs if necessary
+        ToolResult tool = ToolRunner.invokeClass(SSTableExport.class);
+        String help = "usage: sstabledump <sstable file path> <options>\n" +
+                       "Dump contents of given SSTable to standard output in JSON format.\n" +
+                       " -d         CQL row per line internal representation\n" +
+                       " -e         enumerate partition keys only\n" +
+                       " -k <arg>   List of included partition keys\n" +
+                       " -l         Output json lines, by partition\n" +
+                       " -t         Print raw timestamps instead of iso8601 date strings\n" +
+                       " -x <arg>   List of excluded partition keys\n";
+        Assertions.assertThat(tool.getStdout()).isEqualTo(help);
+        assertPostTestEnv();
+    }
+
+    @Test
+    public void testWrongArgFailsAndPrintsHelp()
+    {
+        ToolResult tool = ToolRunner.invokeClass(SSTableExport.class, "--debugwrong", sstable);
+        assertThat(tool.getStdout(), containsStringIgnoringCase("usage:"));
+        assertThat(tool.getCleanedStderr(), containsStringIgnoringCase("Unrecognized option"));
+        assertEquals(1, tool.getExitCode());
+        assertPostTestEnv();
+    }
+
+    @Test
+    public void testPKArgOutOfOrder()
+    {
+        ToolResult tool = ToolRunner.invokeClass(SSTableExport.class, "-k", "0", sstable);
+        assertThat(tool.getStdout(), containsStringIgnoringCase("usage:"));
+        assertThat(tool.getCleanedStderr(), containsStringIgnoringCase("You must supply exactly one sstable"));
+        assertThat(tool.getCleanedStderr(), containsStringIgnoringCase("before the -k/-x options"));
+        assertEquals(1, tool.getExitCode());
+        assertPostTestEnv();
+    }
+
+    @Test
+    public void testExcludePKArgOutOfOrder()
+    {
+        ToolResult tool = ToolRunner.invokeClass(SSTableExport.class, "-x", "0", sstable);
+        assertThat(tool.getStdout(), containsStringIgnoringCase("usage:"));
+        assertThat(tool.getCleanedStderr(), containsStringIgnoringCase("You must supply exactly one sstable"));
+        assertThat(tool.getCleanedStderr(), containsStringIgnoringCase("before the -k/-x options"));
+        assertEquals(1, tool.getExitCode());
+        assertPostTestEnv();
+    }
+
+
+    /**
+     * Runs post-test assertions about loaded classed and started threads.
+     */
+    private void assertPostTestEnv()
+    {
+        assertNoUnexpectedThreadsStarted(OPTIONAL_THREADS_WITH_SCHEMA, false);
         assertSchemaNotLoaded();
         assertCLSMNotLoaded();
         assertSystemKSNotLoaded();
         assertKeyspaceNotLoaded();
-        assertServerNotLoaded();
-    }
-
-    @Test
-    public void testSSTableExport_WithArgs() throws Exception
-    {
-        runTool(0, "org.apache.cassandra.tools.SSTableExport", findOneSSTable("legacy_sstables", "legacy_ma_simple"));
-        assertNoUnexpectedThreadsStarted(null, OPTIONAL_THREADS_WITH_SCHEMA);
-        assertSchemaNotLoaded();
-        assertCLSMNotLoaded();
-        assertSystemKSNotLoaded();
         assertServerNotLoaded();
     }
 }

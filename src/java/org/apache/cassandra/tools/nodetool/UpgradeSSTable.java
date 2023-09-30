@@ -17,9 +17,9 @@
  */
 package org.apache.cassandra.tools.nodetool;
 
-import io.airlift.command.Arguments;
-import io.airlift.command.Command;
-import io.airlift.command.Option;
+import io.airlift.airline.Arguments;
+import io.airlift.airline.Command;
+import io.airlift.airline.Option;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -33,8 +33,15 @@ public class UpgradeSSTable extends NodeToolCmd
     @Arguments(usage = "[<keyspace> <tables>...]", description = "The keyspace followed by one or many tables")
     private List<String> args = new ArrayList<>();
 
-    @Option(title = "include_all", name = {"-a", "--include-all-sstables"}, description = "Use -a to include all sstables, even those already on the current version")
+    @Option(title = "include_all",
+            name = {"-a", "--include-all-sstables"},
+            description = "Use -a to include all sstables, even those already on the current version")
     private boolean includeAll = false;
+
+    @Option(title = "max_timestamp",
+            name = {"-t", "--max-timestamp"},
+            description = "Use -t to compact only SSTables that have local creation time _older_ than the given timestamp")
+    private long maxSSTableTimestamp = Long.MAX_VALUE;
 
     @Option(title = "jobs",
             name = {"-j", "--jobs"},
@@ -51,7 +58,7 @@ public class UpgradeSSTable extends NodeToolCmd
         {
             try
             {
-                probe.upgradeSSTables(System.out, keyspace, !includeAll, jobs, tableNames);
+                probe.upgradeSSTables(probe.output().out, keyspace, !includeAll, maxSSTableTimestamp, jobs, tableNames);
             }
             catch (Exception e)
             {

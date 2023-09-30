@@ -19,11 +19,12 @@ package org.apache.cassandra.cql3.restrictions;
 
 import java.util.List;
 
-import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.index.Index;
+import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.cql3.QueryOptions;
 import org.apache.cassandra.cql3.functions.Function;
 import org.apache.cassandra.db.filter.RowFilter;
-import org.apache.cassandra.index.SecondaryIndexManager;
+import org.apache.cassandra.index.IndexRegistry;
 
 /**
  * <p>Implementation of this class must be immutable.</p>
@@ -39,19 +40,19 @@ public interface Restriction
      * Returns the definition of the first column.
      * @return the definition of the first column.
      */
-    public ColumnDefinition getFirstColumn();
+    public ColumnMetadata getFirstColumn();
 
     /**
      * Returns the definition of the last column.
      * @return the definition of the last column.
      */
-    public ColumnDefinition getLastColumn();
+    public ColumnMetadata getLastColumn();
 
     /**
      * Returns the column definitions in position order.
      * @return the column definitions in position order.
      */
-    public List<ColumnDefinition> getColumnDefs();
+    public List<ColumnMetadata> getColumnDefs();
 
     /**
      * Adds all functions (native and user-defined) used by any component of the restriction
@@ -63,19 +64,27 @@ public interface Restriction
     /**
      * Check if the restriction is on indexed columns.
      *
-     * @param indexManager the index manager
+     * @param indexRegistry the index registry
      * @return <code>true</code> if the restriction is on indexed columns, <code>false</code>
      */
-    public boolean hasSupportingIndex(SecondaryIndexManager indexManager);
+    boolean hasSupportingIndex(IndexRegistry indexRegistry);
+
+    /**
+     * Returns whether this restriction would need filtering if the specified index group were used.
+     *
+     * @param indexGroup an index group
+     * @return {@code true} if this would need filtering if {@code indexGroup} were used, {@code false} otherwise
+     */
+    boolean needsFiltering(Index.Group indexGroup);
 
     /**
      * Adds to the specified row filter the expressions corresponding to this <code>Restriction</code>.
      *
      * @param filter the row filter to add expressions to
-     * @param indexManager the secondary index manager
+     * @param indexRegistry the index registry
      * @param options the query options
      */
-    public void addRowFilterTo(RowFilter filter,
-                               SecondaryIndexManager indexManager,
+    public void addToRowFilter(RowFilter filter,
+                               IndexRegistry indexRegistry,
                                QueryOptions options);
 }

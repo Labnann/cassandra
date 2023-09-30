@@ -28,7 +28,10 @@ import java.util.concurrent.locks.LockSupport;
 
 import com.google.common.util.concurrent.Uninterruptibles;
 import org.apache.commons.math3.distribution.WeibullDistribution;
+import org.junit.Ignore;
 import org.junit.Test;
+
+import static org.apache.cassandra.utils.Clock.Global.nanoTime;
 
 public class LongSharedExecutorPoolTest
 {
@@ -96,7 +99,7 @@ public class LongSharedExecutorPoolTest
         }
     }
 
-    @Test
+    @Test @Ignore // see CASSANDRA-16497. re-evaluate SEPThreadpools post 4.0
     public void testPromptnessOfExecution() throws InterruptedException, ExecutionException
     {
         testPromptnessOfExecution(TimeUnit.MINUTES.toNanos(2L), 0.5f);
@@ -106,7 +109,7 @@ public class LongSharedExecutorPoolTest
     {
         final int executorCount = 4;
         int threadCount = 8;
-        int maxQueued = 1024;
+        int scale = 1024;
         final WeibullDistribution workTime = new WeibullDistribution(3, 200000);
         final long minWorkTime = TimeUnit.MICROSECONDS.toNanos(1);
         final long maxWorkTime = TimeUnit.MILLISECONDS.toNanos(1);
@@ -116,11 +119,11 @@ public class LongSharedExecutorPoolTest
         final ExecutorService[] executors = new ExecutorService[executorCount];
         for (int i = 0 ; i < executors.length ; i++)
         {
-            executors[i] = SharedExecutorPool.SHARED.newExecutor(threadCount, maxQueued, "test" + i, "test" + i);
+            executors[i] = SharedExecutorPool.SHARED.newExecutor(threadCount, "test" + i, "test" + i);
             threadCounts[i] = threadCount;
-            workCount[i] = new WeibullDistribution(2, maxQueued);
+            workCount[i] = new WeibullDistribution(2, scale);
             threadCount *= 2;
-            maxQueued *= 2;
+            scale *= 2;
         }
 
         long runs = 0;
@@ -133,11 +136,11 @@ public class LongSharedExecutorPoolTest
         // (beyond max queued size), and longer operations
         for (float multiplier = 0f ; multiplier < 2.01f ; )
         {
-            if (System.nanoTime() > until)
+            if (nanoTime() > until)
             {
                 System.out.println(String.format("Completed %.0fK batches with %.1fM events", runs * 0.001f, events * 0.000001f));
                 events = 0;
-                until = System.nanoTime() + intervalNanos;
+                until = nanoTime() + intervalNanos;
                 multiplier += loadIncrement;
                 System.out.println(String.format("Running for %ds with load multiplier %.1f", TimeUnit.NANOSECONDS.toSeconds(intervalNanos), multiplier));
             }
@@ -149,20 +152,20 @@ public class LongSharedExecutorPoolTest
             else if (pending.size() == executorCount) timeout = pending.first().timeout;
             else timeout = (long) (Math.random() * pending.last().timeout);
 
-            while (!pending.isEmpty() && timeout > System.nanoTime())
+            while (!pending.isEmpty() && timeout > nanoTime())
             {
                 Batch first = pending.first();
                 boolean complete = false;
                 try
                 {
                     for (Result result : first.results.descendingSet())
-                        result.future.get(timeout - System.nanoTime(), TimeUnit.NANOSECONDS);
+                        result.future.get(timeout - nanoTime(), TimeUnit.NANOSECONDS);
                     complete = true;
                 }
                 catch (TimeoutException e)
                 {
                 }
-                if (!complete && System.nanoTime() > first.timeout)
+                if (!complete && nanoTime() > first.timeout)
                 {
                     for (Result result : first.results)
                         if (!result.future.isDone())
@@ -189,7 +192,7 @@ public class LongSharedExecutorPoolTest
             TreeSet<Result> results = new TreeSet<>();
             int count = (int) (workCount[executorIndex].sample() * multiplier);
             long targetTotalElapsed = 0;
-            long start = System.nanoTime();
+            long start = nanoTime();
             long baseTime;
             if (Math.random() > 0.5) baseTime = 2 * (long) (workTime.sample() * multiplier);
             else  baseTime = 0;
@@ -204,11 +207,11 @@ public class LongSharedExecutorPoolTest
                     time = maxWorkTime;
                 targetTotalElapsed += time;
                 Future<?> future = executor.submit(new WaitTask(time));
-                results.add(new Result(future, System.nanoTime() + time));
+                results.add(new Result(future, nanoTime() + time));
             }
             long end = start + (long) Math.ceil(targetTotalElapsed / (double) threadCounts[executorIndex])
                        + TimeUnit.MILLISECONDS.toNanos(100L);
-            long now = System.nanoTime();
+            long now = nanoTime();
             if (runs++ > executorCount && now > end)
                 throw new AssertionError();
             events += results.size();
